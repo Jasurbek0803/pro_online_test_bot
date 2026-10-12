@@ -5,6 +5,7 @@ from reportlab.lib.colors import HexColor, black
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 import asyncio
+import contextlib
 import html
 import json
 import logging
@@ -38,7 +39,7 @@ from aiogram.types import (
     Message, CallbackQuery,
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    FSInputFile, BotCommand, BotCommandScopeDefault, BotCommandScopeChat, ErrorEvent,
+    FSInputFile, BufferedInputFile, BotCommand, BotCommandScopeDefault, BotCommandScopeChat, ErrorEvent,
     WebAppInfo
 )
 from aiogram.fsm.context import FSMContext
@@ -135,7 +136,7 @@ BTN_ADMIN_CHANNELS = "📣 Majburiy kanallar (Admin)"
 BTN_ADMIN_DEL_TEST = "🗑 Testni o'chirish (Admin)"
 BTN_ADMIN_ADD_ADMIN = "👮 Adminlarni boshqarish"
 BTN_PROFILE = "👤 Profilim"
-BTN_WEBAPP = "🌐 Veb-profil"
+BTN_WEBAPP = "📱 Mini App (test yechish)"
 
 BTN_HOME = "🏠 Bosh menyu"
 # ✅ Bu tugma haqiqatda BIR QADAM ORQAGA emas — butun jarayonni bekor qilib
@@ -2953,6 +2954,11 @@ async def handle_code_search(message: Message, state: FSMContext):
         else:
             text += "\nℹ️ Bu test tekin — pastdagi «🆓 Tekin testlar» bo‘limidan boshlang."
 
+    # ✅ Mini App sozlangan bo'lsa — testni interaktiv oynada ochish tugmasi
+    if WEBAPP_URL:
+        kb.inline_keyboard.append([InlineKeyboardButton(
+            text="📱 Mini App'da ochish", web_app=WebAppInfo(url=f"{WEBAPP_URL}/webapp?code={code}"))])
+
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb if kb.inline_keyboard else None)
     await state.clear()
 
@@ -5419,16 +5425,9 @@ async def staged_collect_free_text(message: Message, state: FSMContext) -> None:
     await state.update_data(stage_kb_mid=kb_msg.message_id)
 
 
-async def _complete_current_stage_mcq(user_tg_id: int, bot: Bot, state: FSMContext, user_ans: str) -> None:
-    data = await state.get_data()
-    test_id = data["staged_test_id"]
-    order = data["staged_order"]
-    pos = data["staged_pos"]
-    user_db_id = await get_user_db_id(user_tg_id)
-
-    t = await POOL.fetchrow("SELECT skills_cfg FROM tests WHERE id=$1", test_id)
-    cfg = _load_skills_cfg(t["skills_cfg"])
-    key = order[pos]
+def _build_stage_mcq_result(cfg: dict, key: str, user_ans: str, open_answers: dict) -> dict:
+    """Bosqichli testning variantli bo'limi natijasi (chat ham, Mini App ham
+    aynan shu funksiya orqali hisoblaydi — natija har ikkalasida bir xil)."""
     section = cfg["sections"][key]
     qcount = int(section["qcount"])
     correct_key = normalize_answers(section["answers"])
@@ -5436,7 +5435,7 @@ async def _complete_current_stage_mcq(user_tg_id: int, bot: Bot, state: FSMConte
     qn = min(qcount, len(correct_key), len(user_ans))
     # ✅ Ochiq (x) savollar kalit bilan avtomatik tekshiriladi; faqat rasm
     # ko'rinishidagi yoki kalitsiz javoblar ustoz tekshiruviga qoladi.
-    open_answers = data.get("stage_mcq_open_answers") or {}
+    open_answers = open_answers or {}
     open_grades = initial_open_grades(correct_key[:qn], open_answers, section.get("open_ref_answers") or {})
     score, scored_total, open_pending = score_with_open(user_ans, correct_key, qn, open_grades)
     result = {"score": score, "total": scored_total, "user_answers": user_ans[:qn],
@@ -5451,6 +5450,20 @@ async def _complete_current_stage_mcq(user_tg_id: int, bot: Bot, state: FSMConte
         result["weight"] = weight
         result["earned"] = score * weight
         result["max"] = scored_total * weight
+    return result
+
+
+async def _complete_current_stage_mcq(user_tg_id: int, bot: Bot, state: FSMContext, user_ans: str) -> None:
+    data = await state.get_data()
+    test_id = data["staged_test_id"]
+    order = data["staged_order"]
+    pos = data["staged_pos"]
+    user_db_id = await get_user_db_id(user_tg_id)
+
+    t = await POOL.fetchrow("SELECT skills_cfg FROM tests WHERE id=$1", test_id)
+    cfg = _load_skills_cfg(t["skills_cfg"])
+    key = order[pos]
+    result = _build_stage_mcq_result(cfg, key, user_ans, data.get("stage_mcq_open_answers") or {})
 
     await delete_session(user_db_id, test_id, f"stage_{key}")
     cancel_timer(user_tg_id, test_id)
@@ -12108,19 +12121,26 @@ _USER_PAGINATED_RENDERERS = {
 }
 
 
-# ===================== MINI APP (veb-profil) =====================
-# ✅ Telegram Mini App — bot menyusidagi "🌐 Veb-profil" tugmasi orqali
-# Telegram ichida ochiladigan veb-sahifa: o'quvchining statistikasi, o'tgan
-# testlari va sertifikatlari. Test yechish mantig'i (sessiyalar, taymer,
-# Rasch) hozircha bot ichida qoladi — bu sahifa faqat o'qish/yuklab olish
-# uchun, shuning uchun mavjud imtihon oqimini bузмайди.
+# ===================== MINI APP (veb-ilova: profil + interaktiv test yechish) =====================
+# ✅ Telegram Mini App — bot menyusidagi "📱 Mini App" tugmasi (yoki test
+# kodi topilganda chiqadigan tugma) orqali Telegram ichida ochiladigan
+# veb-ilova. Ikki qismdan iborat:
+#   1) 📝 Test yechish — o'quvchi test kodini kiritadi, ilova test turiga
+#      moslashgan interaktiv oyna ochadi: DTM javoblar varaqasi (doirachalar),
+#      SAT uchun kalkulyator/grafik/formulalar, ochiq savollar uchun yozish
+#      maydoni (+ rasm), bosqichli imtihonlarda bo'limma-bo'lim o'tish,
+#      Writing uchun matn muharriri, Listening uchun audio pleyer.
+#   2) 👤 Profil — statistika, natijalar, sertifikatlar.
 #
-# Xavfsizlik: Telegram har bir Mini App ochilishida "initData" degan
-# imzolangan satr beradi. Bu initData'ni bot tokenidan olingan maxfiy kalit
-# bilan tekshirmasak, istalgan kishi o'zini boshqa foydalanuvchi qilib
-# ko'rsatib, uning natijalari/sertifikatlarini ko'rishi mumkin bo'lardi.
-# validate_webapp_init_data — aynan shu soxta so'rovlarni ushlab qoladi
-# (Telegramning rasmiy WebApp hash tekshiruv algoritmi bo'yicha).
+# MUHIM: ilova botning O'ZIDAGI qoidalar va funksiyalardan foydalanadi —
+# sessiyalar (sessions), taymer, to'lov holati, baholash
+# (process_test_submission, _finalize_staged_attempt), sertifikat. Natija
+# chatga ham avvalgidek yuboriladi. Ilovada boshlangan test chatda (yoki
+# aksincha) davom ettirilsa ham javoblar yo'qolmaydi.
+#
+# Xavfsizlik: har bir so'rov Telegram "initData" imzosi bilan tekshiriladi
+# (validate_webapp_init_data); javob kalitlari hech qachon brauzerga
+# yuborilmaydi (faqat qaysi savol ochiq ekani ko'rsatiladi — botda ham shunday).
 def validate_webapp_init_data(init_data: str, bot_token: str, max_age_sec: int = 86400) -> dict | None:
     if not init_data:
         return None
@@ -12134,12 +12154,13 @@ def validate_webapp_init_data(init_data: str, bot_token: str, max_age_sec: int =
         return None
 
     auth_date = parsed.get("auth_date")
-    if auth_date:
-        try:
-            if now_ts() - int(auth_date) > max_age_sec:
-                return None
-        except ValueError:
+    if not auth_date:
+        return None
+    try:
+        if now_ts() - int(auth_date) > max_age_sec:
             return None
+    except ValueError:
+        return None
 
     data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
     secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
@@ -12168,106 +12189,1052 @@ async def _webapp_auth_user_row(request: web.Request):
     return row
 
 
-WEBAPP_HTML = """<!DOCTYPE html>
-<html lang="uz">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Veb-profil</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
-<style>
-  :root{
-    --bg: var(--tg-theme-bg-color, #f2f2f7);
-    --card: var(--tg-theme-secondary-bg-color, #ffffff);
-    --text: var(--tg-theme-text-color, #16232e);
-    --hint: var(--tg-theme-hint-color, #6b7680);
-    --accent: var(--tg-theme-button-color, #1e3a5f);
-    --accent-text: var(--tg-theme-button-text-color, #ffffff);
-    --line: rgba(120,120,128,0.22);
-  }
-  *{box-sizing:border-box;}
-  body{
-    margin:0; padding:16px; background:var(--bg); color:var(--text);
-    font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif;
-  }
-  h1{font-size:20px; margin:4px 0 2px;}
-  .hint{color:var(--hint); font-size:13px; margin-bottom:16px;}
-  .stats{display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-bottom:18px;}
-  .stat{background:var(--card); border-radius:12px; padding:12px 8px; text-align:center;}
-  .stat b{display:block; font-size:18px;}
-  .stat span{font-size:11px; color:var(--hint);}
-  .section-title{font-size:13px; color:var(--hint); text-transform:uppercase; letter-spacing:.04em; margin:18px 0 8px;}
-  .item{background:var(--card); border-radius:12px; padding:12px; margin-bottom:8px;}
-  .item .row{display:flex; justify-content:space-between; align-items:center; gap:8px;}
-  .item .title{font-weight:600; font-size:14px;}
-  .item .meta{color:var(--hint); font-size:12px; margin-top:2px;}
-  .badge{background:var(--accent); color:var(--accent-text); font-size:12px; padding:3px 8px; border-radius:8px; white-space:nowrap;}
-  a.dl{display:inline-block; margin-top:8px; background:var(--accent); color:var(--accent-text); text-decoration:none; font-size:13px; padding:6px 10px; border-radius:8px;}
-  .empty{color:var(--hint); font-size:14px; text-align:center; padding:32px 0;}
-  .err{color:#c0392b; text-align:center; padding:32px 0;}
-</style>
-</head>
-<body>
-  <h1 id="name">...</h1>
-  <div class="hint">Statistika, natijalar va sertifikatlar</div>
-  <div class="stats">
-    <div class="stat"><b id="s-count">0</b><span>jami test</span></div>
-    <div class="stat"><b id="s-avg">0%</b><span>o'rtacha</span></div>
-    <div class="stat"><b id="s-best">0%</b><span>eng yaxshi</span></div>
-  </div>
-  <div class="section-title">So'nggi natijalar</div>
-  <div id="results"><div class="empty">Yuklanmoqda...</div></div>
-
-<script>
-const tg = window.Telegram && window.Telegram.WebApp;
-if (tg) { tg.ready(); tg.expand(); }
-const initData = tg ? tg.initData : "";
-
-function esc(s) {
-  return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+WEB_EXAM_LABELS = {
+    "simple": "Oddiy test", "rasch": "Rasch (MS)", "dtm": "DTM (5 fan)", "cefr": "CEFR", "ielts": "IELTS",
+    "sat": "SAT", "dtm_staged": "DTM (5 bosqich)", "ielts4": "IELTS (4 ko'nikma)",
+    "cefr4": "CEFR (4 ko'nikma)", "sat_staged": "SAT (R&W + Math)",
 }
+WEB_DEADLINE_TASKS: dict[tuple[int, int], asyncio.Task] = {}
+WEB_DEADLINE_GRACE_SEC = 20   # ilova o'zi topshirishga ulgurmasa (internet uzilgan) — server topshiradi
+WEB_FILE_CACHE_DIR = os.path.join(tempfile.gettempdir(), "edutest_webapp_files")
+WEB_MAX_PHOTO_BYTES = 10 * 1024 * 1024
+WEB_RATE_WINDOW_SEC = 60
+WEB_RATE_LIMIT = 240          # avtomatik saqlash bilan birga ham bemalol yetadi
+WEB_OPEN_TEXT_MAX = 500       # botdagi ochiq savol javobi chegarasi bilan bir xil
+WEB_WRITING_TEXT_MAX = 4000   # botdagi Writing chegarasi bilan bir xil
+_web_hits: dict[int, deque] = defaultdict(deque)
+_web_file_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
-async function load() {
-  try {
-    const res = await fetch("/api/profile", { headers: { "X-Telegram-Init-Data": initData } });
-    if (!res.ok) throw new Error("unauthorized");
-    const data = await res.json();
 
-    document.getElementById("name").textContent = data.full_name || "Profil";
-    document.getElementById("s-count").textContent = data.summary.count;
-    document.getElementById("s-avg").textContent = data.summary.avg_percent.toFixed(1) + "%";
-    document.getElementById("s-best").textContent = data.summary.best_percent.toFixed(1) + "%";
+class WebError(Exception):
+    def __init__(self, code: str, message: str, status: int = 400, **extra):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status = status
+        self.extra = extra
 
-    const box = document.getElementById("results");
-    if (!data.results.length) {
-      box.innerHTML = '<div class="empty">Hali natijalar yo\\'q</div>';
-      return;
+
+def _web_handler(fn):
+    async def wrapper(request: web.Request):
+        try:
+            return await fn(request)
+        except WebError as e:
+            return web.json_response({"ok": False, "error": e.code, "message": e.message, **e.extra},
+                                     status=e.status)
+        except Exception:
+            logging.exception(f"Mini App API xatosi: {request.method} {request.path}")
+            return web.json_response(
+                {"ok": False, "error": "server", "message": "Serverda kutilmagan xatolik. Qayta urinib ko'ring."},
+                status=500)
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
+def _web_rate_ok(tg_id: int) -> bool:
+    now_ = time.time()
+    dq = _web_hits[tg_id]
+    while dq and now_ - dq[0] > WEB_RATE_WINDOW_SEC:
+        dq.popleft()
+    if len(dq) >= WEB_RATE_LIMIT:
+        return False
+    dq.append(now_)
+    return True
+
+
+async def _web_auth(request: web.Request, need_registered: bool = True) -> dict:
+    init_data = request.headers.get("X-Telegram-Init-Data") or request.query.get("initData", "")
+    tg_user = validate_webapp_init_data(init_data, BOT_TOKEN)
+    if not tg_user or "id" not in tg_user:
+        raise WebError("unauthorized", "Ilovani Telegram ichidan, bot menyusi orqali oching.", 401)
+    tg_id = int(tg_user["id"])
+    if not _web_rate_ok(tg_id):
+        raise WebError("rate", "Juda ko'p so'rov yuborildi. Bir oz kutib, qayta urinib ko'ring.", 429)
+    blocked, remain = await SECURITY.is_blocked(tg_id)
+    if blocked:
+        raise WebError("blocked", f"Siz vaqtincha bloklangansiz. Qolgan vaqt: {fmt_seconds(remain)}", 403)
+    row = await POOL.fetchrow("SELECT id, full_name FROM users WHERE telegram_id=$1", tg_id)
+    registered = bool(row and (row["full_name"] or "").strip())
+    if need_registered and not registered:
+        raise WebError("not_registered", "Avval botda ro'yxatdan o'ting: botga /start yuboring.", 403)
+    return {"tg_id": tg_id, "user_db_id": row["id"] if row else None,
+            "full_name": row["full_name"] if row else None, "registered": registered}
+
+
+async def _web_body(request: web.Request) -> dict:
+    try:
+        data = await request.json()
+    except Exception:
+        raise WebError("bad_request", "So'rov formati noto'g'ri.")
+    if not isinstance(data, dict):
+        raise WebError("bad_request", "So'rov formati noto'g'ri.")
+    return data
+
+
+def _web_int(value, name: str = "id") -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise WebError("bad_request", f"Noto'g'ri {name}.")
+
+
+def _web_lock(bot: Bot, tg_id: int):
+    """Botdagi tugmalar bilan BIR NAVBATDA ishlash uchun foydalanuvchi qulfi
+    (SimpleEventIsolation) — chat va ilova bir vaqtda bir testni buzmasligi uchun."""
+    if EVENTS_ISOLATION is None:
+        return contextlib.nullcontext()
+    return EVENTS_ISOLATION.lock(StorageKey(bot_id=bot.id, chat_id=tg_id, user_id=tg_id))
+
+
+def _web_fsm(bot: Bot, tg_id: int) -> FSMContext | None:
+    if FSM_STORAGE is None:
+        return None
+    return FSMContext(storage=FSM_STORAGE, key=StorageKey(bot_id=bot.id, chat_id=tg_id, user_id=tg_id))
+
+
+async def _web_bot_username(bot: Bot) -> str:
+    try:
+        me = await bot.me()
+        return me.username or ""
+    except Exception:
+        return ""
+
+
+async def _web_require_subscribed(bot: Bot, tg_id: int) -> None:
+    if await is_admin_user(tg_id):
+        return
+    ok, not_joined = await check_user_subscribed(bot, tg_id)
+    if ok:
+        return
+    channels = []
+    for r in not_joined:
+        url = (r["join_url"] or "").strip() or (f"https://t.me/{r['username']}" if r["username"] else "")
+        channels.append({"title": r["title"] or (("@" + r["username"]) if r["username"] else "Kanal"), "url": url})
+    raise WebError("not_subscribed", "Davom etish uchun quyidagi kanal/guruhlarga a'zo bo'ling.", 403,
+                   channels=channels)
+
+
+def _web_n_opts(key: str) -> int:
+    """Variantlar soni — kalitdagi eng katta harfga qarab (kamida A-D).
+    Butun test uchun bitta son: qaysi savolda qaysi javob ekanini oshkor qilmaydi."""
+    letters = [ord(c) - 96 for c in (key or "") if c in "abcdef"]
+    return max(4, max(letters) if letters else 4)
+
+
+def _web_layout(exam_type: str, dtm_cfg_raw: str | None, qcount: int) -> list[dict]:
+    if (exam_type or "") == "dtm":
+        try:
+            cfg = json.loads(dtm_cfg_raw) if dtm_cfg_raw else DTM_DEFAULT_CFG
+            blocks, start = [], 1
+            for s in cfg.get("subjects", []):
+                q = int(s["q"])
+                blocks.append({"name": str(s.get("name") or ""), "from": start, "to": start + q - 1,
+                               "w": float(s.get("w") or 1)})
+                start += q
+            if start - 1 == qcount and blocks:
+                return blocks
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            pass
+    return [{"name": "", "from": 1, "to": qcount}]
+
+
+def _web_tools(exam_type: str, section_key: str | None = None) -> dict:
+    et = exam_type or "simple"
+    sat_math = et == "sat" or (et == "sat_staged" and section_key == "math")
+    sat_any = et in ("sat", "sat_staged")
+    return {"calculator": sat_math, "reference": sat_math, "eliminator": sat_any,
+            "default_view": "card" if sat_any else "sheet"}
+
+
+def _web_question_payload(key: str, qcount: int, saved: dict) -> dict:
+    key = key[:qcount]
+    open_pos = [i + 1 for i, c in enumerate(key) if c == "x"]
+    return {
+        "qcount": qcount, "n_opts": _web_n_opts(key), "open": open_pos,
+        "answers": {k: v for k, v in (saved.get("answers") or {}).items() if isinstance(v, str)},
+        "open_answers": {k: {"text": (v or {}).get("text"), "photo_id": (v or {}).get("photo_id")}
+                         for k, v in (saved.get("open_answers") or {}).items() if isinstance(v, dict)},
+        "flags": [int(x) for x in (saved.get("flags") or []) if str(x).isdigit()],
+        "current_q": int(saved.get("current_q") or 1),
+        "updated": int(saved.get("updated") or 0),
     }
-    box.innerHTML = data.results.map(r => `
-      <div class="item">
-        <div class="row">
-          <div>
-            <div class="title">${esc(r.title)}</div>
-            <div class="meta">${esc(r.code)} · ${esc(r.date)}</div>
-          </div>
-          <div class="badge">${r.percent.toFixed(1)}%</div>
-        </div>
-        <div class="meta">✅ ${r.score}/${r.total}${r.grade ? " · " + esc(r.grade) : ""}</div>
-        ${r.has_certificate ? `<a class="dl" href="/api/certificate/${r.id}?initData=${encodeURIComponent(initData)}">📥 Sertifikat (PDF)</a>` : ""}
-      </div>
-    `).join("");
-  } catch (e) {
-    document.getElementById("results").innerHTML = '<div class="err">Ma\\'lumotlarni yuklab bo\\'lmadi. Botni Telegram ichida oching.</div>';
-  }
+
+
+def _web_clean_answers(raw_answers, raw_open, key: str, qcount: int, allowed_photos: set) -> tuple[dict, dict]:
+    """Brauzerdan kelgan javoblarni bot formatiga keltiradi: variantli savolga
+    faqat ruxsat etilgan harf, ochiq (x) savolga matn yoki SHU foydalanuvchi
+    yuklagan rasm. Ochiq savolga javob bo'lsa answers[q] = "x" (botdagidek)."""
+    raw_answers = raw_answers if isinstance(raw_answers, dict) else {}
+    raw_open = raw_open if isinstance(raw_open, dict) else {}
+    letters = "abcdef"[:_web_n_opts(key)]
+    answers, open_answers = {}, {}
+    for q in range(1, qcount + 1):
+        sq = str(q)
+        if q - 1 < len(key) and key[q - 1] == "x":
+            o = raw_open.get(sq) if isinstance(raw_open.get(sq), dict) else {}
+            text = sanitize_plain_text(str(o.get("text") or ""), max_len=WEB_OPEN_TEXT_MAX) or None
+            pid = o.get("photo_id")
+            pid = pid if isinstance(pid, str) and pid in allowed_photos else None
+            if text or pid:
+                open_answers[sq] = {"text": text, "photo_id": pid}
+                answers[sq] = "x"
+        else:
+            v = str(raw_answers.get(sq) or "").strip().lower()
+            if v in letters and len(v) == 1:
+                answers[sq] = v
+    return answers, open_answers
+
+
+def _web_clean_flags(raw, qcount: int) -> list[int]:
+    out = []
+    for x in raw if isinstance(raw, list) else []:
+        try:
+            n = int(x)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= n <= qcount and n not in out:
+            out.append(n)
+    return out[:qcount]
+
+
+async def _web_load_saved(user_db_id: int, test_id: int, mode: str) -> dict:
+    return _load_json_dict(await POOL.fetchval(
+        "SELECT saved_answers FROM sessions WHERE user_id=$1 AND test_id=$2 AND mode=$3", user_db_id, test_id, mode))
+
+
+async def _web_store_saved(user_db_id: int, test_id: int, mode: str, payload: dict) -> None:
+    payload["updated"] = now_ts()
+    await POOL.execute("UPDATE sessions SET saved_answers=$1 WHERE user_id=$2 AND test_id=$3 AND mode=$4",
+                       json.dumps(payload, ensure_ascii=False), user_db_id, test_id, mode)
+
+
+async def _web_test_row(code: str | None = None, test_id: int | None = None):
+    q = """
+        SELECT id, code, title, subject, is_free, price, duration, questions_count, file_id, answers,
+               start_mode, start_ts, start_at, exam_type, dtm_cfg, skills_cfg,
+               COALESCE(is_hidden,0) AS is_hidden, COALESCE(is_closed,0) AS is_closed,
+               COALESCE(rush_finalized,0) AS rush_finalized, open_ref_answers
+        FROM tests WHERE """
+    if test_id is not None:
+        return await POOL.fetchrow(q + "id=$1", test_id)
+    return await POOL.fetchrow(q + "code=$1", normalize_code(code or ""))
+
+
+def _web_test_info(t) -> dict:
+    et = t["exam_type"] or "simple"
+    info = {
+        "id": t["id"], "code": t["code"], "title": t["title"], "subject": t["subject"],
+        "exam_type": et, "exam_label": WEB_EXAM_LABELS.get(et, et), "is_free": int(t["is_free"] or 0) == 1,
+        "price": int(t["price"] or 0), "duration": int(t["duration"] or 0),
+        "qcount": int(t["questions_count"] or 0), "scheduled": (t["start_mode"] or "normal") == "scheduled",
+        "start_at": t["start_at"], "staged": et in STAGED_EXAM_TYPES,
+    }
+    if info["staged"]:
+        cfg = _load_skills_cfg(t["skills_cfg"])
+        info["sections"] = [
+            {"key": k, "name": cfg["sections"][k].get("name") or k, "type": cfg["sections"][k].get("type"),
+             "type_label": STAGE_TYPE_LABELS.get(cfg["sections"][k].get("type"), ""),
+             "duration_min": int(cfg["sections"][k].get("duration_min") or 0),
+             "qcount": int(cfg["sections"][k].get("qcount") or 0)}
+            for k in cfg.get("order") or [] if k in cfg.get("sections", {})
+        ]
+    return info
+
+
+async def _web_latest_payment(user_db_id: int, test_id: int):
+    return await POOL.fetchrow(
+        "SELECT id, status, started_ts, reject_reason FROM payments WHERE user_id=$1 AND test_id=$2 "
+        "ORDER BY id DESC LIMIT 1", user_db_id, test_id)
+
+
+async def _web_latest_attempt(user_db_id: int, test_id: int):
+    return await POOL.fetchrow(
+        "SELECT id, status, section_idx, sections_json, overall_grade, overall_score, attempt_no "
+        "FROM staged_attempts WHERE user_id=$1 AND test_id=$2 ORDER BY id DESC LIMIT 1", user_db_id, test_id)
+
+
+async def _web_access(user_db_id: int, t) -> dict:
+    """Bot qoidalari bilan bir xil: shu o'quvchi shu testni hozir boshlay
+    oladimi (free_test_start / begin_test / start_staged_attempt mantig'i)."""
+    et = t["exam_type"] or "simple"
+    staged = et in STAGED_EXAM_TYPES
+    is_free = int(t["is_free"] or 0) == 1
+    payment = None
+    if is_free:
+        if int(t["is_hidden"]) == 1:
+            return {"state": "hidden"}
+    else:
+        payment = await _web_latest_payment(user_db_id, t["id"])
+        if not payment or payment["status"] not in ("pending", "rejected", "approved"):
+            return {"state": "need_payment"}
+        if payment["status"] == "pending":
+            return {"state": "payment_pending"}
+        if payment["status"] == "rejected":
+            return {"state": "payment_rejected", "reason": payment["reject_reason"]}
+
+    if staged:
+        if int(t["is_closed"]) == 1:
+            return {"state": "closed"}
+        a = await _web_latest_attempt(user_db_id, t["id"])
+        if a:
+            if a["status"] == "in_progress":
+                return {"state": "resume", "attempt_id": a["id"]}
+            if a["status"] == "pending_review":
+                return {"state": "pending_review"}
+            # status == 'graded' — botdagidek qayta yechish mumkin (eski natija saqlanadi)
+            can_retake = int(t["is_hidden"]) == 0
+            return {"state": "staged_done", "can_retake": can_retake, "grade": a["overall_grade"]}
+        return {"state": "ready"}
+
+    mode = "free" if is_free else "paid"
+    session = await get_session(user_db_id, t["id"], mode)
+    if int(t["is_closed"]) == 1 and (is_free or not session):
+        return {"state": "closed"}
+    blocked, left = is_scheduled_not_started(t["start_mode"], t["start_ts"])
+    if blocked:
+        return {"state": "not_started", "left": left}
+    if await POOL.fetchval("SELECT 1 FROM results WHERE user_id=$1 AND test_id=$2 LIMIT 1", user_db_id, t["id"]):
+        return {"state": "done"}
+    key = normalize_answers(t["answers"] or "")
+    if len(key) != int(t["questions_count"] or 0):
+        return {"state": "broken"}
+
+    if session:
+        start_ts_, dur = int(session["start_ts"]), int(session["duration_sec"])
+    else:
+        dur = int(t["duration"] or 0) * 60
+        if (t["start_mode"] or "normal") == "scheduled" and int(t["start_ts"] or 0) > 0:
+            start_ts_ = int(t["start_ts"])
+        elif payment and payment["started_ts"]:
+            start_ts_ = int(payment["started_ts"])
+        else:
+            start_ts_ = None
+    if start_ts_ is not None and now_ts() > start_ts_ + dur + 60:
+        return {"state": "expired"}
+    if session:
+        return {"state": "resume", "end_ts": start_ts_ + dur}
+    return {"state": "ready"}
+
+
+WEB_STATE_MESSAGES = {
+    "ready": "Test boshlashga tayyor.",
+    "resume": "Bu testni avval boshlagansiz — qolgan vaqtdan davom etasiz, javoblaringiz saqlangan.",
+    "done": "Siz bu testni allaqachon topshirgansiz.",
+    "hidden": "Bu test vaqtincha to'xtatilgan. Keyinroq urinib ko'ring.",
+    "closed": "Bu test yakunlangan — yangi urinish qabul qilinmaydi.",
+    "not_started": "Test hali boshlanmagan.",
+    "expired": "Bu testning vaqti tugagan.",
+    "broken": "Test noto'g'ri sozlangan (javob kaliti savollar soniga mos emas). Ustozga xabar bering.",
+    "need_payment": "Bu test pullik. To'lov bot orqali qilinadi: «🧾 Pullik testlar» bo'limi.",
+    "payment_pending": "To'lov chekingiz tekshirilmoqda. Tasdiqlangach shu yerda boshlay olasiz.",
+    "payment_rejected": "To'lovingiz rad etilgan. Botdagi «📦 Pullik testlarim» orqali qayta yuboring.",
+    "pending_review": "Javoblaringiz yuborilgan — ustoz baholayapti. Natija botga keladi.",
+    "staged_done": "Siz bu imtihonni topshirgansiz. Xohlasangiz qaytadan yechishingiz mumkin (eski natija saqlanadi).",
 }
-load();
-</script>
-</body>
-</html>"""
+
+
+def _web_schedule_deadline(bot: Bot, tg_id: int, test_id: int, end_ts: int) -> None:
+    key = (tg_id, test_id)
+    old = WEB_DEADLINE_TASKS.pop(key, None)
+    if old and not old.done():
+        old.cancel()
+    WEB_DEADLINE_TASKS[key] = asyncio.create_task(_web_deadline(bot, tg_id, test_id, end_ts))
+
+
+def _web_cancel_deadline(tg_id: int, test_id: int) -> None:
+    task = WEB_DEADLINE_TASKS.pop((tg_id, test_id), None)
+    if task and not task.done() and task is not asyncio.current_task():
+        task.cancel()
+
+
+async def _web_deadline(bot: Bot, tg_id: int, test_id: int, end_ts: int) -> None:
+    """Ilovada boshlangan test/bo'lim vaqti tugaganda (ilova yopilgan yoki
+    internet uzilgan bo'lsa ham) oxirgi saqlangan javoblar bilan topshiradi."""
+    key = (tg_id, test_id)
+    try:
+        await asyncio.sleep(max(0, end_ts - now_ts()) + WEB_DEADLINE_GRACE_SEC)
+        if WEB_DEADLINE_TASKS.get(key) is asyncio.current_task():
+            WEB_DEADLINE_TASKS.pop(key, None)
+        async with _web_lock(bot, tg_id):
+            et = await POOL.fetchval("SELECT exam_type FROM tests WHERE id=$1", test_id)
+            if (et or "") in STAGED_EXAM_TYPES:
+                await _web_staged_timeout(bot, tg_id, test_id, end_ts)
+            else:
+                await _auto_submit_on_timeout_unlocked(bot, tg_id, test_id, end_ts)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logging.exception(f"Mini App: vaqt tugaganda topshirib bo'lmadi (user={tg_id}, test={test_id})")
+    finally:
+        if WEB_DEADLINE_TASKS.get(key) is asyncio.current_task():
+            WEB_DEADLINE_TASKS.pop(key, None)
+
+
+# ----- Fayllar (test PDF, Listening audio) -----
+def _web_sniff_type(head: bytes, kind: str | None) -> str:
+    if head.startswith(b"%PDF"):
+        return "application/pdf"
+    if head.startswith(b"RIFF") and head[8:12] == b"WAVE":
+        return "audio/wav"
+    if head.startswith(b"OggS"):
+        return "audio/ogg"
+    if head.startswith(b"ID3") or head[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        return "audio/mpeg"
+    if head[4:8] == b"ftyp":
+        return "audio/mp4" if kind == "audio" else "video/mp4"
+    if head.startswith(b"\x89PNG"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8"):
+        return "image/jpeg"
+    return "application/octet-stream"
+
+
+async def _web_fetch_file(bot: Bot, file_id: str) -> str:
+    os.makedirs(WEB_FILE_CACHE_DIR, exist_ok=True)
+    name = hashlib.sha256(file_id.encode()).hexdigest()[:48]
+    path = os.path.join(WEB_FILE_CACHE_DIR, name)
+    async with _web_file_locks[name]:
+        if not os.path.exists(path):
+            try:
+                tg_file = await bot.get_file(file_id)
+            except TelegramBadRequest as e:
+                if "too big" in str(e).lower():
+                    raise WebError("file_too_big", "Fayl juda katta (20 MB dan ortiq) — uni botdan oling.", 413)
+                raise
+            tmp = path + ".part"
+            await bot.download_file(tg_file.file_path, destination=tmp)
+            os.replace(tmp, path)
+    return path
+
+
+# ----- Bitta sessiyali testlar (oddiy, DTM, Rasch, SAT, CEFR, IELTS) -----
+async def _web_take_over_chat_single(bot: Bot, tg_id: int, test_id: int) -> None:
+    """Shu test chatda ochiq turgan bo'lsa — chatdagi javoblarni sessiyaga
+    yozib, chat holatini yopamiz (endi test ilovada davom etadi)."""
+    fsm = _web_fsm(bot, tg_id)
+    if fsm is None:
+        return
+    st = await fsm.get_state()
+    data = await fsm.get_data()
+    if st in (TestProcessState.solving.state, TestProcessState.awaiting_free_text.state) \
+            and int(data.get("test_id") or 0) == test_id:
+        await _stash_test_progress(fsm, tg_id)
+        await fsm.clear()
+        cancel_timer(tg_id, test_id)
+
+
+async def _web_start_single(bot: Bot, ctx: dict, t, access: dict) -> dict:
+    user_db_id, tg_id, test_id = ctx["user_db_id"], ctx["tg_id"], t["id"]
+    is_free = int(t["is_free"] or 0) == 1
+    mode = "free" if is_free else "paid"
+    session = await get_session(user_db_id, test_id, mode)
+    if session:
+        start_ts_, dur = int(session["start_ts"]), int(session["duration_sec"])
+    else:
+        dur = int(t["duration"] or 0) * 60
+        payment = None if is_free else await _web_latest_payment(user_db_id, test_id)
+        if (t["start_mode"] or "normal") == "scheduled" and int(t["start_ts"] or 0) > 0:
+            start_ts_ = int(t["start_ts"])
+        elif payment and payment["started_ts"]:
+            start_ts_ = int(payment["started_ts"])
+        else:
+            start_ts_ = now_ts()
+        if payment and not payment["started_ts"]:
+            await POOL.execute("UPDATE payments SET started_at=$1, started_ts=$2 WHERE id=$3",
+                               now_str_local(), start_ts_, payment["id"])
+        await upsert_session(user_db_id, test_id, mode, start_ts_, dur)
+    end_ts_ = start_ts_ + dur
+
+    await _web_take_over_chat_single(bot, tg_id, test_id)
+    saved = await _web_load_saved(user_db_id, test_id, mode)
+    _web_schedule_deadline(bot, tg_id, test_id, end_ts_)
+
+    key = normalize_answers(t["answers"] or "")
+    qcount = int(t["questions_count"] or 0)
+    et = t["exam_type"] or "simple"
+    files = [{"slot": "main", "kind": "document", "name": "Savollar"}] if t["file_id"] else []
+    return {
+        "kind": "single", "test": _web_test_info(t), "mode": mode, "end_ts": end_ts_, "server_now": now_ts(),
+        "layout": _web_layout(et, t["dtm_cfg"], qcount), "tools": _web_tools(et), "files": files,
+        **_web_question_payload(key, qcount, saved),
+    }
+
+
+async def _web_result_view(user_db_id: int, test_id: int) -> dict:
+    t = await _web_test_row(test_id=test_id)
+    if not t:
+        raise WebError("not_found", "Test topilmadi.", 404)
+    et = t["exam_type"] or "simple"
+    base = {"test": _web_test_info(t)}
+    if et in STAGED_EXAM_TYPES:
+        a = await POOL.fetchrow(
+            "SELECT id, status, sections_json, overall_grade, overall_score FROM staged_attempts "
+            "WHERE user_id=$1 AND test_id=$2 AND status<>'in_progress' ORDER BY id DESC LIMIT 1", user_db_id, test_id)
+        if not a:
+            return {**base, "state": "none"}
+        cfg = _load_skills_cfg(t["skills_cfg"])
+        sections = _load_json_dict(a["sections_json"])
+        out = []
+        for k in cfg.get("order") or []:
+            s = sections.get(k) or {}
+            sec_cfg = cfg["sections"].get(k, {})
+            out.append({
+                "key": k, "name": sec_cfg.get("name") or k, "type": sec_cfg.get("type"),
+                "score": s.get("score"), "total": s.get("total"), "band": s.get("band"),
+                "earned": s.get("earned"), "max": s.get("max"), "feedback": s.get("feedback"),
+                "open_pending": int(s.get("open_pending") or 0), "submitted": k in sections,
+            })
+        r = await POOL.fetchrow("SELECT id, percent, certificate_sent FROM results WHERE user_id=$1 AND test_id=$2",
+                                user_db_id, test_id)
+        return {**base, "state": "staged", "status": a["status"], "overall_grade": a["overall_grade"],
+                "overall_score": a["overall_score"], "sections": out,
+                "percent": float(r["percent"]) if r and r["percent"] is not None else None,
+                "certificate": bool(r and int(r["certificate_sent"] or 0) == 1), "result_id": r["id"] if r else None}
+
+    r = await POOL.fetchrow("""
+        SELECT id, score, total_questions, percent, earned_points, max_points, details, grade, rasch_ball,
+               rasch_percent, user_answers, open_text_answers, open_grades, COALESCE(open_pending,0) AS open_pending,
+               COALESCE(certificate_sent,0) AS certificate_sent
+        FROM results WHERE user_id=$1 AND test_id=$2
+    """, user_db_id, test_id)
+    if not r:
+        return {**base, "state": "none"}
+    key = normalize_answers(t["answers"] or "")
+    view = {
+        **base, "state": "single", "result_id": r["id"], "score": r["score"], "total": r["total_questions"],
+        "percent": float(r["percent"] or 0), "earned": r["earned_points"], "max": r["max_points"],
+        "grade": r["grade"], "open_pending": int(r["open_pending"]), "certificate": int(r["certificate_sent"]) == 1,
+    }
+    open_grades = _load_json_dict(r["open_grades"])
+    scored_total = sum(1 for i, c in enumerate(key[:int(t["questions_count"] or 0)])
+                       if c != "x" or open_grades.get(str(i + 1)) is not None)
+    view["scored_total"] = scored_total
+    if et == "dtm":
+        view["subjects"] = (_load_json_dict(r["details"]) or {}).get("subjects") or []
+    review_allowed = True
+    if et == "rasch":
+        finalized = int(t["rush_finalized"]) == 1
+        view["rasch"] = {"finalized": finalized, "ball": r["rasch_ball"], "percent": r["rasch_percent"],
+                         "grade": r["grade"], "remain_text": None if finalized else await remaining_time_text(test_id)}
+        end_ts = await get_test_end_ts(test_id)
+        review_allowed = end_ts > 0 and now_ts() >= end_ts
+    view["review_allowed"] = review_allowed
+    if review_allowed and r["user_answers"]:
+        user_ans = normalize_answers(r["user_answers"])
+        open_answers = _load_json_dict(r["open_text_answers"])
+        refs = _load_json_dict(t["open_ref_answers"])
+        items = []
+        for i in range(min(len(key), len(user_ans))):
+            n = str(i + 1)
+            if key[i] == "x":
+                g = open_grades.get(n)
+                oa = open_answers.get(n) or {}
+                items.append({"n": i + 1, "open": True, "ok": None if g is None else int(g) == 1,
+                              "you": (oa.get("text") if isinstance(oa, dict) else None) or
+                                     ("📷 rasm" if isinstance(oa, dict) and oa.get("photo_id") else ""),
+                              "key": refs.get(n) or ""})
+            else:
+                items.append({"n": i + 1, "open": False, "ok": user_ans[i] == key[i],
+                              "you": "" if user_ans[i] == "*" else user_ans[i].upper(), "key": key[i].upper()})
+        view["review"] = items
+    return view
+
+
+# ----- Bosqichli imtihonlar (DTM 5 bosqich, IELTS/CEFR 4 ko'nikma, SAT 2 bo'lim) -----
+def _web_staged_overview(t, attempt) -> dict:
+    cfg = _load_skills_cfg(t["skills_cfg"])
+    order = cfg.get("order") or []
+    sections = _load_json_dict(attempt["sections_json"]) if attempt else {}
+    pos = int(attempt["section_idx"] or 0) if attempt else 0
+    items = []
+    for i, k in enumerate(order):
+        s = cfg["sections"].get(k, {})
+        items.append({
+            "key": k, "name": s.get("name") or k, "type": s.get("type"),
+            "type_label": STAGE_TYPE_LABELS.get(s.get("type"), ""),
+            "duration_min": int(s.get("duration_min") or 0), "qcount": int(s.get("qcount") or 0),
+            "status": "done" if k in sections else ("current" if i == pos else "locked"),
+        })
+    return {"kind": "staged", "test": _web_test_info(t), "attempt_id": attempt["id"] if attempt else None,
+            "pos": pos, "sections": items, "server_now": now_ts()}
+
+
+async def _web_staged_attempt(user_db_id: int, test_id: int):
+    return await POOL.fetchrow(
+        "SELECT id, status, section_idx, sections_json FROM staged_attempts "
+        "WHERE user_id=$1 AND test_id=$2 AND status='in_progress' ORDER BY id DESC LIMIT 1", user_db_id, test_id)
+
+
+async def _web_take_over_chat_staged(bot: Bot, tg_id: int, test_id: int, user_db_id: int, key: str) -> None:
+    """Shu bosqich chatda ochiq bo'lsa — chatdagi belgilangan javoblarni
+    sessiyaga ko'chirib, chat holatini yopamiz."""
+    fsm = _web_fsm(bot, tg_id)
+    if fsm is None:
+        return
+    st = await fsm.get_state()
+    data = await fsm.get_data()
+    if st not in (StagedSolvingState.in_section.state, StagedSolvingState.awaiting_free_text.state) \
+            or data.get("staged_test_id") != test_id:
+        return
+    if data.get("stage_current_key") == key:
+        payload = {"answers": data.get("stage_mcq_answers") or {},
+                   "open_answers": data.get("stage_mcq_open_answers") or {},
+                   "current_q": data.get("stage_mcq_q", 1)}
+        if await get_session(user_db_id, test_id, f"stage_{key}"):
+            await _web_store_saved(user_db_id, test_id, f"stage_{key}", payload)
+    await fsm.clear()
+    cancel_timer(tg_id, test_id)
+
+
+async def _web_staged_finish_section(bot: Bot, tg_id: int, user_db_id: int, t, attempt_id: int,
+                                     key: str, raw: dict) -> dict:
+    """Bo'limni yakunlaydi (botdagi _complete_current_stage_mcq /
+    _save_stage_result_and_advance bilan bir xil natija), keyingisiga o'tadi
+    yoki butun imtihonni yakunlab baholaydi. Chatga keyingi bo'lim YUBORILMAYDI."""
+    test_id = t["id"]
+    cfg = _load_skills_cfg(t["skills_cfg"])
+    order = cfg.get("order") or []
+    sec = cfg["sections"][key]
+    stype = sec.get("type")
+    saved = await _web_load_saved(user_db_id, test_id, f"stage_{key}")
+    allowed_photos = set(saved.get("uploads") or [])
+
+    if stype in (STAGE_TYPE_MCQ, STAGE_TYPE_MCQ_BAND):
+        skey = normalize_answers(sec.get("answers") or "")
+        qcount = int(sec.get("qcount") or 0)
+        answers, open_answers = _web_clean_answers(raw.get("answers"), raw.get("open_answers"), skey, qcount,
+                                                   allowed_photos)
+        user_ans = "".join(answers.get(str(i), "*") for i in range(1, qcount + 1))
+        result = _build_stage_mcq_result(cfg, key, user_ans, open_answers)
+    else:
+        text = sanitize_plain_text(str(raw.get("text") or ""), max_len=WEB_WRITING_TEXT_MAX) or None
+        pid = raw.get("photo_id")
+        pid = pid if isinstance(pid, str) and pid in allowed_photos else None
+        result = {"text": text, "photo_id": pid, "band": None, "feedback": None}
+
+    await delete_session(user_db_id, test_id, f"stage_{key}")
+    _web_cancel_deadline(tg_id, test_id)
+    cancel_timer(tg_id, test_id)
+
+    row = await POOL.fetchrow("SELECT sections_json FROM staged_attempts WHERE id=$1", attempt_id)
+    sections = _load_json_dict(row["sections_json"]) if row else {}
+    sections[key] = result
+    pos = order.index(key) + 1
+    await POOL.execute("UPDATE staged_attempts SET sections_json=$1, section_idx=$2 WHERE id=$3",
+                       json.dumps(sections, ensure_ascii=False), pos, attempt_id)
+
+    if pos < len(order):
+        attempt = await POOL.fetchrow(
+            "SELECT id, status, section_idx, sections_json FROM staged_attempts WHERE id=$1", attempt_id)
+        return {"finished": False, "overview": _web_staged_overview(t, attempt)}
+
+    await _finalize_staged_attempt(tg_id, bot, _DetachedState({}), attempt_id, test_id, sections)
+    return {"finished": True, "result": await _web_result_view(user_db_id, test_id)}
+
+
+async def _web_staged_timeout(bot: Bot, tg_id: int, test_id: int, end_ts: int) -> None:
+    user_db_id = await get_user_db_id(tg_id)
+    if not user_db_id:
+        return
+    a = await _web_staged_attempt(user_db_id, test_id)
+    t = await _web_test_row(test_id=test_id)
+    if not a or not t:
+        return
+    cfg = _load_skills_cfg(t["skills_cfg"])
+    order = cfg.get("order") or []
+    pos = int(a["section_idx"] or 0)
+    if pos >= len(order):
+        return
+    key = order[pos]
+    sess = await get_session(user_db_id, test_id, f"stage_{key}")
+    if not sess or abs(int(sess["start_ts"]) + int(sess["duration_sec"]) - int(end_ts)) > 5:
+        return
+    saved = await _web_load_saved(user_db_id, test_id, f"stage_{key}")
+    try:
+        await bot.send_message(tg_id, "⏱ <b>Bo'lim vaqti tugadi</b> — Mini App'da belgilagan javoblaringiz "
+                                      "avtomatik topshirildi.", parse_mode=ParseMode.HTML)
+    except (TelegramForbiddenError, TelegramBadRequest):
+        pass
+    await _web_staged_finish_section(bot, tg_id, user_db_id, t, a["id"], key, saved)
+
+
+async def _web_staged_section_payload(bot: Bot, ctx: dict, t, attempt) -> dict:
+    user_db_id, tg_id, test_id = ctx["user_db_id"], ctx["tg_id"], t["id"]
+    cfg = _load_skills_cfg(t["skills_cfg"])
+    order = cfg.get("order") or []
+    pos = int(attempt["section_idx"] or 0)
+    if pos >= len(order):
+        raise WebError("no_section", "Barcha bo'limlar topshirilgan.")
+    key = order[pos]
+    sec = cfg["sections"][key]
+    stype = sec.get("type")
+    et = t["exam_type"]
+    base = {"kind": "section", "test": _web_test_info(t), "key": key, "name": sec.get("name") or key,
+            "type": stype, "pos": pos, "total": len(order), "duration_min": int(sec.get("duration_min") or 0)}
+    if stype == STAGE_TYPE_VOICE:
+        return {**base, "handoff": True, "prompt": sec.get("prompt") or "",
+                "bot_username": await _web_bot_username(bot)}
+
+    await _web_take_over_chat_staged(bot, tg_id, test_id, user_db_id, key)
+    sess = await get_session(user_db_id, test_id, f"stage_{key}")
+    if sess:
+        start_ts_, dur = int(sess["start_ts"]), int(sess["duration_sec"])
+    else:
+        start_ts_, dur = now_ts(), int(sec.get("duration_min") or 0) * 60
+        await upsert_session(user_db_id, test_id, f"stage_{key}", start_ts_, dur)
+    end_ts_ = start_ts_ + dur
+    saved = await _web_load_saved(user_db_id, test_id, f"stage_{key}")
+
+    if now_ts() > end_ts_ + 60:
+        # ✅ Bo'lim vaqti (masalan ilova yopiq turganda) tugab bo'lgan —
+        # botdagidek oxirgi saqlangan javoblar bilan yakunlaymiz.
+        res = await _web_staged_finish_section(bot, tg_id, user_db_id, t, attempt["id"], key, saved)
+        return {"kind": "expired", "section_name": base["name"], **res}
+
+    _web_schedule_deadline(bot, tg_id, test_id, end_ts_)
+    files = []
+    if sec.get("file_id"):
+        fk = sec.get("file_kind") or "document"
+        files.append({"slot": f"s_{key}", "kind": fk, "name": "Audio" if fk == "audio" else
+                      ("Video" if fk == "video" else "Savollar")})
+    if sec.get("question_file_id"):
+        files.append({"slot": f"sq_{key}", "kind": "document", "name": "Savollar"})
+    payload = {**base, "end_ts": end_ts_, "server_now": now_ts(), "tools": _web_tools(et, key), "files": files}
+    if stype in (STAGE_TYPE_MCQ, STAGE_TYPE_MCQ_BAND):
+        skey = normalize_answers(sec.get("answers") or "")
+        qcount = int(sec.get("qcount") or 0)
+        payload.update(_web_question_payload(skey, qcount, saved))
+        payload["layout"] = [{"name": "", "from": 1, "to": qcount}]
+    else:
+        payload.update({"prompt": sec.get("prompt") or "", "text": saved.get("text") or "",
+                        "photo_id": saved.get("photo_id"), "text_max": WEB_WRITING_TEXT_MAX,
+                        "updated": int(saved.get("updated") or 0)})
+    return payload
+
+
+# ----- HTTP endpointlar -----
+@_web_handler
+async def webapp_api_me(request: web.Request):
+    ctx = await _web_auth(request, need_registered=False)
+    bot: Bot = request.app["bot"]
+    out = {"ok": True, "registered": ctx["registered"], "full_name": ctx["full_name"],
+           "bot_username": await _web_bot_username(bot), "academy": ACADEMY_NAME}
+    if ctx["registered"]:
+        try:
+            await _web_require_subscribed(bot, ctx["tg_id"])
+            out["subscribed"] = True
+        except WebError as e:
+            out["subscribed"] = False
+            out["channels"] = e.extra.get("channels", [])
+    return web.json_response(out)
+
+
+@_web_handler
+async def webapp_api_lookup(request: web.Request):
+    ctx = await _web_auth(request)
+    bot: Bot = request.app["bot"]
+    await _web_require_subscribed(bot, ctx["tg_id"])
+    body = await _web_body(request)
+    code = normalize_code(str(body.get("code") or ""))
+    if not is_valid_code(code):
+        raise WebError("bad_code", "Kod formati noto'g'ri. Masalan: MS-001")
+    t = await _web_test_row(code=code)
+    if not t:
+        raise WebError("not_found", "Bunday kodli test topilmadi. Kodni tekshirib qayta kiriting.", 404)
+    access = await _web_access(ctx["user_db_id"], t)
+    msg = WEB_STATE_MESSAGES.get(access["state"], "")
+    if access["state"] == "payment_rejected" and access.get("reason"):
+        msg += f" Sabab: {access['reason']}"
+    return web.json_response({"ok": True, "test": _web_test_info(t), "access": access, "message": msg,
+                              "bot_username": await _web_bot_username(bot), "server_now": now_ts()})
+
+
+@_web_handler
+async def webapp_api_start(request: web.Request):
+    ctx = await _web_auth(request)
+    bot: Bot = request.app["bot"]
+    await _web_require_subscribed(bot, ctx["tg_id"])
+    body = await _web_body(request)
+    test_id = _web_int(body.get("test_id"), "test")
+    async with _web_lock(bot, ctx["tg_id"]):
+        t = await _web_test_row(test_id=test_id)
+        if not t:
+            raise WebError("not_found", "Test topilmadi.", 404)
+        access = await _web_access(ctx["user_db_id"], t)
+        st = access["state"]
+        et = t["exam_type"] or "simple"
+        if et in STAGED_EXAM_TYPES:
+            if st == "staged_done" and body.get("retake") and access.get("can_retake"):
+                last_no = await POOL.fetchval(
+                    "SELECT COALESCE(MAX(attempt_no), 0) FROM staged_attempts WHERE user_id=$1 AND test_id=$2",
+                    ctx["user_db_id"], test_id)
+                await POOL.execute("""
+                    INSERT INTO staged_attempts (user_id, test_id, status, section_idx, sections_json, attempt_no,
+                                                 started_at, created_ts)
+                    VALUES ($1, $2, 'in_progress', 0, '{}', $3, $4, $4)
+                """, ctx["user_db_id"], test_id, int(last_no) + 1, now_ts())
+            elif st == "ready":
+                await POOL.execute("""
+                    INSERT INTO staged_attempts (user_id, test_id, status, section_idx, sections_json, attempt_no,
+                                                 started_at, created_ts)
+                    VALUES ($1, $2, 'in_progress', 0, '{}', 1, $3, $3)
+                """, ctx["user_db_id"], test_id, now_ts())
+            elif st != "resume":
+                raise WebError(st, WEB_STATE_MESSAGES.get(st, "Testni boshlab bo'lmaydi."), 409)
+            attempt = await _web_staged_attempt(ctx["user_db_id"], test_id)
+            return web.json_response({"ok": True, **_web_staged_overview(t, attempt)})
+
+        if st not in ("ready", "resume"):
+            raise WebError(st, WEB_STATE_MESSAGES.get(st, "Testni boshlab bo'lmaydi."), 409)
+        payload = await _web_start_single(bot, ctx, t, access)
+    return web.json_response({"ok": True, **payload})
+
+
+@_web_handler
+async def webapp_api_section(request: web.Request):
+    ctx = await _web_auth(request)
+    bot: Bot = request.app["bot"]
+    await _web_require_subscribed(bot, ctx["tg_id"])
+    body = await _web_body(request)
+    test_id = _web_int(body.get("test_id"), "test")
+    async with _web_lock(bot, ctx["tg_id"]):
+        t = await _web_test_row(test_id=test_id)
+        if not t or (t["exam_type"] or "") not in STAGED_EXAM_TYPES:
+            raise WebError("not_found", "Bosqichli test topilmadi.", 404)
+        attempt = await _web_staged_attempt(ctx["user_db_id"], test_id)
+        if not attempt:
+            raise WebError("no_attempt", "Faol urinish topilmadi — testni qaytadan oching.", 409)
+        payload = await _web_staged_section_payload(bot, ctx, t, attempt)
+    return web.json_response({"ok": True, **payload})
+
+
+async def _web_resolve_mode(ctx: dict, t, section_key: str | None) -> tuple[str, str, int]:
+    """Saqlash/topshirish uchun sessiya rejimi, javob kaliti va savollar soni."""
+    et = t["exam_type"] or "simple"
+    if et in STAGED_EXAM_TYPES:
+        a = await _web_staged_attempt(ctx["user_db_id"], t["id"])
+        cfg = _load_skills_cfg(t["skills_cfg"])
+        order = cfg.get("order") or []
+        pos = int(a["section_idx"] or 0) if a else -1
+        if not a or pos >= len(order) or order[pos] != section_key:
+            raise WebError("stale", "Bu bo'lim allaqachon yakunlangan yoki eskirgan.", 409)
+        sec = cfg["sections"][section_key]
+        return f"stage_{section_key}", normalize_answers(sec.get("answers") or ""), int(sec.get("qcount") or 0)
+    mode = "free" if int(t["is_free"] or 0) == 1 else "paid"
+    return mode, normalize_answers(t["answers"] or ""), int(t["questions_count"] or 0)
+
+
+@_web_handler
+async def webapp_api_save(request: web.Request):
+    ctx = await _web_auth(request)
+    bot: Bot = request.app["bot"]
+    body = await _web_body(request)
+    test_id = _web_int(body.get("test_id"), "test")
+    section_key = body.get("section_key") or None
+    async with _web_lock(bot, ctx["tg_id"]):
+        t = await _web_test_row(test_id=test_id)
+        if not t:
+            raise WebError("not_found", "Test topilmadi.", 404)
+        mode, key, qcount = await _web_resolve_mode(ctx, t, section_key)
+        sess = await get_session(ctx["user_db_id"], test_id, mode)
+        if not sess:
+            raise WebError("no_session", "Test sessiyasi yakunlangan.", 409)
+        end_ts_ = int(sess["start_ts"]) + int(sess["duration_sec"])
+        if now_ts() > end_ts_ + 60:
+            raise WebError("time_over", "Vaqt tugagan.", 409)
+        saved = await _web_load_saved(ctx["user_db_id"], test_id, mode)
+        allowed = set(saved.get("uploads") or [])
+        payload = {"uploads": list(allowed)}
+        if mode.startswith("stage_") and not qcount:
+            payload["text"] = sanitize_plain_text(str(body.get("text") or ""), max_len=WEB_WRITING_TEXT_MAX)
+            pid = body.get("photo_id")
+            payload["photo_id"] = pid if isinstance(pid, str) and pid in allowed else None
+        else:
+            answers, open_answers = _web_clean_answers(body.get("answers"), body.get("open_answers"), key, qcount,
+                                                       allowed)
+            payload.update({"answers": answers, "open_answers": open_answers,
+                            "flags": _web_clean_flags(body.get("flags"), qcount),
+                            "current_q": max(1, min(qcount or 1, _web_int(body.get("current_q") or 1, "savol")))})
+        await _web_store_saved(ctx["user_db_id"], test_id, mode, payload)
+    return web.json_response({"ok": True, "server_now": now_ts(), "end_ts": end_ts_})
+
+
+@_web_handler
+async def webapp_api_submit(request: web.Request):
+    ctx = await _web_auth(request)
+    bot: Bot = request.app["bot"]
+    body = await _web_body(request)
+    test_id = _web_int(body.get("test_id"), "test")
+    async with _web_lock(bot, ctx["tg_id"]):
+        t = await _web_test_row(test_id=test_id)
+        if not t:
+            raise WebError("not_found", "Test topilmadi.", 404)
+        if (t["exam_type"] or "") in STAGED_EXAM_TYPES:
+            raise WebError("bad_request", "Bosqichli test bo'limlarini alohida topshiring.")
+        mode, key, qcount = await _web_resolve_mode(ctx, t, None)
+        if not await get_session(ctx["user_db_id"], test_id, mode):
+            # vaqt tugab server allaqachon topshirgan bo'lishi mumkin — natijani ko'rsatamiz
+            view = await _web_result_view(ctx["user_db_id"], test_id)
+            if view.get("state") != "none":
+                return web.json_response({"ok": True, "result": view})
+            raise WebError("no_session", "Test sessiyasi topilmadi — testni qaytadan oching.", 409)
+        saved = await _web_load_saved(ctx["user_db_id"], test_id, mode)
+        answers, open_answers = _web_clean_answers(body.get("answers"), body.get("open_answers"), key, qcount,
+                                                   set(saved.get("uploads") or []))
+        user_ans = "".join(answers.get(str(i), "*") for i in range(1, qcount + 1))
+        _web_cancel_deadline(ctx["tg_id"], test_id)
+        await process_test_submission(ctx["tg_id"], bot, _DetachedState({"test_id": test_id, "mode": mode}),
+                                      user_ans, open_answers)
+        view = await _web_result_view(ctx["user_db_id"], test_id)
+        if view.get("state") == "none":
+            raise WebError("time_over", "Vaqt tugagani uchun javoblar qabul qilinmadi.", 409)
+    return web.json_response({"ok": True, "result": view})
+
+
+@_web_handler
+async def webapp_api_section_submit(request: web.Request):
+    ctx = await _web_auth(request)
+    bot: Bot = request.app["bot"]
+    body = await _web_body(request)
+    test_id = _web_int(body.get("test_id"), "test")
+    section_key = str(body.get("section_key") or "")
+    async with _web_lock(bot, ctx["tg_id"]):
+        t = await _web_test_row(test_id=test_id)
+        if not t or (t["exam_type"] or "") not in STAGED_EXAM_TYPES:
+            raise WebError("not_found", "Bosqichli test topilmadi.", 404)
+        await _web_resolve_mode(ctx, t, section_key)   # eskirgan bo'limni rad etadi
+        attempt = await _web_staged_attempt(ctx["user_db_id"], test_id)
+        if not await get_session(ctx["user_db_id"], test_id, f"stage_{section_key}"):
+            raise WebError("no_session", "Bo'lim sessiyasi topilmadi — imtihonni qaytadan oching.", 409)
+        res = await _web_staged_finish_section(bot, ctx["tg_id"], ctx["user_db_id"], t, attempt["id"],
+                                               section_key, body)
+    return web.json_response({"ok": True, **res})
+
+
+@_web_handler
+async def webapp_api_handoff(request: web.Request):
+    """🎙 Speaking (ovozli) bo'limi — Telegram'ning o'z ovozli xabari eng
+    qulay va ishonchli usul, shuning uchun shu bo'limdan boshlab imtihon
+    chatda davom etadi (bot keyingi qadamlarni o'zi yuboradi)."""
+    ctx = await _web_auth(request)
+    bot: Bot = request.app["bot"]
+    body = await _web_body(request)
+    test_id = _web_int(body.get("test_id"), "test")
+    async with _web_lock(bot, ctx["tg_id"]):
+        t = await _web_test_row(test_id=test_id)
+        attempt = await _web_staged_attempt(ctx["user_db_id"], test_id) if t else None
+        if not t or not attempt:
+            raise WebError("no_attempt", "Faol urinish topilmadi.", 409)
+        cfg = _load_skills_cfg(t["skills_cfg"])
+        order = cfg.get("order") or []
+        fsm = _web_fsm(bot, ctx["tg_id"])
+        if fsm is None:
+            raise WebError("server", "Bot holati tayyor emas.", 500)
+        _web_cancel_deadline(ctx["tg_id"], test_id)
+        await fsm.clear()
+        await fsm.set_state(StagedSolvingState.in_section)
+        await fsm.update_data(staged_attempt_id=attempt["id"], staged_test_id=test_id, staged_order=order,
+                              staged_pos=int(attempt["section_idx"] or 0))
+        await _send_stage_section(ctx["tg_id"], bot, fsm)
+    return web.json_response({"ok": True, "bot_username": await _web_bot_username(bot)})
+
+
+@_web_handler
+async def webapp_api_upload_photo(request: web.Request):
+    ctx = await _web_auth(request)
+    bot: Bot = request.app["bot"]
+    if request.content_length and request.content_length > WEB_MAX_PHOTO_BYTES + 64 * 1024:
+        raise WebError("too_big", "Rasm juda katta (10 MB gacha).", 413)
+    reader = await request.multipart()
+    fields, data, ctype = {}, None, ""
+    while True:
+        part = await reader.next()
+        if part is None:
+            break
+        if part.name == "file":
+            ctype = (part.headers.get("Content-Type") or "").lower()
+            data = bytearray()
+            while True:
+                chunk = await part.read_chunk(64 * 1024)
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if len(data) > WEB_MAX_PHOTO_BYTES:
+                    raise WebError("too_big", "Rasm juda katta (10 MB gacha).", 413)
+        else:
+            fields[part.name] = (await part.text())[:64]
+    if not data or not ctype.startswith("image/"):
+        raise WebError("bad_file", "Faqat rasm (JPG/PNG) yuklash mumkin.")
+    test_id = _web_int(fields.get("test_id"), "test")
+    section_key = fields.get("section_key") or None
+    q = fields.get("q") or ""
+    async with _web_lock(bot, ctx["tg_id"]):
+        t = await _web_test_row(test_id=test_id)
+        if not t:
+            raise WebError("not_found", "Test topilmadi.", 404)
+        mode, _key, _qc = await _web_resolve_mode(ctx, t, section_key)
+        if not await get_session(ctx["user_db_id"], test_id, mode):
+            raise WebError("no_session", "Test sessiyasi yakunlangan.", 409)
+        caption = f"📎 {q}-savol uchun javob (Mini App)" if q.isdigit() else "📎 Javob rasmi (Mini App)"
+        try:
+            sent = await bot.send_photo(ctx["tg_id"], BufferedInputFile(bytes(data), filename="javob.jpg"),
+                                        caption=caption)
+        except TelegramBadRequest:
+            raise WebError("bad_file", "Rasmni qabul qilib bo'lmadi — boshqa rasm tanlang.")
+        photo_id = sent.photo[-1].file_id
+        saved = await _web_load_saved(ctx["user_db_id"], test_id, mode)
+        saved["uploads"] = (list(saved.get("uploads") or []) + [photo_id])[-50:]
+        await _web_store_saved(ctx["user_db_id"], test_id, mode, saved)
+    return web.json_response({"ok": True, "photo_id": photo_id})
+
+
+@_web_handler
+async def webapp_api_file(request: web.Request):
+    ctx = await _web_auth(request)
+    bot: Bot = request.app["bot"]
+    test_id = _web_int(request.match_info["test_id"], "test")
+    slot = request.match_info["slot"]
+    t = await _web_test_row(test_id=test_id)
+    if not t:
+        raise WebError("not_found", "Test topilmadi.", 404)
+    file_id, kind = None, "document"
+    if slot == "main":
+        mode = "free" if int(t["is_free"] or 0) == 1 else "paid"
+        has_session = await get_session(ctx["user_db_id"], test_id, mode)
+        has_result = await POOL.fetchval("SELECT 1 FROM results WHERE user_id=$1 AND test_id=$2",
+                                         ctx["user_db_id"], test_id)
+        if not (has_session or has_result):
+            raise WebError("forbidden", "Fayl faqat test boshlangandan keyin ochiladi.", 403)
+        file_id = t["file_id"]
+    elif slot.startswith(("s_", "sq_")):
+        key = slot.split("_", 1)[1]
+        cfg = _load_skills_cfg(t["skills_cfg"])
+        sec = cfg.get("sections", {}).get(key)
+        if not sec or not await get_session(ctx["user_db_id"], test_id, f"stage_{key}"):
+            raise WebError("forbidden", "Bo'lim fayli faqat shu bo'lim davomida ochiladi.", 403)
+        if slot.startswith("sq_"):
+            file_id = sec.get("question_file_id")
+        else:
+            file_id, kind = sec.get("file_id"), sec.get("file_kind") or "document"
+    if not file_id:
+        raise WebError("not_found", "Fayl topilmadi.", 404)
+    path = await _web_fetch_file(bot, file_id)
+    with open(path, "rb") as fh:
+        head = fh.read(16)
+    return web.FileResponse(path, headers={"Content-Type": _web_sniff_type(head, kind),
+                                           "Cache-Control": "private, max-age=3600"})
+
+
+@_web_handler
+async def webapp_api_result(request: web.Request):
+    ctx = await _web_auth(request)
+    test_id = _web_int(request.match_info["test_id"], "test")
+    return web.json_response({"ok": True, "result": await _web_result_view(ctx["user_db_id"], test_id)})
 
 
 async def webapp_index(request: web.Request):
-    return web.Response(text=WEBAPP_HTML, content_type="text/html")
+    return web.Response(text=WEBAPP_HTML, content_type="text/html",
+                        headers={"Cache-Control": "no-cache"})
 
 
 async def webapp_api_profile(request: web.Request):
@@ -12281,7 +13248,7 @@ async def webapp_api_profile(request: web.Request):
         user_db_id
     )
     results = await POOL.fetch("""
-        SELECT r.id, t.code, t.title, r.score, r.total_questions, r.percent, r.grade, r.date,
+        SELECT r.id, r.test_id, t.code, t.title, t.exam_type, r.score, r.total_questions, r.percent, r.grade, r.date,
                r.certificate_sent
         FROM results r JOIN tests t ON t.id=r.test_id
         WHERE r.user_id=$1
@@ -12298,7 +13265,8 @@ async def webapp_api_profile(request: web.Request):
         },
         "results": [
             {
-                "id": r["id"], "code": r["code"], "title": r["title"],
+                "id": r["id"], "test_id": r["test_id"], "code": r["code"], "title": r["title"],
+                "exam_label": WEB_EXAM_LABELS.get(r["exam_type"] or "simple", ""),
                 "score": r["score"], "total": r["total_questions"],
                 "percent": float(r["percent"] or 0), "grade": r["grade"],
                 "date": r["date"], "has_certificate": int(r["certificate_sent"] or 0) == 1,
@@ -12363,21 +13331,1304 @@ async def webapp_api_certificate(request: web.Request):
     })
 
 
-def build_webapp_application() -> web.Application:
-    app = web.Application()
+def build_webapp_application(bot: Bot | None = None) -> web.Application:
+    app = web.Application(client_max_size=WEB_MAX_PHOTO_BYTES + 1024 * 1024)
+    app["bot"] = bot
     app.router.add_get("/webapp", webapp_index)
+    app.router.add_get("/api/me", webapp_api_me)
     app.router.add_get("/api/profile", webapp_api_profile)
     app.router.add_get("/api/certificate/{result_id}", webapp_api_certificate)
+    app.router.add_post("/api/test/lookup", webapp_api_lookup)
+    app.router.add_post("/api/test/start", webapp_api_start)
+    app.router.add_post("/api/test/save", webapp_api_save)
+    app.router.add_post("/api/test/submit", webapp_api_submit)
+    app.router.add_post("/api/staged/section", webapp_api_section)
+    app.router.add_post("/api/staged/submit", webapp_api_section_submit)
+    app.router.add_post("/api/staged/handoff", webapp_api_handoff)
+    app.router.add_post("/api/upload_photo", webapp_api_upload_photo)
+    app.router.add_get("/api/file/{test_id}/{slot}", webapp_api_file)
+    app.router.add_get("/api/result/{test_id}", webapp_api_result)
     return app
 
 
-async def run_webapp_server():
-    app = build_webapp_application()
+async def run_webapp_server(bot: Bot | None = None):
+    app = build_webapp_application(bot)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, WEBAPP_HOST, WEBAPP_PORT)
     await site.start()
     logging.info(f"Mini App server ishga tushdi: http://{WEBAPP_HOST}:{WEBAPP_PORT}/webapp")
+
+
+# --- MINI APP HTML (avtomatik joylangan; tahrirlash uchun scratchpad/miniapp.html) ---
+WEBAPP_HTML = r"""<!DOCTYPE html>
+<html lang="uz">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
+<title>Test yechish</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+:root{
+  --page: var(--tg-theme-secondary-bg-color, #eef1f5);
+  --card: var(--tg-theme-section-bg-color, var(--tg-theme-bg-color, #ffffff));
+  --text: var(--tg-theme-text-color, #15202b);
+  --hint: var(--tg-theme-hint-color, #6b7680);
+  --accent: var(--tg-theme-button-color, #2f6fed);
+  --accent-text: var(--tg-theme-button-text-color, #ffffff);
+  --link: var(--tg-theme-link-color, #2f6fed);
+  --line: rgba(127,127,127,.22);
+  --soft: rgba(127,127,127,.10);
+  --ok: #1f9d55; --bad: #d64545; --warn: #e08a00; --flag: #f08c00;
+  --radius: 14px;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;padding:0}
+body{background:var(--page);color:var(--text);font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;min-height:100vh}
+button{font:inherit;color:inherit;cursor:pointer}
+input,textarea{font:inherit;color:var(--text)}
+.hidden{display:none!important}
+.screen{max-width:760px;margin:0 auto;padding:16px 16px 96px}
+h1{font-size:22px;margin:4px 0 4px}
+h2{font-size:18px;margin:0 0 8px}
+.muted{color:var(--hint)}
+.small{font-size:13px}
+.card{background:var(--card);border-radius:var(--radius);padding:16px;margin:12px 0;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:0;border-radius:12px;padding:12px 16px;background:var(--accent);color:var(--accent-text);font-weight:600;min-height:46px}
+.btn.block{display:flex;width:100%}
+.btn.ghost{background:var(--soft);color:var(--text)}
+.btn.danger{background:var(--bad);color:#fff}
+.btn:disabled{opacity:.55}
+.btn + .btn{margin-top:8px}
+.row-btns{display:flex;gap:8px}.row-btns .btn{flex:1;margin-top:0}
+.input{width:100%;border:1.5px solid var(--line);background:var(--page);border-radius:12px;padding:13px 14px;font-size:18px;letter-spacing:.06em;text-transform:uppercase;outline:none}
+.input:focus{border-color:var(--accent)}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.chip{background:var(--soft);border-radius:999px;padding:4px 10px;font-size:13px;white-space:nowrap}
+.chip.acc{background:var(--accent);color:var(--accent-text)}
+.status{border-radius:12px;padding:12px 14px;margin:12px 0;font-size:14px;background:var(--soft)}
+.status.ok{background:rgba(31,157,85,.12)}.status.bad{background:rgba(214,69,69,.12)}.status.warn{background:rgba(224,138,0,.13)}
+.feat{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:4px}
+.feat div{background:var(--soft);border-radius:12px;padding:10px;font-size:13px}
+.tabs{position:fixed;left:0;right:0;bottom:0;display:flex;background:var(--card);border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom);z-index:20}
+.tabs button{flex:1;border:0;background:none;padding:10px 0 12px;font-size:12px;color:var(--hint)}
+.tabs button b{display:block;font-size:20px;line-height:1.2}
+.tabs button.on{color:var(--accent)}
+.list-item{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:12px 0;border-bottom:1px solid var(--line)}
+.list-item:last-child{border-bottom:0}
+.badge{background:var(--accent);color:var(--accent-text);border-radius:8px;padding:3px 8px;font-size:13px;font-weight:600;white-space:nowrap}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.stat{background:var(--soft);border-radius:12px;padding:10px 6px;text-align:center}
+.stat b{display:block;font-size:19px}.stat span{font-size:12px;color:var(--hint)}
+.sec-item{display:flex;gap:12px;align-items:center;padding:12px;border-radius:12px;background:var(--soft);margin-bottom:8px}
+.sec-item .ico{font-size:22px;width:30px;text-align:center}
+.sec-item.current{outline:2px solid var(--accent)}
+.sec-item.locked{opacity:.55}
+/* ---- solve ---- */
+.solve{position:fixed;inset:0;display:flex;flex-direction:column;background:var(--page);z-index:10}
+.sbar{display:flex;align-items:center;gap:6px;padding:8px 10px;background:var(--card);border-bottom:1px solid var(--line)}
+.timer{font-variant-numeric:tabular-nums;font-weight:700;font-size:17px;padding:5px 10px;border-radius:10px;background:var(--soft);min-width:84px;text-align:center}
+.timer.warn{background:rgba(224,138,0,.18);color:var(--warn)}
+.timer.crit{background:rgba(214,69,69,.18);color:var(--bad);animation:pulse 1s infinite}
+@keyframes pulse{50%{opacity:.55}}
+.prog{flex:1;min-width:0}
+.prog .t{font-size:12px;color:var(--hint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.prog .bar{height:5px;border-radius:5px;background:var(--soft);overflow:hidden;margin-top:3px}
+.prog .bar i{display:block;height:100%;background:var(--accent);width:0;transition:width .25s}
+.icon-btn{border:0;background:var(--soft);border-radius:10px;width:38px;height:38px;font-size:18px;display:inline-flex;align-items:center;justify-content:center;flex:none}
+.icon-btn.on{background:var(--accent);color:var(--accent-text)}
+.savest{font-size:12px;width:18px;text-align:center;flex:none}
+.seg{display:flex;gap:6px;padding:8px 10px;background:var(--card);border-bottom:1px solid var(--line)}
+.seg button{flex:1;border:0;border-radius:10px;padding:8px;background:var(--soft);font-weight:600;font-size:14px}
+.seg button.on{background:var(--accent);color:var(--accent-text)}
+.panes{flex:1;display:flex;min-height:0}
+.pane{flex:1;overflow:auto;min-width:0;-webkit-overflow-scrolling:touch}
+@media (max-width:859px){.panes .pane{display:none}.panes .pane.active{display:block}}
+@media (min-width:860px){.seg{display:none}.pane.pdfpane{flex:1.3;border-right:1px solid var(--line)}}
+.sfoot{display:flex;gap:8px;padding:10px 12px calc(10px + env(safe-area-inset-bottom));background:var(--card);border-top:1px solid var(--line)}
+.sfoot .btn{flex:1;margin:0}
+.pane-head{position:sticky;top:0;z-index:2;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;background:var(--page);border-bottom:1px solid var(--line);font-size:13px;color:var(--hint)}
+.pdfwrap{padding:8px;display:flex;flex-direction:column;align-items:flex-start;gap:8px}
+.pdfpage{background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.18);margin:0 auto;flex:none}
+.pdfpage canvas{display:block;width:100%;height:auto}
+.media{padding:10px 12px}.media audio,.media video{width:100%}
+/* bubble sheet */
+.block-h{padding:10px 12px 6px;font-weight:700;font-size:14px;display:flex;justify-content:space-between;align-items:baseline}
+.block-h span{font-weight:500;color:var(--hint);font-size:12px}
+.qrow{display:flex;align-items:center;gap:8px;padding:5px 12px;border-bottom:1px solid var(--line);background:var(--card)}
+.qrow.cur{box-shadow:inset 3px 0 0 var(--accent)}
+.qn{width:34px;flex:none;text-align:right;font-weight:700;color:var(--hint);background:none;border:0;padding:0;font-variant-numeric:tabular-nums}
+.bubs{display:flex;gap:8px;flex:1;flex-wrap:wrap}
+.bub{width:36px;height:36px;border-radius:50%;border:1.7px solid var(--hint);background:transparent;font-weight:700;font-size:14px;padding:0;transition:transform .08s}
+.bub:active{transform:scale(.9)}
+.bub.on{background:var(--accent);border-color:var(--accent);color:var(--accent-text)}
+.flagb{border:0;background:none;font-size:17px;opacity:.28;padding:4px;flex:none}
+.flagb.on{opacity:1;color:var(--flag)}
+.openbtn{flex:1;border:1.5px dashed var(--hint);background:transparent;border-radius:10px;padding:8px 10px;text-align:left;font-size:14px;min-height:38px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.openbtn.has{border-style:solid;border-color:var(--accent);background:rgba(47,111,237,.07)}
+/* card mode */
+.qcard{padding:14px}
+.qcard .ch{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.qcard .ch b{font-size:20px}
+.opt{display:flex;align-items:center;gap:12px;padding:12px;border:1.5px solid var(--line);border-radius:12px;margin-bottom:8px;background:var(--card)}
+.opt.on{border-color:var(--accent);background:rgba(47,111,237,.08)}
+.opt.elim{opacity:.4}.opt.elim .ol{text-decoration:line-through}
+.opt .ol{width:34px;height:34px;border-radius:50%;border:1.7px solid var(--hint);display:flex;align-items:center;justify-content:center;font-weight:700;flex:none}
+.opt.on .ol{background:var(--accent);border-color:var(--accent);color:var(--accent-text)}
+.opt .lbl{flex:1}
+.opt .strike{border:0;background:var(--soft);border-radius:8px;width:32px;height:32px;flex:none}
+.cnav{display:flex;gap:8px;margin-top:12px}.cnav .btn{flex:1;margin:0}
+textarea.ta{width:100%;min-height:120px;border:1.5px solid var(--line);border-radius:12px;padding:12px;background:var(--page);resize:vertical;outline:none;font-size:16px}
+textarea.ta:focus{border-color:var(--accent)}
+textarea.ta.big{min-height:45vh}
+.thumb{max-width:140px;max-height:140px;border-radius:10px;display:block;margin-top:8px}
+/* modal / sheet */
+.mback{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:flex-end;justify-content:center;z-index:60;animation:fade .15s}
+@keyframes fade{from{opacity:0}}
+.msheet{background:var(--card);width:100%;max-width:560px;border-radius:18px 18px 0 0;padding:18px 16px calc(16px + env(safe-area-inset-bottom));max-height:88vh;overflow:auto}
+@media (min-width:860px){.mback{align-items:center}.msheet{border-radius:18px}}
+.navgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(42px,1fr));gap:6px;margin:12px 0}
+.navgrid button{height:42px;border-radius:10px;border:1.5px solid var(--line);background:transparent;font-weight:700;position:relative}
+.navgrid button.ans{background:var(--accent);color:var(--accent-text);border-color:var(--accent)}
+.navgrid button.flag{box-shadow:0 0 0 2px var(--flag)}
+.navgrid button.ok{background:rgba(31,157,85,.16);border-color:var(--ok);color:var(--ok)}
+.navgrid button.bad{background:rgba(214,69,69,.14);border-color:var(--bad);color:var(--bad)}
+.navgrid button.pend{border-style:dashed}
+.legend{display:flex;flex-wrap:wrap;gap:10px;font-size:12px;color:var(--hint)}
+.legend i{display:inline-block;width:12px;height:12px;border-radius:4px;vertical-align:-2px;margin-right:4px;border:1.5px solid var(--line)}
+.toast{position:fixed;left:50%;bottom:calc(84px + env(safe-area-inset-bottom));transform:translateX(-50%);background:rgba(20,24,30,.92);color:#fff;padding:10px 16px;border-radius:12px;font-size:14px;z-index:80;max-width:92vw;text-align:center;animation:fade .2s}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:90;display:flex;align-items:center;justify-content:center;color:#fff;flex-direction:column;gap:14px;text-align:center;padding:20px}
+.spin{width:42px;height:42px;border-radius:50%;border:4px solid rgba(255,255,255,.3);border-top-color:#fff;animation:sp 1s linear infinite}
+.spin.dark{border-color:var(--soft);border-top-color:var(--accent)}
+@keyframes sp{to{transform:rotate(360deg)}}
+.center{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:60vh;text-align:center;gap:10px}
+.ring{width:150px;height:150px;margin:6px auto}
+.ring text{font-weight:800}
+.kv{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--line)}.kv:last-child{border-bottom:0}
+table.tb{width:100%;border-collapse:collapse;font-size:14px}table.tb td,table.tb th{padding:7px 4px;border-bottom:1px solid var(--line);text-align:left}table.tb th{color:var(--hint);font-weight:600;font-size:12px}
+/* calculator */
+.calc{position:fixed;top:64px;right:12px;width:330px;max-width:calc(100vw - 24px);background:var(--card);border-radius:16px;box-shadow:0 8px 30px rgba(0,0,0,.28);z-index:50;overflow:hidden;border:1px solid var(--line)}
+.calc .ch{display:flex;align-items:center;gap:6px;padding:8px 10px;background:var(--soft);cursor:move;touch-action:none;user-select:none}
+.calc .ch .tb2{flex:1;display:flex;gap:4px}
+.calc .ch .tb2 button{border:0;border-radius:8px;padding:5px 9px;background:transparent;font-size:13px;font-weight:600}
+.calc .ch .tb2 button.on{background:var(--card)}
+.calc .disp{padding:10px 12px}
+.calc .expr{width:100%;border:0;background:transparent;font-size:20px;text-align:right;outline:none;font-variant-numeric:tabular-nums}
+.calc .res{text-align:right;color:var(--hint);min-height:22px;font-size:16px;font-variant-numeric:tabular-nums}
+.keys{display:grid;grid-template-columns:repeat(5,1fr);gap:5px;padding:0 10px 10px}
+.keys button{border:0;border-radius:9px;height:40px;background:var(--soft);font-weight:600;font-size:15px}
+.keys button.op{background:rgba(47,111,237,.13);color:var(--accent)}
+.keys button.eq{background:var(--accent);color:var(--accent-text)}
+.keys button.fn{font-size:13px}
+.hist{max-height:70px;overflow:auto;padding:0 12px 6px;font-size:12px;color:var(--hint);text-align:right}
+.graph{padding:8px 10px 10px}
+.graph canvas{width:100%;height:230px;background:var(--page);border-radius:10px;touch-action:none;display:block}
+.fnrow{display:flex;align-items:center;gap:6px;margin-bottom:6px}
+.fnrow i{width:10px;height:10px;border-radius:50%;flex:none}
+.fnrow input{flex:1;border:1.5px solid var(--line);border-radius:8px;padding:6px 8px;background:var(--page);outline:none;font-size:14px}
+.ref h3{font-size:15px;margin:14px 0 6px}
+.ref .f{display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px solid var(--line);font-size:14px}
+.ref .f b{font-family:"Times New Roman",serif;font-style:italic;font-size:16px;white-space:nowrap}
+.words{font-size:12px;color:var(--hint);text-align:right;margin-top:4px}
+.prompt{white-space:pre-wrap}
+</style>
+</head>
+<body>
+<div id="view"></div>
+<nav class="tabs hidden" id="tabs">
+  <button data-tab="home" class="on"><b>📝</b>Test yechish</button>
+  <button data-tab="profile"><b>👤</b>Profil</button>
+</nav>
+<div id="calc" class="calc hidden"></div>
+
+<script>
+"use strict";
+const tg = window.Telegram && window.Telegram.WebApp;
+const initData = tg ? (tg.initData || "") : "";
+const S = { me: null, uid: (tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) || 0,
+            back: null, tick: null, st: null, tab: "home" };
+const LETTERS = "ABCDEF";
+
+/* ------------ yordamchilar ------------ */
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === "class") e.className = v;
+    else if (k.startsWith("on") && typeof v === "function") e.addEventListener(k.slice(2), v);
+    else if (k === "html") e.innerHTML = v;
+    else e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const k of kids.flat()) {
+    if (k == null || k === false) continue;
+    e.append(k instanceof Node ? k : document.createTextNode(String(k)));
+  }
+  return e;
+}
+const $view = () => document.getElementById("view");
+function clean(nodes) { return nodes.flat().filter(n => n != null && n !== false); }
+function mount(...nodes) { const v = $view(); v.replaceChildren(...clean(nodes)); window.scrollTo(0, 0); }
+function toast(msg, ms) {
+  document.querySelectorAll(".toast").forEach(t => t.remove());
+  const t = el("div", {class: "toast"}, msg); document.body.append(t);
+  setTimeout(() => t.remove(), ms || 2600);
+}
+function haptic(kind) {
+  try {
+    if (!tg || !tg.HapticFeedback) return;
+    if (kind === "sel") tg.HapticFeedback.selectionChanged();
+    else if (kind === "ok" || kind === "error" || kind === "warning") tg.HapticFeedback.notificationOccurred(kind === "ok" ? "success" : kind);
+    else tg.HapticFeedback.impactOccurred(kind || "light");
+  } catch (e) {}
+}
+function overlay(text) {
+  const o = el("div", {class: "overlay"}, el("div", {class: "spin"}), el("div", {}, text));
+  document.body.append(o); return () => o.remove();
+}
+function fmtTime(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+  const p = n => String(n).padStart(2, "0");
+  return h ? `${h}:${p(m)}:${p(s)}` : `${p(m)}:${p(s)}`;
+}
+function plural(n, w) { return `${n} ta ${w}`; }
+function lsGet(k) { try { return JSON.parse(localStorage.getItem(k) || "null"); } catch (e) { return null; } }
+function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+function lsDel(k) { try { localStorage.removeItem(k); } catch (e) {} }
+function stopTick() { if (S.tick) { clearInterval(S.tick); S.tick = null; } }
+
+async function api(path, opts) {
+  opts = opts || {};
+  const o = {method: opts.method || (opts.body || opts.form ? "POST" : "GET"), headers: {"X-Telegram-Init-Data": initData}};
+  if (opts.body !== undefined) { o.headers["Content-Type"] = "application/json"; o.body = JSON.stringify(opts.body); }
+  if (opts.form) o.body = opts.form;
+  if (opts.keepalive) o.keepalive = true;
+  let res;
+  try { res = await fetch(path, o); }
+  catch (e) { throw {network: true, message: "Internet aloqasi yo'q. Qayta urinib ko'ring."}; }
+  let data = {};
+  try { data = await res.json(); } catch (e) {}
+  if (!res.ok || data.ok === false) throw Object.assign({status: res.status}, data, {message: data.message || "Xatolik yuz berdi."});
+  return data;
+}
+function handleErr(e) {
+  if (e && e.error === "not_subscribed") return renderGate("sub", e.channels);
+  if (e && e.error === "not_registered") return renderGate("reg");
+  if (e && e.error === "unauthorized") return renderGate("tg");
+  toast((e && e.message) || "Xatolik yuz berdi.", 3500);
+  haptic("error");
+}
+function openBot() {
+  const u = S.me && S.me.bot_username;
+  if (tg && u) { tg.openTelegramLink("https://t.me/" + u); setTimeout(() => tg.close(), 300); }
+  else if (tg) tg.close();
+}
+function setBack(fn) {
+  S.back = fn;
+  if (!tg || !tg.BackButton) return;
+  if (fn) tg.BackButton.show(); else tg.BackButton.hide();
+}
+function confirmBox(title, text, okText, danger) {
+  return new Promise(resolve => {
+    const close = v => { back.remove(); resolve(v); };
+    const back = el("div", {class: "mback", onclick: e => { if (e.target === back) close(false); }},
+      el("div", {class: "msheet"},
+        el("h2", {}, title), text ? el("p", {class: "muted"}, text) : null,
+        el("button", {class: "btn block" + (danger ? " danger" : ""), onclick: () => close(true)}, okText || "Ha"),
+        el("button", {class: "btn block ghost", onclick: () => close(false)}, "Bekor qilish")));
+    document.body.append(back);
+  });
+}
+function sheet(...kids) {
+  const back = el("div", {class: "mback"});
+  const box = el("div", {class: "msheet"}, ...kids);
+  back.append(box);
+  back.addEventListener("click", e => { if (e.target === back) back.remove(); });
+  document.body.append(back);
+  return back;
+}
+function showTabs(on) { document.getElementById("tabs").classList.toggle("hidden", !on); }
+
+/* ------------ kirish ------------ */
+async function boot() {
+  if (tg) {
+    tg.ready(); tg.expand();
+    try { tg.BackButton.onClick(() => S.back && S.back()); } catch (e) {}
+  }
+  document.querySelectorAll("#tabs button").forEach(b => b.addEventListener("click", () => {
+    const t = b.dataset.tab; if (t === "home") renderHome(); else renderProfile();
+  }));
+  if (!initData) return renderGate("tg");
+  mount(el("div", {class: "center"}, el("div", {class: "spin dark"}), el("div", {class: "muted"}, "Yuklanmoqda...")));
+  try { S.me = await api("/api/me"); }
+  catch (e) { return handleErr(e); }
+  if (!S.me.registered) return renderGate("reg");
+  if (!S.me.subscribed) return renderGate("sub", S.me.channels);
+  const params = new URLSearchParams(location.search);
+  const code = params.get("code") || (tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param) || "";
+  renderHome();
+  if (code) lookup(code);
+}
+
+function renderGate(kind, channels) {
+  stopTick(); showTabs(false); setBack(null);
+  if (kind === "tg") {
+    return mount(el("div", {class: "screen center"}, el("div", {style: "font-size:48px"}, "📱"),
+      el("h2", {}, "Ilovani Telegram ichida oching"),
+      el("p", {class: "muted"}, "Bu sahifa botning «📱 Mini App» tugmasi orqali ochiladi.")));
+  }
+  if (kind === "reg") {
+    return mount(el("div", {class: "screen center"}, el("div", {style: "font-size:48px"}, "📝"),
+      el("h2", {}, "Avval ro'yxatdan o'ting"),
+      el("p", {class: "muted"}, "Botga /start yuboring, ism va telefon raqamingizni kiriting. So'ng ilovani qayta oching."),
+      el("button", {class: "btn", onclick: openBot}, "Botga o'tish")));
+  }
+  const box = el("div", {class: "card"});
+  (channels || []).forEach(c => box.append(el("div", {class: "list-item"}, el("b", {}, c.title),
+    c.url ? el("button", {class: "btn", onclick: () => tg ? tg.openTelegramLink(c.url) : window.open(c.url)}, "A'zo bo'lish") : null)));
+  mount(el("div", {class: "screen"}, el("div", {class: "center", style: "min-height:auto;padding-top:20px"},
+      el("div", {style: "font-size:48px"}, "🔒"), el("h2", {}, "Kanallarga a'zo bo'ling"),
+      el("p", {class: "muted"}, "Testlardan foydalanish uchun quyidagi kanal/guruhlarga a'zo bo'ling.")), box,
+    el("button", {class: "btn block", onclick: () => boot()}, "✅ A'zo bo'ldim — tekshirish")));
+}
+
+/* ------------ bosh sahifa: kod kiritish ------------ */
+function renderHome() {
+  stopTick(); closeCalc(); showTabs(true); setBack(null); setTab("home");
+  if (tg) { try { tg.disableClosingConfirmation(); } catch (e) {} }
+  const inp = el("input", {class: "input", id: "code", placeholder: "Masalan: MS-001", autocomplete: "off",
+    autocapitalize: "characters", spellcheck: "false", maxlength: "20", enterkeyhint: "go"});
+  inp.addEventListener("keydown", e => { if (e.key === "Enter") go(); });
+  const go = () => { const v = inp.value.trim(); if (!v) { inp.focus(); return toast("Test kodini kiriting"); } lookup(v); };
+  const name = (S.me && S.me.full_name) || "";
+  mount(el("div", {class: "screen"},
+    el("div", {class: "muted small"}, (S.me && S.me.academy) || ""),
+    el("h1", {}, "Assalomu alaykum" + (name ? ", " + name.split(" ")[0] : "") + "! 👋"),
+    el("p", {class: "muted"}, "Ustozingiz bergan test kodini kiriting — test turiga mos interaktiv oyna ochiladi."),
+    el("div", {class: "card"},
+      el("label", {class: "muted small", for: "code"}, "Test kodi"), el("div", {style: "height:6px"}), inp,
+      el("div", {style: "height:12px"}), el("button", {class: "btn block", onclick: go}, "🔎 Testni ochish")),
+    el("div", {class: "card"}, el("h2", {}, "Imkoniyatlar"),
+      el("div", {class: "feat"},
+        el("div", {}, "🔵 DTM javoblar varaqasi — doirachani bosib belgilang"),
+        el("div", {}, "🧮 SAT: kalkulyator, grafik va formulalar"),
+        el("div", {}, "✍️ Ochiq savollarga matn yoki rasm"),
+        el("div", {}, "💾 Javoblar avtomatik saqlanadi"),
+        el("div", {}, "⏱ Taymer: vaqt tugasa avtomatik topshiriladi"),
+        el("div", {}, "🎧 Listening audio va 📄 PDF shu yerda")))));
+}
+function setTab(t) {
+  S.tab = t;
+  document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("on", b.dataset.tab === t));
+}
+
+/* ------------ test kartasi ------------ */
+async function lookup(code) {
+  const done = overlay("Test qidirilmoqda...");
+  let r;
+  try { r = await api("/api/test/lookup", {body: {code}}); }
+  catch (e) { done(); return handleErr(e); }
+  done(); renderInfo(r);
+}
+const STATE_STYLE = {ready: "ok", resume: "ok", done: "", staged_done: "", not_started: "warn", payment_pending: "warn",
+  pending_review: "warn", need_payment: "warn", payment_rejected: "bad", closed: "bad", hidden: "bad", expired: "bad", broken: "bad"};
+
+function renderInfo(r) {
+  stopTick(); showTabs(false); setBack(renderHome);
+  const t = r.test, a = r.access, st = a.state;
+  const chips = el("div", {class: "chips"},
+    el("span", {class: "chip acc"}, t.exam_label), el("span", {class: "chip"}, t.is_free ? "🆓 Tekin" : `💰 ${t.price.toLocaleString("ru-RU")} so'm`),
+    t.staged ? el("span", {class: "chip"}, `🧩 ${t.sections.length} bo'lim`) : el("span", {class: "chip"}, `🧮 ${t.qcount} savol`),
+    el("span", {class: "chip"}, `⏳ ${t.duration} daqiqa`), t.subject ? el("span", {class: "chip"}, "📚 " + t.subject) : null);
+  const statusBox = el("div", {class: "status " + (STATE_STYLE[st] || "")}, r.message);
+  const body = [];
+  if (t.staged) {
+    const list = el("div", {});
+    t.sections.forEach((s, i) => list.append(el("div", {class: "sec-item"}, el("div", {class: "ico"}, secIcon(s)),
+      el("div", {style: "flex:1"}, el("b", {}, `${i + 1}. ${s.name}`),
+        el("div", {class: "muted small"}, `${s.type_label}${s.qcount ? " · " + s.qcount + " savol" : ""} · ${s.duration_min} daqiqa`)))));
+    body.push(el("div", {class: "card"}, el("h2", {}, "Bo'limlar"), list));
+  }
+  const btns = [];
+  const start = async (retake) => {
+    const txt = t.staged ? "Bo'limlar ketma-ket topshiriladi, har birining o'z vaqti bor." :
+      `Vaqt ${t.duration} daqiqa. Boshlangach taymer to'xtamaydi — ilovani yopsangiz ham vaqt ketaveradi, javoblaringiz saqlanadi.`;
+    if (st === "ready" || retake) { if (!await confirmBox("Testni boshlaysizmi?", txt, "🚀 Boshlash")) return; }
+    startTest(t, retake);
+  };
+  if (st === "ready") btns.push(el("button", {class: "btn block", onclick: () => start(false)}, "🚀 Testni boshlash"));
+  if (st === "resume") btns.push(el("button", {class: "btn block", onclick: () => start(false)}, "▶️ Davom ettirish"));
+  if (st === "done" || st === "staged_done" || st === "pending_review") btns.push(el("button", {class: "btn block", onclick: () => showResult(t.id)}, "📊 Natijani ko'rish"));
+  if (st === "staged_done" && a.can_retake) btns.push(el("button", {class: "btn block ghost", onclick: () => start(true)}, "🔄 Qaytadan yechish"));
+  if (st === "need_payment" || st === "payment_rejected" || st === "payment_pending") btns.push(el("button", {class: "btn block", onclick: openBot}, "💳 Botga o'tish"));
+  btns.push(el("button", {class: "btn block ghost", onclick: renderHome}, "⬅️ Boshqa kod"));
+  if (st === "not_started" && a.left) {
+    const cd = el("b", {}, fmtTime(a.left));
+    statusBox.append(el("div", {style: "margin-top:6px"}, "Boshlanishiga: ", cd));
+    const until = Date.now() / 1000 + a.left;
+    S.tick = setInterval(() => {
+      const left = until - Date.now() / 1000; cd.textContent = fmtTime(left);
+      if (left <= 0) { stopTick(); lookup(t.code); }
+    }, 1000);
+  }
+  mount(el("div", {class: "screen"},
+    el("div", {class: "muted small"}, "Kod: " + t.code), el("h1", {}, t.title || "Test"), chips,
+    t.scheduled && t.start_at ? el("div", {class: "muted small"}, "📅 Boshlanish: " + t.start_at) : null,
+    statusBox, ...body, el("div", {class: "card"}, ...btns)));
+}
+function secIcon(s) {
+  const byKey = {listening: "🎧", reading: "📖", reading_writing: "📖", math: "🧮", writing: "✍️", speaking: "🎙"};
+  return byKey[s.key] || {mcq: "📝", mcq_band: "📖", open_text: "✍️", open_voice: "🎙"}[s.type] || "📝";
+}
+
+async function startTest(t, retake) {
+  const done = overlay("Tayyorlanmoqda...");
+  let p;
+  try { p = await api("/api/test/start", {body: {test_id: t.id, retake: !!retake}}); }
+  catch (e) { done(); return handleErr(e); }
+  done();
+  if (p.kind === "staged") renderOverview(p); else renderSolve(p, null);
+}
+
+/* ------------ bosqichli imtihon xaritasi ------------ */
+function renderOverview(ov) {
+  stopTick(); closeCalc(); showTabs(false); setBack(renderHome);
+  if (tg) { try { tg.disableClosingConfirmation(); } catch (e) {} }
+  const t = ov.test;
+  const list = el("div", {});
+  let current = null;
+  ov.sections.forEach((s, i) => {
+    if (s.status === "current") current = s;
+    const mark = s.status === "done" ? "✅" : s.status === "current" ? "▶️" : "🔒";
+    list.append(el("div", {class: "sec-item " + s.status}, el("div", {class: "ico"}, secIcon(s)),
+      el("div", {style: "flex:1"}, el("b", {}, `${i + 1}. ${s.name}`),
+        el("div", {class: "muted small"}, `${s.type_label}${s.qcount ? " · " + s.qcount + " savol" : ""} · ${s.duration_min} daqiqa`)),
+      el("div", {style: "font-size:20px"}, mark)));
+  });
+  const actions = el("div", {class: "card"});
+  if (current) {
+    if (current.type === "open_voice") {
+      actions.append(el("p", {}, el("b", {}, current.name), " bo'limi Telegram'ning ovozli xabari orqali topshiriladi — bu eng qulay va ishonchli usul."),
+        el("p", {class: "muted small"}, "Tugmani bosganingizda bot chatda topshiriqni yuboradi va vaqt boshlanadi. Ovozli javobdan keyin qolgan bo'limlarni chatda yoki shu ilovada (kodni qayta kiritib) davom ettirishingiz mumkin."),
+        el("button", {class: "btn block", onclick: () => handoff(t)}, "🎙 Botda ovozli javob berish"));
+    } else {
+      actions.append(el("button", {class: "btn block", onclick: async () => {
+        if (!await confirmBox(`${current.name} bo'limini boshlaysizmi?`, `Vaqt: ${current.duration_min} daqiqa. Boshlangach taymer to'xtamaydi.`, "▶️ Boshlash")) return;
+        openSection(t);
+      }}, `▶️ ${current.name} bo'limini boshlash`));
+    }
+  }
+  actions.append(el("button", {class: "btn block ghost", onclick: renderHome}, "🏠 Bosh sahifa"));
+  mount(el("div", {class: "screen"}, el("div", {class: "muted small"}, "Kod: " + t.code), el("h1", {}, t.title),
+    el("div", {class: "chips"}, el("span", {class: "chip acc"}, t.exam_label)),
+    el("div", {class: "card"}, el("h2", {}, "Imtihon xaritasi"), list), actions));
+}
+async function openSection(t) {
+  const done = overlay("Bo'lim ochilmoqda...");
+  let p;
+  try { p = await api("/api/staged/section", {body: {test_id: t.id}}); }
+  catch (e) { done(); return handleErr(e); }
+  done();
+  if (p.kind === "expired") {
+    toast(`⏱ «${p.section_name}» vaqti tugagan edi — saqlangan javoblar bilan topshirildi.`, 4000);
+    return p.finished ? renderResult(p.result) : renderOverview(p.overview);
+  }
+  if (p.handoff) return renderOverview(await api("/api/test/start", {body: {test_id: t.id}}));
+  if (p.type === "open_text") return renderWriting(p);
+  renderSolve(p, p.key);
+}
+async function handoff(t) {
+  const done = overlay("Bot chatiga yuborilmoqda...");
+  try { await api("/api/staged/handoff", {body: {test_id: t.id}}); }
+  catch (e) { done(); return handleErr(e); }
+  done();
+  mount(el("div", {class: "screen center"}, el("div", {style: "font-size:52px"}, "🎙"), el("h2", {}, "Topshiriq bot chatiga yuborildi"),
+    el("p", {class: "muted"}, "Chatga qayting, topshiriqni o'qing va javobingizni ovozli xabar qilib yuboring. Vaqt boshlandi."),
+    el("button", {class: "btn", onclick: openBot}, "💬 Chatga qaytish")));
+  setBack(renderHome);
+}
+
+/* ------------ test yechish oynasi ------------ */
+function lsKeyFor(st) { return `et:${S.uid}:${st.testId}:${st.sectionKey || "main"}:${st.endTs}`; }
+
+function renderSolve(p, sectionKey) {
+  stopTick(); showTabs(false);
+  const st = {
+    testId: p.test.id, sectionKey, test: p.test, name: p.name || p.test.title, qcount: p.qcount, nOpts: p.n_opts,
+    open: new Set(p.open || []), answers: Object.assign({}, p.answers), openAnswers: Object.assign({}, p.open_answers),
+    flags: new Set(p.flags || []), elim: {}, current: Math.min(Math.max(p.current_q || 1, 1), p.qcount),
+    view: (p.tools && p.tools.default_view) || "sheet", endTs: p.end_ts, offset: p.server_now - Date.now() / 1000,
+    layout: p.layout && p.layout.length ? p.layout : [{name: "", from: 1, to: p.qcount}], files: p.files || [], tools: p.tools || {},
+    saveTimer: null, saving: false, again: false, submitted: false, pane: "ans", photos: {}, warned: {}
+  };
+  // qurilmada saqlangan (internet uzilgan paytdagi) javoblar serverdagidan yangiroq bo'lsa — ularni olamiz
+  const local = lsGet(lsKeyFor(st));
+  if (local && local.ts > (p.updated || 0)) {
+    st.answers = local.answers || {}; st.openAnswers = local.openAnswers || {}; st.flags = new Set(local.flags || []);
+    setTimeout(() => scheduleSave(st), 300);
+  }
+  S.st = st;
+  if (tg) { try { tg.enableClosingConfirmation(); } catch (e) {} }
+  setBack(async () => {
+    if (await confirmBox("Testdan chiqasizmi?", "Javoblaringiz saqlangan, vaqt esa ketaveradi. Kodni qayta kiritib davom ettirishingiz mumkin.", "Chiqish")) {
+      await flushSave(st); renderHome();
+    }
+  });
+
+  const hasFiles = st.files.length > 0;
+  const timer = el("div", {class: "timer"}, "--:--");
+  const progT = el("div", {class: "t"}), progBar = el("i");
+  const saveSt = el("span", {class: "savest", title: "Saqlash holati"}, "");
+  const tools = el("div", {style: "display:flex;gap:6px"});
+  if (st.tools.calculator) tools.append(el("button", {class: "icon-btn", title: "Kalkulyator", onclick: () => toggleCalc()}, "🧮"));
+  if (st.tools.reference) tools.append(el("button", {class: "icon-btn", title: "Formulalar", onclick: showReference}, "📐"));
+  tools.append(el("button", {class: "icon-btn", title: "Savollar xaritasi", onclick: () => showNavigator(st)}, "☰"));
+  const bar = el("div", {class: "sbar"}, timer, el("div", {class: "prog"}, progT, el("div", {class: "bar"}, progBar)), saveSt, tools);
+
+  const ansPane = el("div", {class: "pane anspane active"});
+  const pdfPane = el("div", {class: "pane pdfpane"});
+  const seg = el("div", {class: "seg" + (hasFiles ? "" : " hidden")});
+  const segBtn = (key, txt) => el("button", {class: key === "ans" ? "on" : "", onclick: (ev) => {
+    st.pane = key; seg.querySelectorAll("button").forEach(b => b.classList.toggle("on", b === ev.currentTarget));
+    ansPane.classList.toggle("active", key === "ans"); pdfPane.classList.toggle("active", key === "pdf");
+    if (key === "pdf") ensureFiles(st, pdfPane);
+  }}, txt);
+  seg.append(segBtn("pdf", "📄 Savollar"), segBtn("ans", "📝 Javoblar"));
+  const submitBtn = el("button", {class: "btn", onclick: () => askSubmit(st)}, "Yakunlash");
+  const foot = el("div", {class: "sfoot"}, submitBtn);
+  const panes = el("div", {class: "panes"}, hasFiles ? pdfPane : null, ansPane);
+  const root = el("div", {class: "solve"}, bar, seg, panes, foot);
+  mount(root);
+  st.ui = {timer, progT, progBar, saveSt, ansPane, pdfPane, submitBtn};
+  if (hasFiles && window.matchMedia("(min-width: 860px)").matches) ensureFiles(st, pdfPane);
+  renderAnswers(st); updateProgress(st);
+
+  const tick = () => {
+    const remain = st.endTs - (Date.now() / 1000 + st.offset);
+    timer.textContent = "⏱ " + fmtTime(remain);
+    timer.className = "timer" + (remain <= 60 ? " crit" : remain <= 300 ? " warn" : "");
+    if (remain <= 300 && remain > 60 && !st.warned[5]) { st.warned[5] = 1; toast("⚠️ 5 daqiqa qoldi"); haptic("warning"); }
+    if (remain <= 60 && !st.warned[1]) { st.warned[1] = 1; toast("⚠️ 1 daqiqa qoldi!"); haptic("warning"); }
+    if (remain <= 0 && !st.submitted) { stopTick(); toast("⏱ Vaqt tugadi — javoblaringiz topshirilmoqda", 3000); doSubmit(st, true); }
+  };
+  tick(); S.tick = setInterval(tick, 500);
+}
+
+function isAnswered(st, q) { return !!st.answers[String(q)]; }
+function answeredCount(st) { let n = 0; for (let q = 1; q <= st.qcount; q++) if (isAnswered(st, q)) n++; return n; }
+function updateProgress(st) {
+  const n = answeredCount(st);
+  st.ui.progT.textContent = `${st.name} · ${n}/${st.qcount} javob`;
+  st.ui.progBar.style.width = (st.qcount ? n / st.qcount * 100 : 0) + "%";
+  st.ui.submitBtn.textContent = st.sectionKey ? `Bo'limni yakunlash (${n}/${st.qcount})` : `Yakunlash (${n}/${st.qcount})`;
+}
+
+function renderAnswers(st) {
+  const pane = st.ui.ansPane;
+  const head = el("div", {class: "pane-head"},
+    el("span", {}, st.view === "sheet" ? "Javoblar varaqasi" : "Bittalab ko'rinish"),
+    el("button", {class: "btn ghost", style: "min-height:32px;padding:4px 10px;font-size:13px", onclick: () => {
+      st.view = st.view === "sheet" ? "card" : "sheet"; renderAnswers(st);
+    }}, st.view === "sheet" ? "▭ Bittalab" : "▦ Varaq"));
+  pane.replaceChildren(head, st.view === "sheet" ? buildSheet(st) : buildCard(st));
+}
+
+function buildSheet(st) {
+  const wrap = el("div", {});
+  st.layout.forEach(b => {
+    if (b.name || st.layout.length > 1) {
+      wrap.append(el("div", {class: "block-h"}, el("div", {}, b.name || "Savollar"),
+        el("span", {}, `${b.from}–${b.to}` + (b.w ? ` · har biri ${b.w} ball` : ""))));
+    }
+    for (let q = b.from; q <= b.to; q++) wrap.append(buildRow(st, q));
+  });
+  wrap.addEventListener("click", e => {
+    const row = e.target.closest(".qrow"); if (!row) return;
+    const q = +row.dataset.q;
+    if (e.target.closest(".bub")) {
+      const l = e.target.closest(".bub").dataset.l;
+      setAnswer(st, q, st.answers[String(q)] === l ? null : l);
+    } else if (e.target.closest(".flagb")) toggleFlag(st, q);
+    else if (e.target.closest(".openbtn")) openEditor(st, q);
+    else if (e.target.closest(".qn")) { st.current = q; st.view = "card"; renderAnswers(st); }
+  });
+  return wrap;
+}
+function buildRow(st, q) {
+  const row = el("div", {class: "qrow", "data-q": q, id: "row" + q});
+  row.append(el("button", {class: "qn"}, q));
+  if (st.open.has(q)) {
+    const oa = st.openAnswers[String(q)];
+    const label = oa && (oa.text || oa.photo_id) ? ("✅ " + (oa.text ? oa.text : "📷 Rasm biriktirilgan")) : "✍️ Yozma javob (bosing)";
+    row.append(el("button", {class: "openbtn" + (oa && (oa.text || oa.photo_id) ? " has" : "")}, label));
+  } else {
+    const bubs = el("div", {class: "bubs"});
+    for (let i = 0; i < st.nOpts; i++) {
+      const l = LETTERS[i].toLowerCase();
+      bubs.append(el("button", {class: "bub" + (st.answers[String(q)] === l ? " on" : ""), "data-l": l, "aria-label": `${q}-savol ${LETTERS[i]}`}, LETTERS[i]));
+    }
+    row.append(bubs);
+  }
+  row.append(el("button", {class: "flagb" + (st.flags.has(q) ? " on" : ""), title: "Keyinroq qaytish uchun belgilash"}, "⚑"));
+  return row;
+}
+function refreshRow(st, q) {
+  const old = document.getElementById("row" + q);
+  if (old) old.replaceWith(buildRow(st, q));
+}
+
+function buildCard(st) {
+  const q = st.current, sq = String(q);
+  const box = el("div", {class: "qcard"});
+  const flagBtn = el("button", {class: "btn ghost", style: "min-height:34px;padding:4px 10px;font-size:13px" + (st.flags.has(q) ? ";color:var(--flag)" : ""),
+    onclick: () => { toggleFlag(st, q); renderAnswers(st); }}, st.flags.has(q) ? "⚑ Belgilangan" : "⚑ Belgilash");
+  box.append(el("div", {class: "ch"}, el("div", {}, el("b", {}, q + "-savol"), el("span", {class: "muted"}, " / " + st.qcount)), flagBtn));
+  if (st.open.has(q)) {
+    const oa = st.openAnswers[sq] || {};
+    const ta = el("textarea", {class: "ta", maxlength: "500", placeholder: "Javobingizni shu yerga yozing..."});
+    ta.value = oa.text || "";
+    ta.addEventListener("input", () => setOpen(st, q, ta.value, (st.openAnswers[sq] || {}).photo_id || null, true));
+    box.append(el("div", {class: "status warn small"}, "❗️ Bu savol variantsiz — javobni matn bilan yozing (yoki yechimingiz rasmini yuboring)."),
+      ta, photoControl(st, q));
+  } else {
+    const elim = st.elim[q] || (st.elim[q] = new Set());
+    for (let i = 0; i < st.nOpts; i++) {
+      const l = LETTERS[i].toLowerCase();
+      const on = st.answers[sq] === l, crossed = elim.has(l);
+      const opt = el("div", {class: "opt" + (on ? " on" : "") + (crossed ? " elim" : "")},
+        el("div", {class: "ol"}, LETTERS[i]), el("div", {class: "lbl"}, `${LETTERS[i]} variant`),
+        st.tools.eliminator ? el("button", {class: "strike", title: "Variantni chiqarib tashlash", onclick: e => {
+          e.stopPropagation(); if (elim.has(l)) elim.delete(l); else { elim.add(l); if (st.answers[sq] === l) setAnswer(st, q, null); }
+          renderAnswers(st);
+        }}, crossed ? "↺" : "✕") : null);
+      opt.addEventListener("click", () => { setAnswer(st, q, on ? null : l); renderAnswers(st); });
+      box.append(opt);
+    }
+  }
+  box.append(el("div", {class: "cnav"},
+    el("button", {class: "btn ghost", disabled: q <= 1, onclick: () => { st.current = q - 1; renderAnswers(st); scheduleSave(st); }}, "⬅️ Oldingi"),
+    q < st.qcount ? el("button", {class: "btn", onclick: () => { st.current = q + 1; renderAnswers(st); scheduleSave(st); }}, "Keyingi ➡️")
+      : el("button", {class: "btn", onclick: () => askSubmit(st)}, "✅ Yakunlash")));
+  return box;
+}
+
+function setAnswer(st, q, l) {
+  const sq = String(q);
+  if (l) st.answers[sq] = l; else delete st.answers[sq];
+  haptic("sel");
+  if (st.view === "sheet") refreshRow(st, q);
+  updateProgress(st); scheduleSave(st);
+}
+function toggleFlag(st, q) {
+  if (st.flags.has(q)) st.flags.delete(q); else st.flags.add(q);
+  haptic("sel");
+  if (st.view === "sheet") refreshRow(st, q);
+  scheduleSave(st);
+}
+function setOpen(st, q, text, photoId, quiet) {
+  const sq = String(q);
+  text = (text || "").slice(0, 500);
+  if (text.trim() || photoId) { st.openAnswers[sq] = {text: text.trim() ? text : null, photo_id: photoId || null}; st.answers[sq] = "x"; }
+  else { delete st.openAnswers[sq]; delete st.answers[sq]; }
+  if (!quiet && st.view === "sheet") refreshRow(st, q);
+  updateProgress(st); scheduleSave(st);
+}
+function photoControl(st, q) {
+  const sq = String(q);
+  const wrap = el("div", {style: "margin-top:10px"});
+  const draw = () => {
+    const oa = st.openAnswers[sq] || {};
+    const file = el("input", {type: "file", accept: "image/*", class: "hidden"});
+    file.addEventListener("change", async () => {
+      if (!file.files || !file.files[0]) return;
+      const done = overlay("Rasm yuklanmoqda...");
+      try {
+        const blob = await compressImage(file.files[0]);
+        const fd = new FormData();
+        fd.append("test_id", st.testId); if (st.sectionKey) fd.append("section_key", st.sectionKey);
+        fd.append("q", String(q)); fd.append("file", blob, "javob.jpg");
+        const r = await api("/api/upload_photo", {form: fd});
+        st.photos[sq] = URL.createObjectURL(blob);
+        setOpen(st, q, (st.openAnswers[sq] || {}).text || "", r.photo_id);
+        toast("📷 Rasm biriktirildi"); haptic("ok");
+      } catch (e) { handleErr(e); }
+      done(); draw();
+    });
+    const kids = [file, el("button", {class: "btn ghost", onclick: () => file.click()}, oa.photo_id ? "📷 Rasmni almashtirish" : "📷 Rasm biriktirish")];
+    if (oa.photo_id) {
+      kids.push(el("button", {class: "btn ghost", style: "margin-left:8px", onclick: () => { setOpen(st, q, oa.text || "", null); draw(); }}, "🗑"));
+      if (st.photos[sq]) kids.push(el("img", {class: "thumb", src: st.photos[sq], alt: "javob rasmi"}));
+      else kids.push(el("div", {class: "muted small", style: "margin-top:6px"}, "✅ Rasm biriktirilgan"));
+    }
+    wrap.replaceChildren(...kids);
+  };
+  draw();
+  return wrap;
+}
+async function compressImage(file) {
+  try {
+    const bmp = await createImageBitmap(file);
+    const k = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
+    const c = document.createElement("canvas");
+    c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
+    c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
+    return await new Promise(res => c.toBlob(b => res(b || file), "image/jpeg", 0.85));
+  } catch (e) { return file; }
+}
+function openEditor(st, q) {
+  const sq = String(q);
+  const ta = el("textarea", {class: "ta", maxlength: "500", placeholder: "Javobingizni yozing..."});
+  ta.value = (st.openAnswers[sq] || {}).text || "";
+  const cnt = el("div", {class: "words"});
+  const upd = () => { cnt.textContent = `${ta.value.length}/500`; };
+  ta.addEventListener("input", () => { upd(); setOpen(st, q, ta.value, (st.openAnswers[sq] || {}).photo_id || null, true); });
+  upd();
+  const s = sheet(el("h2", {}, `${q}-savol — yozma javob`), el("p", {class: "muted small"}, "Kalit bilan avtomatik tekshiriladi. Rasm yuborsangiz, ustoz tekshiradi."),
+    ta, cnt, photoControl(st, q),
+    el("div", {style: "height:12px"}),
+    el("button", {class: "btn block", onclick: () => { s.remove(); refreshRow(st, q); }}, "✅ Saqlash"));
+  setTimeout(() => ta.focus(), 120);
+  s.addEventListener("click", e => { if (e.target === s) refreshRow(st, q); });
+}
+
+function showNavigator(st) {
+  const grid = el("div", {class: "navgrid"});
+  for (let q = 1; q <= st.qcount; q++) {
+    const cls = (isAnswered(st, q) ? "ans " : "") + (st.flags.has(q) ? "flag" : "");
+    grid.append(el("button", {class: cls, onclick: () => {
+      s.remove(); st.current = q;
+      if (st.view === "card") renderAnswers(st);
+      else { const r = document.getElementById("row" + q); if (r) { r.scrollIntoView({block: "center", behavior: "smooth"}); r.classList.add("cur"); setTimeout(() => r.classList.remove("cur"), 1500); } }
+      if (st.pane !== "ans") { const b = document.querySelector(".seg button:last-child"); if (b) b.click(); }
+    }}, st.open.has(q) ? q + "✍" : q));
+  }
+  const n = answeredCount(st);
+  const s = sheet(el("h2", {}, "Savollar xaritasi"), el("div", {class: "muted small"}, `Javob berilgan: ${n}/${st.qcount} · Belgilangan: ${st.flags.size}`),
+    grid, el("div", {class: "legend"}, el("span", {}, el("i", {style: "background:var(--accent);border-color:var(--accent)"}), "javob berilgan"),
+      el("span", {}, el("i", {style: "box-shadow:0 0 0 2px var(--flag)"}), "belgilangan"), el("span", {}, el("i", {}), "javobsiz"), el("span", {}, "✍ — ochiq savol")));
+}
+
+/* ------------ avtomatik saqlash ------------ */
+function savePayload(st) {
+  return {test_id: st.testId, section_key: st.sectionKey, answers: st.answers, open_answers: st.openAnswers,
+          flags: Array.from(st.flags), current_q: st.current};
+}
+function setSaveState(st, s) {
+  if (!st.ui) return;
+  st.ui.saveSt.textContent = {saving: "⏳", ok: "✓", offline: "⚠️", "": ""}[s] || "";
+  st.ui.saveSt.title = {saving: "Saqlanmoqda...", ok: "Saqlandi", offline: "Internet yo'q — javoblar qurilmada saqlandi"}[s] || "";
+}
+function scheduleSave(st) {
+  if (st.submitted) return;
+  lsSet(lsKeyFor(st), {answers: st.answers, openAnswers: st.openAnswers, flags: Array.from(st.flags), ts: Math.floor(Date.now() / 1000 + st.offset)});
+  setSaveState(st, "saving");
+  clearTimeout(st.saveTimer);
+  st.saveTimer = setTimeout(() => flushSave(st), 1200);
+}
+async function flushSave(st) {
+  clearTimeout(st.saveTimer);
+  if (st.submitted) return;
+  if (st.saving) { st.again = true; return; }
+  st.saving = true;
+  try {
+    const r = await api("/api/test/save", {body: savePayload(st)});
+    if (r.end_ts) st.endTs = r.end_ts;
+    setSaveState(st, "ok");
+  } catch (e) {
+    if (e.network) { setSaveState(st, "offline"); st.saveTimer = setTimeout(() => flushSave(st), 5000); }
+    else if (e.error === "time_over" || e.error === "no_session" || e.error === "stale") { setSaveState(st, ""); }
+    else setSaveState(st, "offline");
+  }
+  st.saving = false;
+  if (st.again) { st.again = false; flushSave(st); }
+}
+document.addEventListener("visibilitychange", () => {
+  const st = S.st;
+  if (document.visibilityState === "hidden" && st && !st.submitted && st.ui) {
+    fetch(st.writing ? "/api/test/save" : "/api/test/save", {method: "POST", keepalive: true,
+      headers: {"X-Telegram-Init-Data": initData, "Content-Type": "application/json"},
+      body: JSON.stringify(st.writing ? writingPayload(st) : savePayload(st))}).catch(() => {});
+  }
+});
+
+/* ------------ topshirish ------------ */
+async function askSubmit(st) {
+  const n = answeredCount(st), miss = st.qcount - n;
+  const lines = [];
+  if (miss) lines.push(`${miss} ta savol javobsiz qolgan.`);
+  if (st.flags.size) lines.push(`${st.flags.size} ta savol "keyinroq qaytish" uchun belgilangan.`);
+  lines.push(st.sectionKey ? "Bo'lim yakunlangach unga qaytib bo'lmaydi." : "Topshirgandan keyin javoblarni o'zgartirib bo'lmaydi.");
+  if (await confirmBox(st.sectionKey ? "Bo'limni yakunlaysizmi?" : "Testni yakunlaysizmi?", lines.join(" "), "✅ Ha, topshirish")) doSubmit(st, false);
+}
+async function doSubmit(st, auto) {
+  if (st.submitted) return;
+  st.submitted = true; stopTick(); clearTimeout(st.saveTimer);
+  const done = overlay(auto ? "Vaqt tugadi — topshirilmoqda..." : "Javoblar baholanmoqda...");
+  try {
+    let r;
+    if (st.sectionKey) r = await api("/api/staged/submit", {body: savePayload(st)});
+    else r = await api("/api/test/submit", {body: {test_id: st.testId, answers: st.answers, open_answers: st.openAnswers}});
+    lsDel(lsKeyFor(st));
+    done(); haptic("ok"); closeCalc();
+    if (tg) { try { tg.disableClosingConfirmation(); } catch (e) {} }
+    S.st = null;
+    if (st.sectionKey && !r.finished) { toast(`✅ «${st.name}» topshirildi`); return renderOverview(r.overview); }
+    renderResult(r.result);
+  } catch (e) {
+    done();
+    if (e.network) {
+      st.submitted = false; toast("Internet yo'q — javoblar saqlangan. Aloqa tiklangach qayta bosing.", 4000);
+      if (!auto) return;
+      setTimeout(() => doSubmit(st, true), 4000); return;
+    }
+    if (e.error === "stale" || e.error === "no_session") {
+      S.st = null; toast(e.message, 3500);
+      try { const r = await api("/api/result/" + st.testId); if (r.result.state !== "none") return renderResult(r.result); } catch (x) {}
+      return renderHome();
+    }
+    st.submitted = false; handleErr(e);
+  }
+}
+
+/* ------------ Writing (matnli bo'lim) ------------ */
+function writingPayload(st) {
+  return {test_id: st.testId, section_key: st.sectionKey, text: st.text, photo_id: st.photoId};
+}
+function renderWriting(p) {
+  stopTick(); showTabs(false);
+  const st = {writing: true, testId: p.test.id, sectionKey: p.key, name: p.name, text: p.text || "", photoId: p.photo_id || null,
+    endTs: p.end_ts, offset: p.server_now - Date.now() / 1000, submitted: false, saveTimer: null, warned: {}, qcount: 0};
+  const local = lsGet(`et:${S.uid}:${st.testId}:${st.sectionKey}:${st.endTs}`);
+  if (local && local.ts > (p.updated || 0) && typeof local.text === "string") st.text = local.text;
+  S.st = st;
+  if (tg) { try { tg.enableClosingConfirmation(); } catch (e) {} }
+  setBack(async () => { if (await confirmBox("Bo'limdan chiqasizmi?", "Matningiz saqlangan, vaqt ketaveradi.", "Chiqish")) { await saveWriting(st); renderHome(); } });
+  const timer = el("div", {class: "timer"}, "--:--");
+  const saveSt = el("span", {class: "savest"});
+  const ta = el("textarea", {class: "ta big", maxlength: String(p.text_max || 4000), placeholder: "Javobingizni shu yerga yozing..."});
+  ta.value = st.text;
+  const words = el("div", {class: "words"});
+  const upd = () => { const w = ta.value.trim() ? ta.value.trim().split(/\s+/).length : 0; words.textContent = `${w} so'z · ${ta.value.length}/${p.text_max || 4000} belgi`; };
+  ta.addEventListener("input", () => {
+    st.text = ta.value; upd(); saveSt.textContent = "⏳";
+    lsSet(`et:${S.uid}:${st.testId}:${st.sectionKey}:${st.endTs}`, {text: st.text, ts: Math.floor(Date.now() / 1000 + st.offset)});
+    clearTimeout(st.saveTimer); st.saveTimer = setTimeout(() => saveWriting(st).then(ok => { saveSt.textContent = ok ? "✓" : "⚠️"; }), 1500);
+  });
+  upd();
+  const photoBox = el("div", {});
+  const drawPhoto = () => {
+    const file = el("input", {type: "file", accept: "image/*", class: "hidden"});
+    file.addEventListener("change", async () => {
+      if (!file.files || !file.files[0]) return;
+      const done = overlay("Rasm yuklanmoqda...");
+      try {
+        const blob = await compressImage(file.files[0]);
+        const fd = new FormData(); fd.append("test_id", st.testId); fd.append("section_key", st.sectionKey); fd.append("file", blob, "javob.jpg");
+        const r = await api("/api/upload_photo", {form: fd});
+        st.photoId = r.photo_id; st.photoUrl = URL.createObjectURL(blob); await saveWriting(st); toast("📷 Rasm biriktirildi");
+      } catch (e) { handleErr(e); }
+      done(); drawPhoto();
+    });
+    photoBox.replaceChildren(...clean([file, el("button", {class: "btn ghost", onclick: () => file.click()}, st.photoId ? "📷 Rasmni almashtirish" : "📷 Qo'lda yozilgan javob rasmini biriktirish"),
+      st.photoId ? (st.photoUrl ? el("img", {class: "thumb", src: st.photoUrl}) : el("div", {class: "muted small"}, "✅ Rasm biriktirilgan")) : null]));
+  };
+  drawPhoto();
+  const submit = async () => {
+    if (!st.text.trim() && !st.photoId) return toast("Avval javob yozing yoki rasm biriktiring");
+    if (!await confirmBox("Bo'limni yakunlaysizmi?", "Topshirgandan keyin matnni o'zgartirib bo'lmaydi.", "✅ Topshirish")) return;
+    submitWriting(st);
+  };
+  mount(el("div", {class: "solve"},
+    el("div", {class: "sbar"}, timer, el("div", {class: "prog"}, el("div", {class: "t"}, p.name)), saveSt),
+    el("div", {class: "pane active", style: "padding:12px 14px"},
+      el("div", {class: "card", style: "margin-top:0"}, el("div", {class: "muted small"}, "✍️ Topshiriq"), el("div", {class: "prompt"}, p.prompt)),
+      ta, words, el("div", {style: "height:10px"}), photoBox),
+    el("div", {class: "sfoot"}, el("button", {class: "btn", onclick: submit}, "✅ Bo'limni topshirish"))));
+  const tick = () => {
+    const remain = st.endTs - (Date.now() / 1000 + st.offset);
+    timer.textContent = "⏱ " + fmtTime(remain);
+    timer.className = "timer" + (remain <= 60 ? " crit" : remain <= 300 ? " warn" : "");
+    if (remain <= 0 && !st.submitted) { stopTick(); toast("⏱ Vaqt tugadi — matningiz topshirilmoqda"); submitWriting(st, true); }
+  };
+  tick(); S.tick = setInterval(tick, 500);
+}
+async function saveWriting(st) {
+  if (st.submitted) return true;
+  try { await api("/api/test/save", {body: writingPayload(st)}); return true; } catch (e) { return false; }
+}
+async function submitWriting(st, auto) {
+  if (st.submitted) return;
+  st.submitted = true; stopTick(); clearTimeout(st.saveTimer);
+  const done = overlay("Topshirilmoqda... (AI tekshirsa bir necha soniya davom etadi)");
+  try {
+    const r = await api("/api/staged/submit", {body: writingPayload(st)});
+    lsDel(`et:${S.uid}:${st.testId}:${st.sectionKey}:${st.endTs}`);
+    done(); haptic("ok"); S.st = null;
+    if (tg) { try { tg.disableClosingConfirmation(); } catch (e) {} }
+    if (!r.finished) { toast(`✅ «${st.name}» topshirildi`); return renderOverview(r.overview); }
+    renderResult(r.result);
+  } catch (e) {
+    done(); st.submitted = false;
+    if (e.network && auto) { setTimeout(() => submitWriting(st, true), 4000); return; }
+    handleErr(e);
+  }
+}
+
+/* ------------ fayllar: PDF / audio ------------ */
+async function ensureFiles(st, pane) {
+  if (st.filesLoaded) return;
+  st.filesLoaded = true;
+  pane.replaceChildren(el("div", {class: "center", style: "min-height:40vh"}, el("div", {class: "spin dark"}), el("div", {class: "muted"}, "Fayl yuklanmoqda...")));
+  const parts = [];
+  for (const f of st.files) {
+    const box = el("div", {});
+    parts.push(box);
+    try {
+      const res = await fetch(`/api/file/${st.testId}/${f.slot}`, {headers: {"X-Telegram-Init-Data": initData}});
+      if (!res.ok) { let m = "Faylni yuklab bo'lmadi."; try { m = (await res.json()).message || m; } catch (e) {} throw new Error(m); }
+      const ct = res.headers.get("Content-Type") || "";
+      const blob = await res.blob();
+      if (ct.includes("pdf")) await renderPdf(await blob.arrayBuffer(), box, pane);
+      else if (ct.startsWith("audio")) box.append(el("div", {class: "media"}, el("div", {class: "muted small"}, "🎧 Audio (Listening)"), el("audio", {controls: true, src: URL.createObjectURL(blob), preload: "auto"})));
+      else if (ct.startsWith("video")) box.append(el("div", {class: "media"}, el("video", {controls: true, src: URL.createObjectURL(blob), playsinline: true})));
+      else if (ct.startsWith("image")) box.append(el("div", {class: "pdfwrap"}, el("img", {src: URL.createObjectURL(blob), class: "pdfpage", style: "width:100%"})));
+      else box.append(el("div", {class: "media"}, el("a", {href: URL.createObjectURL(blob), download: "savollar"}, "📥 Faylni yuklab olish")));
+    } catch (e) {
+      box.append(el("div", {class: "status bad", style: "margin:12px"}, "⚠️ " + (e.message || "Faylni yuklab bo'lmadi.")));
+    }
+  }
+  // audio har doim tepada tursin
+  parts.sort((a, b) => (b.querySelector("audio") ? 1 : 0) - (a.querySelector("audio") ? 1 : 0));
+  pane.replaceChildren(...parts);
+}
+async function renderPdf(buf, box, pane) {
+  if (!window.pdfjsLib) { box.append(el("div", {class: "status bad", style: "margin:12px"}, "PDF ko'ruvchini yuklab bo'lmadi.")); return; }
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  const pdf = await pdfjsLib.getDocument({data: buf}).promise;
+  let zoom = 1;
+  const pages = el("div", {class: "pdfwrap"});
+  const info = el("span", {}, `${pdf.numPages} sahifa`);
+  const z = d => { zoom = Math.min(3, Math.max(0.6, zoom + d)); zl.textContent = Math.round(zoom * 100) + "%"; rerender(); };
+  const zl = el("span", {}, "100%");
+  const head = el("div", {class: "pane-head"}, info, el("div", {style: "display:flex;gap:6px;align-items:center"},
+    el("button", {class: "icon-btn", onclick: () => z(-0.2)}, "−"), zl, el("button", {class: "icon-btn", onclick: () => z(0.2)}, "+")));
+  box.append(head, pages);
+  const slots = [];
+  const io = new IntersectionObserver(ents => ents.forEach(en => { if (en.isIntersecting) draw(en.target); }), {root: pane, rootMargin: "600px 0px"});
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const d = el("div", {class: "pdfpage", "data-p": i, style: "width:100%;min-height:300px"});
+    slots.push(d); pages.append(d); io.observe(d);
+  }
+  async function draw(d) {
+    const want = zoom + ":" + pane.clientWidth;
+    if (d.dataset.done === want || d.dataset.busy) return;
+    d.dataset.busy = "1";
+    try {
+      const page = await pdf.getPage(+d.dataset.p);
+      const avail = Math.max(240, (pane.clientWidth || window.innerWidth) - 16);
+      const base = page.getViewport({scale: 1});
+      const cssW = avail * zoom, scale = cssW / base.width, dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+      const vp = page.getViewport({scale: scale * dpr});
+      const c = document.createElement("canvas"); c.width = vp.width; c.height = vp.height;
+      await page.render({canvasContext: c.getContext("2d"), viewport: vp}).promise;
+      d.style.width = cssW + "px"; d.style.minHeight = ""; d.replaceChildren(c); d.dataset.done = want;
+    } catch (e) { d.textContent = "Sahifani chizib bo'lmadi"; }
+    delete d.dataset.busy;
+  }
+  function rerender() { slots.forEach(d => { const r = d.getBoundingClientRect(), pr = pane.getBoundingClientRect(); if (r.bottom > pr.top - 600 && r.top < pr.bottom + 600) draw(d); }); }
+  window.addEventListener("resize", () => rerender());
+}
+
+/* ------------ natija ------------ */
+async function showResult(testId) {
+  const done = overlay("Natija yuklanmoqda...");
+  try { const r = await api("/api/result/" + testId); done(); renderResult(r.result); }
+  catch (e) { done(); handleErr(e); }
+}
+function ring(pct, label) {
+  const p = Math.max(0, Math.min(100, pct || 0)), R = 62, C = 2 * Math.PI * R;
+  const color = p >= 70 ? "var(--ok)" : p >= 50 ? "var(--warn)" : "var(--bad)";
+  const svg = `<svg class="ring" viewBox="0 0 150 150"><circle cx="75" cy="75" r="${R}" fill="none" stroke="rgba(127,127,127,.18)" stroke-width="12"/>
+    <circle cx="75" cy="75" r="${R}" fill="none" stroke="${color}" stroke-width="12" stroke-linecap="round" stroke-dasharray="${C}" stroke-dashoffset="${C * (1 - p / 100)}" transform="rotate(-90 75 75)"/>
+    <text x="75" y="${label ? 76 : 84}" text-anchor="middle" font-size="30" fill="currentColor">${label ? "" : Math.round(p) + "%"}</text></svg>`;
+  const d = el("div", {html: svg});
+  if (label) d.querySelector("text").textContent = label;
+  return d;
+}
+function renderResult(v) {
+  stopTick(); closeCalc(); showTabs(false); setBack(renderHome); S.st = null;
+  if (tg) { try { tg.disableClosingConfirmation(); } catch (e) {} }
+  const t = v.test;
+  const kids = [el("div", {class: "muted small"}, `${t.exam_label} · ${t.code}`), el("h1", {}, t.title)];
+  if (v.state === "none") {
+    kids.push(el("div", {class: "status warn"}, "Bu test bo'yicha natija hali yo'q."));
+  } else if (v.state === "staged") {
+    const pend = v.status === "pending_review";
+    const big = v.overall_grade != null && !pend ? String(v.overall_grade) : "⏳";
+    kids.push(el("div", {class: "card", style: "text-align:center"}, ring(pend ? 0 : (v.percent != null ? v.percent : 0), big),
+      el("div", {class: "muted"}, pend ? "Ustoz (yoki AI) baholayapti — yakuniy natija botga keladi." : "Umumiy natija")));
+    const tb = el("table", {class: "tb"}, el("tr", {}, el("th", {}, "Bo'lim"), el("th", {}, "Natija"), el("th", {}, "Daraja/ball")));
+    v.sections.forEach(s => tb.append(el("tr", {}, el("td", {}, s.name),
+      el("td", {}, s.total != null ? `${s.score}/${s.total}` : (s.submitted ? "topshirildi" : "—")),
+      el("td", {}, s.band != null ? String(s.band) : (s.earned != null ? `${(+s.earned).toFixed(1)}/${(+s.max).toFixed(1)}` : (s.submitted ? "⏳" : "—"))))));
+    kids.push(el("div", {class: "card"}, el("h2", {}, "Bo'limlar"), tb));
+    v.sections.filter(s => s.feedback).forEach(s => kids.push(el("div", {class: "card"}, el("b", {}, s.name + " — fikr-mulohaza"), el("p", {class: "prompt"}, s.feedback))));
+  } else {
+    const rasch = v.rasch;
+    let big;
+    if (rasch && !rasch.finalized) kids.push(el("div", {class: "card", style: "text-align:center"}, ring(0, "⏳"),
+      el("div", {}, "⚡ Rasch ball test yakunlangach hammaga bir vaqtda e'lon qilinadi."), el("div", {class: "muted small"}, rasch.remain_text || "")));
+    else if (rasch) kids.push(el("div", {class: "card", style: "text-align:center"}, ring(rasch.percent, (rasch.ball != null ? (+rasch.ball).toFixed(1) : "-")),
+      el("div", {}, "Rasch ball (0–75)"), rasch.grade ? el("div", {class: "chips", style: "justify-content:center"}, el("span", {class: "chip acc"}, "Daraja: " + rasch.grade)) : null));
+    else kids.push(el("div", {class: "card", style: "text-align:center"}, ring(v.percent),
+      v.grade ? el("div", {class: "chips", style: "justify-content:center"}, el("span", {class: "chip acc"}, gradeLabel(t.exam_type) + v.grade)) : null));
+    if (!rasch || rasch.finalized) {
+      const wrong = (v.scored_total != null ? v.scored_total : v.total) - v.score;
+      kids.push(el("div", {class: "stats"}, el("div", {class: "stat"}, el("b", {style: "color:var(--ok)"}, v.score), el("span", {}, "to'g'ri")),
+        el("div", {class: "stat"}, el("b", {style: "color:var(--bad)"}, Math.max(0, wrong)), el("span", {}, "xato")),
+        el("div", {class: "stat"}, el("b", {}, (v.percent || 0).toFixed(1) + "%"), el("span", {}, "foiz"))));
+    } else kids.push(el("div", {class: "status"}, "📊 Javoblaringiz qabul qilindi."));
+    if (t.exam_type === "dtm" && v.max) kids.push(el("div", {class: "card"}, el("div", {class: "kv"}, el("span", {}, "🏁 DTM ball"), el("b", {}, `${(+v.earned).toFixed(1)} / ${(+v.max).toFixed(1)}`)),
+      ...(v.subjects || []).map(s => el("div", {class: "kv"}, el("span", {}, `${s.name} (${s.q} savol × ${s.w})`), el("span", {}, `${s.correct} ta · ${(+s.earned).toFixed(1)} ball`)))));
+    if (v.open_pending) kids.push(el("div", {class: "status warn"}, `✍️ ${v.open_pending} ta ochiq javobingizni ustoz tekshiradi — yakuniy natija botga keladi.`));
+    if (v.review) {
+      const grid = el("div", {class: "navgrid"});
+      v.review.forEach(it => grid.append(el("button", {class: it.ok == null ? "pend" : it.ok ? "ok" : "bad", onclick: () => {
+        toast(it.open ? `${it.n}-savol (ochiq): siz — «${it.you || "javobsiz"}», kalit — «${it.key || "-"}»` :
+          `${it.n}-savol: siz — ${it.you || "javobsiz"}, to'g'ri — ${it.key}`, 3500);
+      }}, it.n)));
+      kids.push(el("div", {class: "card"}, el("h2", {}, "Javoblar tahlili"), el("div", {class: "muted small"}, "Raqamni bosing — javobingiz va to'g'ri javob ko'rinadi."), grid,
+        el("div", {class: "legend"}, el("span", {}, el("i", {style: "background:rgba(31,157,85,.3);border-color:var(--ok)"}), "to'g'ri"),
+          el("span", {}, el("i", {style: "background:rgba(214,69,69,.25);border-color:var(--bad)"}), "xato"), el("span", {}, el("i", {style: "border-style:dashed"}), "tekshirilmoqda"))));
+    } else if (v.review_allowed === false) kids.push(el("div", {class: "status"}, "🔒 Guruh xavfsizligi uchun batafsil tahlil test vaqti tugagach ochiladi."));
+  }
+  if (v.certificate && v.result_id) kids.push(el("div", {class: "card"}, el("b", {}, "🎓 Sertifikat"), el("p", {class: "muted small"}, "Sertifikatingiz botga ham yuborilgan."),
+    el("a", {class: "btn block", href: `/api/certificate/${v.result_id}?initData=${encodeURIComponent(initData)}`}, "📥 Sertifikatni yuklab olish")));
+  kids.push(el("div", {class: "card"}, el("p", {class: "muted small"}, "Batafsil natija bot chatiga ham yuborildi."),
+    el("button", {class: "btn block", onclick: renderHome}, "🏠 Bosh sahifa"), el("button", {class: "btn block ghost", onclick: openBot}, "💬 Botga qaytish")));
+  mount(el("div", {class: "screen"}, ...kids));
+}
+function gradeLabel(et) { return {cefr: "CEFR: ", ielts: "IELTS band: ", sat: "SAT: ", rasch: "Daraja: "}[et] || "Daraja: "; }
+
+/* ------------ profil ------------ */
+async function renderProfile() {
+  stopTick(); closeCalc(); showTabs(true); setBack(renderHome); setTab("profile");
+  mount(el("div", {class: "center"}, el("div", {class: "spin dark"})));
+  let d;
+  try { d = await api("/api/profile"); } catch (e) { return handleErr(e); }
+  if (S.tab !== "profile") return;
+  const list = el("div", {});
+  if (!d.results.length) list.append(el("div", {class: "muted", style: "text-align:center;padding:24px 0"}, "Hali natijalar yo'q"));
+  d.results.forEach(r => list.append(el("div", {class: "list-item", style: "cursor:pointer", onclick: () => showResult(r.test_id)},
+    el("div", {}, el("b", {}, r.title), el("div", {class: "muted small"}, `${r.code} · ${r.exam_label} · ${r.date || ""}`),
+      r.has_certificate ? el("div", {class: "small"}, "🎓 sertifikat bor") : null),
+    el("span", {class: "badge"}, r.percent.toFixed(1) + "%"))));
+  mount(el("div", {class: "screen"}, el("h1", {}, d.full_name || "Profil"), el("div", {class: "muted"}, "Statistika va natijalar"),
+    el("div", {class: "card"}, el("div", {class: "stats"},
+      el("div", {class: "stat"}, el("b", {}, d.summary.count), el("span", {}, "jami test")),
+      el("div", {class: "stat"}, el("b", {}, d.summary.avg_percent.toFixed(1) + "%"), el("span", {}, "o'rtacha")),
+      el("div", {class: "stat"}, el("b", {}, d.summary.best_percent.toFixed(1) + "%"), el("span", {}, "eng yaxshi")))),
+    el("div", {class: "card"}, el("h2", {}, "So'nggi natijalar"), list)));
+}
+
+/* ------------ SAT: kalkulyator ------------ */
+const Calc = {deg: false, ans: 0, mode: "calc", hist: [], fns: ["x^2-2x-3", "", ""], view: {x0: -10, x1: 10, y0: -7, y1: 7}};
+function tokenize(src) {
+  const s = src.replace(/×/g, "*").replace(/÷/g, "/").replace(/−/g, "-").replace(/π/g, "pi").replace(/√/g, "sqrt").replace(/²/g, "^2");
+  const out = []; let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (/\s/.test(c)) { i++; continue; }
+    const m = /^(\d+\.?\d*|\.\d+)(e[+-]?\d+)?/i.exec(s.slice(i));
+    if (m) { out.push({t: "n", v: parseFloat(m[0])}); i += m[0].length; continue; }
+    const w = /^[a-z]+/i.exec(s.slice(i));
+    if (w) { out.push({t: "id", v: w[0].toLowerCase()}); i += w[0].length; continue; }
+    if ("+-*/^(),!%".includes(c)) { out.push({t: "op", v: c}); i++; continue; }
+    throw new Error("Noto'g'ri belgi: " + c);
+  }
+  return out;
+}
+const FN = {sin: 1, cos: 1, tan: 1, asin: 1, acos: 1, atan: 1, sqrt: 1, cbrt: 1, ln: 1, log: 1, abs: 1, exp: 1};
+function parseExpr(tokens) {
+  let p = 0;
+  const peek = () => tokens[p], next = () => tokens[p++];
+  const isOp = (v) => peek() && peek().t === "op" && peek().v === v;
+  function expr() { let n = term(); while (isOp("+") || isOp("-")) { const o = next().v, r = term(), l = n; n = o === "+" ? (x) => l(x) + r(x) : (x) => l(x) - r(x); } return n; }
+  function startsPrimary() { const t = peek(); return t && (t.t === "n" || t.t === "id" || (t.t === "op" && t.v === "(")); }
+  function term() {
+    let n = unary();
+    for (;;) {
+      if (isOp("*") || isOp("/")) { const o = next().v, r = unary(), l = n; n = o === "*" ? (x) => l(x) * r(x) : (x) => l(x) / r(x); }
+      else if (startsPrimary()) { const r = power(), l = n; n = (x) => l(x) * r(x); }
+      else return n;
+    }
+  }
+  function unary() { if (isOp("-")) { next(); const u = unary(); return (x) => -u(x); } if (isOp("+")) { next(); return unary(); } return power(); }
+  function power() { const b = postfix(); if (isOp("^")) { next(); const e = unary(); return (x) => Math.pow(b(x), e(x)); } return b; }
+  function postfix() {
+    let n = primary();
+    for (;;) {
+      if (isOp("!")) { next(); const l = n; n = (x) => fact(l(x)); }
+      else if (isOp("%")) { next(); const l = n; n = (x) => l(x) / 100; }
+      else return n;
+    }
+  }
+  function primary() {
+    const t = next();
+    if (!t) throw new Error("Ifoda tugallanmagan");
+    if (t.t === "n") return () => t.v;
+    if (t.t === "op" && t.v === "(") { const n = expr(); if (!isOp(")")) throw new Error("Qavs yopilmagan"); next(); return n; }
+    if (t.t === "id") {
+      if (t.v === "pi") return () => Math.PI;
+      if (t.v === "e") return () => Math.E;
+      if (t.v === "x") return (x) => x;
+      if (t.v === "ans") return () => Calc.ans;
+      if (FN[t.v]) {
+        let a;
+        if (isOp("(")) { next(); a = expr(); if (!isOp(")")) throw new Error("Qavs yopilmagan"); next(); }
+        else a = power();
+        const f = t.v, rad = (v) => Calc.deg ? v * Math.PI / 180 : v, inv = (v) => Calc.deg ? v * 180 / Math.PI : v;
+        return (x) => { const v = a(x);
+          switch (f) { case "sin": return Math.sin(rad(v)); case "cos": return Math.cos(rad(v)); case "tan": return Math.tan(rad(v));
+            case "asin": return inv(Math.asin(v)); case "acos": return inv(Math.acos(v)); case "atan": return inv(Math.atan(v));
+            case "sqrt": return Math.sqrt(v); case "cbrt": return Math.cbrt(v); case "ln": return Math.log(v); case "log": return Math.log10(v);
+            case "abs": return Math.abs(v); case "exp": return Math.exp(v); } };
+      }
+      throw new Error("Noma'lum: " + t.v);
+    }
+    throw new Error("Kutilmagan: " + t.v);
+  }
+  const f = expr();
+  if (p < tokens.length) throw new Error("Ortiqcha: " + tokens[p].v);
+  return f;
+}
+function fact(n) { if (n < 0 || !Number.isInteger(n) || n > 170) return NaN; let r = 1; for (let i = 2; i <= n; i++) r *= i; return r; }
+function fmtNum(v) {
+  if (!isFinite(v)) return isNaN(v) ? "Xato" : (v > 0 ? "∞" : "-∞");
+  if (Math.abs(v) >= 1e12 || (Math.abs(v) < 1e-7 && v !== 0)) return v.toExponential(6).replace(/\.?0+e/, "e");
+  return String(+v.toPrecision(12));
+}
+function closeCalc() { const c = document.getElementById("calc"); if (c) c.classList.add("hidden"); }
+function toggleCalc() {
+  const c = document.getElementById("calc");
+  if (!c.dataset.built) buildCalc(c);
+  c.classList.toggle("hidden");
+  if (!c.classList.contains("hidden") && Calc.mode === "graph") drawGraph();
+}
+function buildCalc(c) {
+  c.dataset.built = "1";
+  const tabs = el("div", {class: "tb2"});
+  const tabBtn = (m, t) => el("button", {class: Calc.mode === m ? "on" : "", onclick: () => { Calc.mode = m; renderCalcBody(); tabs.querySelectorAll("button").forEach(b => b.classList.toggle("on", b.textContent === t)); }}, t);
+  tabs.append(tabBtn("calc", "Kalkulyator"), tabBtn("graph", "Grafik"));
+  const head = el("div", {class: "ch"}, el("span", {}, "🧮"), tabs, el("button", {class: "icon-btn", style: "width:30px;height:30px", onclick: closeCalc}, "✕"));
+  const body = el("div", {});
+  c.append(head, body);
+  // sudrab ko'chirish
+  let drag = null;
+  head.addEventListener("pointerdown", e => { if (e.target.closest("button")) return; const r = c.getBoundingClientRect(); drag = {dx: e.clientX - r.left, dy: e.clientY - r.top}; head.setPointerCapture(e.pointerId); });
+  head.addEventListener("pointermove", e => { if (!drag) return; c.style.left = Math.max(0, Math.min(window.innerWidth - 80, e.clientX - drag.dx)) + "px"; c.style.top = Math.max(0, Math.min(window.innerHeight - 60, e.clientY - drag.dy)) + "px"; c.style.right = "auto"; });
+  head.addEventListener("pointerup", () => { drag = null; });
+  function renderCalcBody() { body.replaceChildren(Calc.mode === "calc" ? calcPanel() : graphPanel()); if (Calc.mode === "graph") drawGraph(); }
+  renderCalcBody();
+}
+function calcPanel() {
+  const expr = el("input", {class: "expr", inputmode: window.matchMedia("(pointer:coarse)").matches ? "none" : "text", spellcheck: "false", placeholder: "0"});
+  expr.value = Calc.expr || "";
+  const res = el("div", {class: "res"});
+  const hist = el("div", {class: "hist"});
+  const drawHist = () => hist.replaceChildren(...Calc.hist.slice(-4).map(h => el("div", {}, h)));
+  const live = () => { Calc.expr = expr.value; try { if (!expr.value.trim()) { res.textContent = ""; return; } res.textContent = "= " + fmtNum(parseExpr(tokenize(expr.value))(0)); } catch (e) { res.textContent = ""; } };
+  const ins = (s) => { const a = expr.selectionStart ?? expr.value.length, b = expr.selectionEnd ?? expr.value.length; expr.value = expr.value.slice(0, a) + s + expr.value.slice(b); const p = a + s.length; expr.setSelectionRange(p, p); live(); };
+  const evalNow = () => {
+    try { const v = parseExpr(tokenize(expr.value))(0); Calc.hist.push(`${expr.value} = ${fmtNum(v)}`); Calc.ans = v; expr.value = fmtNum(v); res.textContent = ""; drawHist(); }
+    catch (e) { res.textContent = e.message; }
+  };
+  expr.addEventListener("input", live);
+  expr.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); evalNow(); } });
+  const degBtn = el("button", {class: "fn"}, Calc.deg ? "DEG" : "RAD");
+  degBtn.addEventListener("click", () => { Calc.deg = !Calc.deg; degBtn.textContent = Calc.deg ? "DEG" : "RAD"; live(); });
+  const K = (label, cls, fn) => el("button", {class: cls || "", onclick: () => { fn(); haptic("sel"); }}, label);
+  const keys = el("div", {class: "keys"},
+    degBtn, K("(", "", () => ins("(")), K(")", "", () => ins(")")), K("⌫", "", () => { const a = expr.selectionStart ?? expr.value.length; if (a > 0) { expr.value = expr.value.slice(0, a - 1) + expr.value.slice(a); expr.setSelectionRange(a - 1, a - 1); } live(); }), K("AC", "", () => { expr.value = ""; live(); }),
+    K("sin", "fn", () => ins("sin(")), K("cos", "fn", () => ins("cos(")), K("tan", "fn", () => ins("tan(")), K("π", "", () => ins("π")), K("e", "", () => ins("e")),
+    K("ln", "fn", () => ins("ln(")), K("log", "fn", () => ins("log(")), K("√", "", () => ins("√(")), K("x²", "", () => ins("^2")), K("^", "op", () => ins("^")),
+    K("7", "", () => ins("7")), K("8", "", () => ins("8")), K("9", "", () => ins("9")), K("÷", "op", () => ins("÷")), K("n!", "fn", () => ins("!")),
+    K("4", "", () => ins("4")), K("5", "", () => ins("5")), K("6", "", () => ins("6")), K("×", "op", () => ins("×")), K("%", "", () => ins("%")),
+    K("1", "", () => ins("1")), K("2", "", () => ins("2")), K("3", "", () => ins("3")), K("−", "op", () => ins("−")), K("Ans", "fn", () => ins("ans")),
+    K("0", "", () => ins("0")), K(".", "", () => ins(".")), K("1/x", "fn", () => { expr.value = "1/(" + (expr.value || "0") + ")"; live(); }), K("+", "op", () => ins("+")), K("=", "eq", evalNow));
+  setTimeout(drawHist, 0);
+  return el("div", {}, el("div", {class: "disp"}, expr, res), hist, keys);
+}
+const GCOL = ["#2f6fed", "#d64545", "#1f9d55"];
+function graphPanel() {
+  const rows = Calc.fns.map((f, i) => {
+    const inp = el("input", {value: f, placeholder: i ? "ixtiyoriy, masalan 2x+1" : "masalan x^2-2x-3", spellcheck: "false"});
+    inp.addEventListener("input", () => { Calc.fns[i] = inp.value; drawGraph(); });
+    return el("div", {class: "fnrow"}, el("i", {style: "background:" + GCOL[i]}), el("span", {class: "small"}, "y ="), inp);
+  });
+  const cv = el("canvas", {id: "gcv"});
+  const coord = el("div", {class: "muted small", id: "gcoord", style: "text-align:center;min-height:18px"}, "Grafikni sudrang, +/− bilan kattalashtiring");
+  const zoom = k => { const v = Calc.view, cx = (v.x0 + v.x1) / 2, cy = (v.y0 + v.y1) / 2; v.x0 = cx - (cx - v.x0) * k; v.x1 = cx + (v.x1 - cx) * k; v.y0 = cy - (cy - v.y0) * k; v.y1 = cy + (v.y1 - cy) * k; drawGraph(); };
+  let drag = null;
+  cv.addEventListener("pointerdown", e => { drag = {x: e.clientX, y: e.clientY}; cv.setPointerCapture(e.pointerId); });
+  cv.addEventListener("pointermove", e => {
+    const r = cv.getBoundingClientRect(), v = Calc.view;
+    const gx = v.x0 + (e.clientX - r.left) / r.width * (v.x1 - v.x0);
+    if (drag) { const dx = (e.clientX - drag.x) / r.width * (v.x1 - v.x0), dy = (e.clientY - drag.y) / r.height * (v.y1 - v.y0); v.x0 -= dx; v.x1 -= dx; v.y0 += dy; v.y1 += dy; drag = {x: e.clientX, y: e.clientY}; drawGraph(); }
+    let txt = `x = ${fmtNum(+gx.toFixed(3))}`;
+    Calc.fns.forEach((f, i) => { if (!f.trim()) return; try { txt += `  ·  y${i + 1} = ${fmtNum(+parseExpr(tokenize(f))(gx).toFixed(4))}`; } catch (er) {} });
+    coord.textContent = txt;
+  });
+  cv.addEventListener("pointerup", () => { drag = null; });
+  return el("div", {class: "graph"}, ...rows, cv, coord, el("div", {class: "row-btns", style: "margin-top:6px"},
+    el("button", {class: "btn ghost", onclick: () => zoom(0.7)}, "+"), el("button", {class: "btn ghost", onclick: () => zoom(1 / 0.7)}, "−"),
+    el("button", {class: "btn ghost", onclick: () => { Calc.view = {x0: -10, x1: 10, y0: -7, y1: 7}; drawGraph(); }}, "⟲")));
+}
+function drawGraph() {
+  const cv = document.getElementById("gcv"); if (!cv) return;
+  const dpr = window.devicePixelRatio || 1, W = cv.clientWidth || 300, H = cv.clientHeight || 230;
+  cv.width = W * dpr; cv.height = H * dpr;
+  const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+  const v = Calc.view, X = x => (x - v.x0) / (v.x1 - v.x0) * W, Y = y => H - (y - v.y0) / (v.y1 - v.y0) * H;
+  const css = getComputedStyle(document.body), txt = css.color;
+  const step = s => { const raw = s / 8, p = Math.pow(10, Math.floor(Math.log10(raw))), m = raw / p; return (m < 2 ? 1 : m < 5 ? 2 : 5) * p; };
+  const sx = step(v.x1 - v.x0), sy = step(v.y1 - v.y0);
+  g.lineWidth = 1; g.strokeStyle = "rgba(127,127,127,.18)"; g.fillStyle = txt; g.font = "10px sans-serif";
+  for (let x = Math.ceil(v.x0 / sx) * sx; x <= v.x1; x += sx) { g.beginPath(); g.moveTo(X(x), 0); g.lineTo(X(x), H); g.stroke(); if (Math.abs(x) > 1e-9) g.fillText(fmtNum(+x.toFixed(6)), X(x) + 2, Math.min(H - 3, Math.max(10, Y(0) + 11))); }
+  for (let y = Math.ceil(v.y0 / sy) * sy; y <= v.y1; y += sy) { g.beginPath(); g.moveTo(0, Y(y)); g.lineTo(W, Y(y)); g.stroke(); if (Math.abs(y) > 1e-9) g.fillText(fmtNum(+y.toFixed(6)), Math.min(W - 24, Math.max(2, X(0) + 3)), Y(y) - 2); }
+  g.strokeStyle = "rgba(127,127,127,.75)"; g.lineWidth = 1.3;
+  g.beginPath(); g.moveTo(0, Y(0)); g.lineTo(W, Y(0)); g.moveTo(X(0), 0); g.lineTo(X(0), H); g.stroke();
+  Calc.fns.forEach((f, i) => {
+    if (!f.trim()) return;
+    let fn; try { fn = parseExpr(tokenize(f)); } catch (e) { return; }
+    g.strokeStyle = GCOL[i]; g.lineWidth = 2.2; g.beginPath();
+    let pen = false, prev = null;
+    for (let px = 0; px <= W; px += 1) {
+      const x = v.x0 + px / W * (v.x1 - v.x0), y = fn(x);
+      if (!isFinite(y) || (prev != null && Math.abs(Y(y) - Y(prev)) > H * 2)) { pen = false; prev = isFinite(y) ? y : null; continue; }
+      if (pen) g.lineTo(px, Y(y)); else { g.moveTo(px, Y(y)); pen = true; }
+      prev = y;
+    }
+    g.stroke();
+  });
+}
+function showReference() {
+  const F = (name, f) => el("div", {class: "f"}, el("span", {}, name), el("b", {}, f));
+  sheet(el("div", {class: "ref"}, el("h2", {}, "📐 SAT Math ma'lumotnomasi"),
+    el("div", {class: "muted small"}, "Imtihonda beriladigan formulalar"),
+    el("h3", {}, "Yuzalar"), F("Doira yuzasi", "A = πr²"), F("Aylana uzunligi", "C = 2πr"), F("To'g'ri to'rtburchak", "A = ℓw"), F("Uchburchak", "A = ½·b·h"),
+    el("h3", {}, "Uchburchaklar"), F("Pifagor teoremasi", "c² = a² + b²"), F("30°–60°–90°", "x,  x√3,  2x"), F("45°–45°–90°", "s,  s,  s√2"),
+    el("h3", {}, "Hajmlar"), F("To'g'ri burchakli parallelepiped", "V = ℓwh"), F("Silindr", "V = πr²h"), F("Shar", "V = ⁴⁄₃·πr³"), F("Konus", "V = ⅓·πr²h"), F("Piramida", "V = ⅓·ℓwh"),
+    el("h3", {}, "Faktlar"), F("Aylanadagi yoy", "360° = 2π radian"), F("Uchburchak burchaklari yig'indisi", "180°")));
+}
+
+boot();
+</script>
+</body>
+</html>
+"""
+# --- MINI APP HTML OXIRI ---
 
 
 # ===================== FSM HOLATINI SAQLASH (Postgres) =====================
@@ -12465,7 +14716,7 @@ async def main():
     asyncio.create_task(db_backup_daemon(bot))
     # ✅ WEBAPP_URL bo'sh bo'lsa tugma ko'rinmaydi — portni ham ochib qo'yish shart emas.
     if WEBAPP_URL:
-        asyncio.create_task(run_webapp_server())
+        asyncio.create_task(run_webapp_server(bot))
 
     global FSM_STORAGE
     fsm_storage = PostgresStorage()
