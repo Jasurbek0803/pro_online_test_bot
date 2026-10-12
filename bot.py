@@ -16,7 +16,7 @@ import os
 import tempfile
 import random
 import string
-from datetime import datetime, timezone, timedelta, date, time as dtime
+from datetime import datetime, timezone, timedelta, time as dtime
 from collections import defaultdict, deque
 
 import asyncpg
@@ -44,6 +44,7 @@ from aiogram.types import (
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import BaseStorage, StorageKey, StateType
+from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 from aiogram.utils.callback_answer import CallbackAnswerMiddleware
@@ -1171,11 +1172,13 @@ async def _gemini_check_rasch_sanity(
         '{"ok": true yoki false, "reason": "<agar ok=false bo\'lsa qisqa o\'zbekcha sabab, aks holda bo\'sh satr>"}'
     )
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    # ✅ Kalit URL'da emas, header'da — aiohttp xatolari (masalan JSON o'rniga
+    # HTML qaytsa) to'liq URL'ni logga yozadi, kalit server logiga tushardi.
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-            async with session.post(url, json=payload) as resp:
+            async with session.post(url, json=payload, headers={"x-goog-api-key": GEMINI_API_KEY}) as resp:
                 if resp.status != 200:
                     logging.error(f"Gemini Rasch tekshiruvi xatosi: {resp.status} {await resp.text()}")
                     return default
@@ -1587,6 +1590,14 @@ def _normalize_channel_ref(text: str) -> str:
     if s.startswith("@"):
         s = s[1:]
     return s
+
+
+def _is_valid_join_url(url: str) -> bool:
+    """Telegram inline tugmasi qabul qiladigan havola. Avval faqat "http" bilan
+    boshlanishi tekshirilardi — "http://" yoki ichida bo'sh joy bo'lgan havola
+    "A'zo bo'ling" tugmasini Telegram rad etishiga va a'zo bo'lmagan HAR BIR
+    foydalanuvchi "Kutilmagan xatolik" olishiga olib kelardi."""
+    return bool(re.fullmatch(r"https?://[A-Za-z0-9.-]+\.[A-Za-z]{2,}(/[^\s<>\"']*)?", url or ""))
 
 
 def _looks_like_int(s: str) -> bool:
@@ -2042,6 +2053,12 @@ async def init_db(db):
     await _ensure_column(db, "payments", "amount", "INTEGER")
     await _ensure_column(db, "payments", "approved_at", "TEXT")
 
+    # ✅ Tezlik uchun indekslar — faqat qidiruvni tezlashtiradi, hech qanday
+    # ma'lumotni o'zgartirmaydi yoki o'chirmaydi.
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_results_test_id ON results(test_id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_payments_user_test ON payments(user_id, test_id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_staged_attempts_user_test ON staged_attempts(user_id, test_id)")
+
 
 # ===================== SECURITY =====================
 class SecurityManager:
@@ -2362,6 +2379,7 @@ async def _resume_active_timers(bot: Bot):
 
 
 FSM_STORAGE = None  # main() ichida o'rnatiladi (taymer avtomatik topshirishi uchun)
+EVENTS_ISOLATION = None  # main() ichida o'rnatiladi (foydalanuvchi bo'yicha qulf)
 
 
 class _DetachedState:
@@ -2386,6 +2404,18 @@ class _DetachedState:
 
 
 async def _auto_submit_on_timeout(bot: "Bot", user_tg_id: int, test_id: int, end_ts: int) -> None:
+    # ✅ Taymer foydalanuvchining o'z tugmalari bilan BIR NAVBATDA ishlaydi —
+    # aks holda oxirgi soniyada "Yakunlash" bosilib, taymer ham bir vaqtda
+    # ishga tushsa, bosqichli testda bitta bosqich ikki marta topshirilib,
+    # keyingi bosqich javobsiz yakunlanib ketishi mumkin edi.
+    if EVENTS_ISOLATION is None:
+        return await _auto_submit_on_timeout_unlocked(bot, user_tg_id, test_id, end_ts)
+    key = StorageKey(bot_id=bot.id, chat_id=user_tg_id, user_id=user_tg_id)
+    async with EVENTS_ISOLATION.lock(key):
+        await _auto_submit_on_timeout_unlocked(bot, user_tg_id, test_id, end_ts)
+
+
+async def _auto_submit_on_timeout_unlocked(bot: "Bot", user_tg_id: int, test_id: int, end_ts: int) -> None:
     """✅ Vaqt tugaganda o'quvchi belgilagan javoblarni AVTOMATIK topshiradi.
     Avval vaqt tugasa, "Yakunlash"ni o'zi 60 soniya ichida bosmagan o'quvchining
     butun ishi yo'qolardi ("Vaqt tugadi! Javoblar qabul qilinmadi"). Bosqichli
@@ -3186,6 +3216,10 @@ async def free_test_start(callback: CallbackQuery, state: FSMContext, bot: Bot):
 
     # ✅ O'quvchi avval shu testni boshlab, menyuga chiqib ketgan bo'lsa —
     # belgilagan javoblari tiklanadi (yordam bo'limida va'da qilinganidek).
+    # ✅ O'quvchi test yechayotganda eski xabardagi "Boshlash"ni qayta bossa,
+    # joriy (hali saqlanmagan) javoblari avval sessiyaga yoziladi — aks holda
+    # holat ustidan yozilib, belgilagan javoblari o'chib ketardi.
+    await _stash_test_progress(state, callback.from_user.id)
     saved = await _restore_test_progress(user_db_id, test_id, "free")
     saved_answers = saved.get("answers") or {}
     await state.update_data(
@@ -3600,21 +3634,25 @@ async def process_screenshot(message: Message, state: FSMContext, bot: Bot):
             f"Tasdiqlasangiz, tegishli ulushni o'ziga o'tkazib berishni unutmang.</i>"
         )
 
-    await bot.send_photo(
-        chat_id=routing["notify_tg_id"],
-        photo=photo_id,
-        caption=(
-            f"🟡 <b>Yangi to'lov (PENDING)</b>\n\n"
-            f"👤 User: {uname}\n"
-            f"📚 Test: {title}\n"
-            f"🔑 Kod: <code>{code}</code>\n"
-            f"💰 Summa: {price} so'm\n"
-            f"🆔 Payment ID: <code>{payment_id}</code>"
-            f"{share_note}"
-        ),
-        parse_mode=ParseMode.HTML,
-        reply_markup=admin_kb
+    # ✅ Xabar oluvchi (test egasi-admin) botni bloklagan bo'lsa, avval o'quvchi
+    # "Kutilmagan xatolik" olardi va chek kutish holatida qotib qolardi
+    # (to'lov esa bazaga yozilib bo'lgan). Endi asosiy adminga zaxira yuboriladi.
+    caption = (
+        f"🟡 <b>Yangi to'lov (PENDING)</b>\n\n"
+        f"👤 User: {_h(uname)}\n"
+        f"📚 Test: {_h(title)}\n"
+        f"🔑 Kod: <code>{code}</code>\n"
+        f"💰 Summa: {price} so'm\n"
+        f"🆔 Payment ID: <code>{payment_id}</code>"
+        f"{share_note}"
     )
+    for notify_id in dict.fromkeys([routing["notify_tg_id"], ADMIN_ID]):
+        try:
+            await bot.send_photo(chat_id=notify_id, photo=photo_id, caption=caption,
+                                 parse_mode=ParseMode.HTML, reply_markup=admin_kb)
+            break
+        except (TelegramForbiddenError, TelegramBadRequest):
+            logging.warning(f"To'lov xabarini yuborib bo'lmadi (tg_id={notify_id}, payment={payment_id})")
 
     admin_flag = await is_admin_user(message.from_user.id)
     await message.answer("✅ Chek qabul qilindi. Admin tasdiqlashini kuting.", reply_markup=main_menu_kb(admin_flag))
@@ -4241,6 +4279,10 @@ async def begin_test(callback: CallbackQuery, state: FSMContext, bot: Bot):
 
     # ✅ O'quvchi avval shu testni boshlab, menyuga chiqib ketgan bo'lsa —
     # belgilagan javoblari tiklanadi (yordam bo'limida va'da qilinganidek).
+    # ✅ O'quvchi test yechayotganda eski xabardagi "Boshlash"ni qayta bossa,
+    # joriy (hali saqlanmagan) javoblari avval sessiyaga yoziladi — aks holda
+    # holat ustidan yozilib, belgilagan javoblari o'chib ketardi.
+    await _stash_test_progress(state, callback.from_user.id)
     saved = await _restore_test_progress(user_db_id, test_id, "paid")
     saved_answers = saved.get("answers") or {}
     await state.update_data(
@@ -5183,7 +5225,7 @@ async def _send_stage_section(user_tg_id: int, bot: Bot, state: FSMContext) -> N
         if is_resume:
             current_q = data.get("stage_mcq_q", 1)
             answers = data.get("stage_mcq_answers", {})
-            await bot.send_message(
+            kb_msg = await bot.send_message(
                 user_tg_id,
                 f"▶️ <b>{label}</b> bosqichini davom ettiryapsiz — avvalgi javoblaringiz saqlangan.\n\n"
                 f"{question_status_note(answer_key, current_q)}"
@@ -5191,6 +5233,7 @@ async def _send_stage_section(user_tg_id: int, bot: Bot, state: FSMContext) -> N
                 parse_mode=ParseMode.HTML,
                 reply_markup=stage_mcq_kb(current_q, qcount, answers, answer_key)
             )
+            await state.update_data(stage_kb_mid=kb_msg.message_id)
         else:
             # ✅ stage_mcq_open_answers ham tozalanadi — avval oldingi bosqichning
             # ochiq javoblari keyingi bosqich natijasiga "oqib" o'tib qolardi.
@@ -5219,13 +5262,14 @@ async def _send_stage_section(user_tg_id: int, bot: Bot, state: FSMContext) -> N
                 except Exception:
                     logging.exception(f"Bosqich savollar faylini yuborib bo'lmadi (test={test_id}, key={key})")
 
-            await bot.send_message(
+            kb_msg = await bot.send_message(
                 user_tg_id,
                 f"📝 {question_status_note(answer_key, 1)}<b>1-savol</b> / {qcount}\n"
                 f"Pastdagi tugmalar orqali javobni belgilang:",
                 parse_mode=ParseMode.HTML,
                 reply_markup=stage_mcq_kb(1, qcount, {}, answer_key)
             )
+            await state.update_data(stage_kb_mid=kb_msg.message_id)
 
         timer_msg = await bot.send_message(user_tg_id, intro + "\n⏳ Qolgan vaqt: ...", parse_mode=ParseMode.HTML)
         ACTIVE_TIMERS[(user_tg_id, test_id)] = asyncio.create_task(
@@ -5257,9 +5301,17 @@ async def _send_stage_section(user_tg_id: int, bot: Bot, state: FSMContext) -> N
 @router.callback_query(StateFilter(StagedSolvingState.in_section, StagedSolvingState.awaiting_free_text),
                        F.data.startswith("sq_"))
 async def staged_mcq_handler(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    # ✅ Faqat AMALDAGI bosqich klaviaturasi qabul qilinadi. Avval oldingi
+    # bosqich xabaridagi tugma (yoki "Bosqichni yakunlash"ning ikkinchi
+    # bosilishi) KEYINGI bosqichga tegib, uni javobsiz topshirib yuborardi.
+    kb_mid = data.get("stage_kb_mid")
+    if kb_mid and callback.message and callback.message.message_id != kb_mid:
+        await callback.answer("⏱ Bu tugma oldingi bosqichga tegishli — eng so'nggi xabardagi tugmalardan "
+                              "foydalaning.", show_alert=True)
+        return
     if callback.data != "sq_freetext" and await state.get_state() == StagedSolvingState.awaiting_free_text.state:
         await state.set_state(StagedSolvingState.in_section)
-    data = await state.get_data()
     current_q = data.get("stage_mcq_q", 1)
     qcount = int(data.get("stage_current_qcount", 0))
     answers = data.get("stage_mcq_answers", {})
@@ -5358,12 +5410,13 @@ async def staged_collect_free_text(message: Message, state: FSMContext) -> None:
     await state.set_state(StagedSolvingState.in_section)
 
     ack = "rasm" if photo_id else "matn"
-    await message.answer(
+    kb_msg = await message.answer(
         f"✅ {current_q}-savol uchun {ack} javobingiz qabul qilindi.\n\n"
         f"📝 <b>{current_q}-savol</b> / {qcount}\nPastdagi tugmalar orqali davom eting:",
         parse_mode=ParseMode.HTML,
         reply_markup=stage_mcq_kb(current_q, qcount, answers, correct_key)
     )
+    await state.update_data(stage_kb_mid=kb_msg.message_id)
 
 
 async def _complete_current_stage_mcq(user_tg_id: int, bot: Bot, state: FSMContext, user_ans: str) -> None:
@@ -5542,13 +5595,19 @@ async def _complete_dtm_staged_attempt(bot: Bot, attempt_id: int, graded_by: int
         f"({sections[k].get('earned', 0):.1f}/{sections[k].get('max', 0):.1f} ball)"
         for k in cfg["order"] if k in sections
     )
-    await bot.send_message(
-        user_tg_id,
-        f"🏁 <b>DTM (5 bosqich) yakunlandi!</b>\n\n{lines}\n\n"
-        f"🏆 <b>Umumiy ball:</b> {earned:.1f}/{maxp:.1f} ({percent:.1f}%)",
-        parse_mode=ParseMode.HTML,
-        reply_markup=main_menu_kb(admin_flag)
-    )
+    # ✅ Ustoz baholaganda chaqiriladi — o'quvchi botni bloklagan bo'lsa,
+    # avval ustozning tugmasi "Kutilmagan xatolik" bilan yiqilardi.
+    try:
+        await bot.send_message(
+            user_tg_id,
+            f"🏁 <b>DTM (5 bosqich) yakunlandi!</b>\n\n{lines}\n\n"
+            f"🏆 <b>Umumiy ball:</b> {earned:.1f}/{maxp:.1f} ({percent:.1f}%)",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_kb(admin_flag)
+        )
+    except (TelegramForbiddenError, TelegramBadRequest):
+        logging.warning(f"DTM yakuniy natijasi o'quvchiga yetmadi (attempt={attempt_id})")
+        return
 
     if percent >= CERT_MIN_PERCENT:
         try:
@@ -5605,7 +5664,12 @@ async def _finalize_staged_attempt(
                 "(va loyiq bo'lsa sertifikat) shu yerga yuboriladi.",
                 parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(admin_flag)
             )
-            await _send_staged_open_for_review(bot, t["creator_id"] or ADMIN_ID, attempt_id)
+            # ✅ Ustoz botni bloklagan bo'lsa ham o'quvchining oqimi buzilmaydi —
+            # urinish "✍️ Tekshirilmagan ochiq javoblar" panelida ko'rinib turadi.
+            try:
+                await _send_staged_open_for_review(bot, t["creator_id"] or ADMIN_ID, attempt_id)
+            except (TelegramForbiddenError, TelegramBadRequest):
+                logging.warning(f"Ochiq javoblarni ustozga yuborib bo'lmadi (attempt={attempt_id})")
             return
         await _complete_dtm_staged_attempt(bot, attempt_id)
         return
@@ -5696,8 +5760,8 @@ async def _finalize_staged_attempt(
         )
         await bot.send_message(
             user_tg_id,
-            f"🏁 <b>Test yakunlandi — barchasi avtomatik baholandi!</b>\n"
-            f"Batafsil natija va fikr-mulohaza yuqorida yuborildi.",
+            "🏁 <b>Test yakunlandi — barchasi avtomatik baholandi!</b>\n"
+            "Batafsil natija va fikr-mulohaza yuqorida yuborildi.",
             parse_mode=ParseMode.HTML,
             reply_markup=main_menu_kb(admin_flag)
         )
@@ -5873,12 +5937,12 @@ async def _gemini_grade(
             logging.exception("Gemini uchun ovozli faylni yuklab bo'lmadi")
             return {"ok": False, "reason": "voice_download"}
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     payload = {"contents": [{"parts": parts}]}
 
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
-            async with session.post(url, json=payload) as resp:
+            async with session.post(url, json=payload, headers={"x-goog-api-key": GEMINI_API_KEY}) as resp:
                 if resp.status == 429:
                     logging.error(f"Gemini API kvota tugadi: {resp.status} {await resp.text()}")
                     return {"ok": False, "reason": "quota"}
@@ -7302,7 +7366,10 @@ async def interactive_test_handler(callback: CallbackQuery, state: FSMContext, b
         for i in range(1, qcount + 1):
             user_ans += answers.get(str(i), "*")
 
-        await callback.message.delete_reply_markup()
+        try:
+            await callback.message.delete_reply_markup()
+        except TelegramBadRequest:
+            pass  # klaviatura allaqachon olingan / xabar eski — topshirish to'xtamasligi kerak
         await callback.answer("Javoblaringiz qabul qilindi, baholanmoqda...", show_alert=False)
         open_answers = data.get("test_open_answers", {})
         await process_test_submission(callback.from_user.id, bot, state, user_ans, open_answers)
@@ -7610,8 +7677,8 @@ async def admin_pending(message: Message):
         )
         text += (
             f"🆔 <code>{pid}</code>\n"
-            f"👤 {uname}\n"
-            f"🔑 <code>{code}</code> — <b>{title}</b>\n"
+            f"👤 {_h(uname)}\n"
+            f"🔑 <code>{code}</code> — <b>{_h(title)}</b>\n"
             f"💰 {price} so'm | 🕒 {created_at}\n\n"
         )
         kb.inline_keyboard.append([InlineKeyboardButton(text=f"Ko‘rish: {pid}", callback_data=f"pview_{pid}")])
@@ -7651,8 +7718,8 @@ async def admin_pending_view(callback: CallbackQuery, bot: Bot):
         caption=(
             f"🟡 <b>PENDING to‘lov</b>\n\n"
             f"🆔 Payment ID: <code>{pid}</code>\n"
-            f"👤 User: {uname}\n"
-            f"📚 Test: {title}\n"
+            f"👤 User: {_h(uname)}\n"
+            f"📚 Test: {_h(title)}\n"
             f"🔑 Kod: <code>{code}</code>\n"
             f"💰 Summa: {price} so'm\n"
             f"🕒 Sana: {created_at}"
@@ -7694,9 +7761,19 @@ async def approve_payment(callback: CallbackQuery, bot: Bot):
         await callback.message.answer("❌ Bu test vaqti tugagan. Tasdiqlab bo‘lmaydi.")
         return
 
-    await POOL.execute(
-        "UPDATE payments SET status='approved', reject_reason=NULL, approved_at=$2 WHERE id=$1",
-        payment_id, now_str_local())
+    # ✅ Atomik: ikki admin (yoki tugmani ikki marta bosish) bir vaqtda
+    # tasdiqlasa, o'quvchiga ikki marta "tasdiqlandi" borardi. Shuningdek,
+    # o'quvchining shu testga boshqa tasdiqlangan to'lovi bo'lsa (eski rad
+    # etilgan chek keyin tasdiqlansa) — ikkinchi marta pul hisoblanmaydi.
+    upd = await POOL.execute("""
+        UPDATE payments SET status='approved', reject_reason=NULL, approved_at=$2
+        WHERE id=$1 AND status<>'approved'
+          AND NOT EXISTS (SELECT 1 FROM payments p2 WHERE p2.user_id=payments.user_id
+                          AND p2.test_id=payments.test_id AND p2.status='approved')
+    """, payment_id, now_str_local())
+    if upd.endswith(" 0"):
+        return await callback.answer("Bu to'lov (yoki shu o'quvchining shu testga boshqa to'lovi) "
+                                     "allaqachon tasdiqlangan.", show_alert=True)
 
     start_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 Testni boshlash", callback_data=f"begin_{payment_id}")]
@@ -7706,20 +7783,27 @@ async def approve_payment(callback: CallbackQuery, bot: Bot):
     if (start_mode or "normal") == "scheduled":
         extra = f"\n📅 Boshlanish: <b>{start_at}</b>\n⚠️ PDF faqat vaqt yetganda beriladi."
 
-    await bot.send_message(
-        chat_id=user_tg_id,
-        text=(
-            f"✅ <b>To‘lov tasdiqlandi!</b>\n\n"
-            f"📚 Test: <b>{title}</b>\n"
-            f"🔑 Kod: <code>{code}</code>\n"
-            f"🧮 Savollar: <b>{qcount}</b>\n"
-            f"⏳ Vaqt: {duration} daqiqa\n"
-            f"{extra}\n\n"
-            f"✅ Boshlash uchun tugmani bosing."
-        ),
-        parse_mode=ParseMode.HTML,
-        reply_markup=start_kb
-    )
+    try:
+        await bot.send_message(
+            chat_id=user_tg_id,
+            text=(
+                f"✅ <b>To‘lov tasdiqlandi!</b>\n\n"
+                f"📚 Test: <b>{title}</b>\n"
+                f"🔑 Kod: <code>{code}</code>\n"
+                f"🧮 Savollar: <b>{qcount}</b>\n"
+                f"⏳ Vaqt: {duration} daqiqa\n"
+                f"{extra}\n\n"
+                f"✅ Boshlash uchun tugmani bosing."
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=start_kb
+        )
+    except (TelegramForbiddenError, TelegramBadRequest):
+        logging.warning(f"Tasdiq xabari o'quvchiga yetmadi (payment={payment_id})")
+        return await callback.message.answer(
+            f"✅ Tasdiqlandi. Payment ID: {payment_id}\n"
+            f"⚠️ O'quvchiga xabar yetkazilmadi (botni bloklagan bo'lishi mumkin). Test uning "
+            f"«📦 Pullik testlarim» bo'limida ochiq turibdi.")
 
     await callback.message.answer(f"✅ Tasdiqlandi. Payment ID: {payment_id}")
 
@@ -7767,6 +7851,10 @@ async def reject_with_reason(message: Message, state: FSMContext, bot: Bot):
         await state.clear()
         return await message.answer("⚠️ Bu to'lov allaqachon tasdiqlangan — rad etilmadi.")
 
+    # ✅ Holat yuborishdan OLDIN tozalanadi — avval o'quvchi botni bloklagan
+    # bo'lsa xato tufayli admin "sabab kutish" holatida qolib ketardi va uning
+    # keyingi har bir xabari yana shu to'lovga "sabab" bo'lib yozilardi.
+    await state.clear()
     row = await POOL.fetchrow("""
         SELECT u.telegram_id, t.code, t.title, t.price
         FROM payments p
@@ -7775,23 +7863,28 @@ async def reject_with_reason(message: Message, state: FSMContext, bot: Bot):
         WHERE p.id=$1
     """, payment_id)
 
+    delivered = True
     if row:
         user_tg_id, code, title, price = row["telegram_id"], row["code"], row["title"], row["price"]
-        await bot.send_message(
-            chat_id=user_tg_id,
-            text=(
-                f"❌ <b>To‘lov rad etildi</b>\n\n"
-                f"📚 Test: <b>{title}</b>\n"
-                f"🔑 Kod: <code>{code}</code>\n"
-                f"💰 Summa: {price} so'm\n"
-                f"📝 Sabab: <i>{_h(reason)}</i>\n\n"
-                f"📦 'Pullik testlarim' bo‘limidan qayta to‘lov yuborishingiz mumkin."
-            ),
-            parse_mode=ParseMode.HTML
-        )
+        try:
+            await bot.send_message(
+                chat_id=user_tg_id,
+                text=(
+                    f"❌ <b>To‘lov rad etildi</b>\n\n"
+                    f"📚 Test: <b>{title}</b>\n"
+                    f"🔑 Kod: <code>{code}</code>\n"
+                    f"💰 Summa: {price} so'm\n"
+                    f"📝 Sabab: <i>{_h(reason)}</i>\n\n"
+                    f"📦 'Pullik testlarim' bo‘limidan qayta to‘lov yuborishingiz mumkin."
+                ),
+                parse_mode=ParseMode.HTML
+            )
+        except (TelegramForbiddenError, TelegramBadRequest):
+            delivered = False
+            logging.warning(f"Rad etish xabari o'quvchiga yetmadi (payment={payment_id})")
 
-    await message.answer(f"❌ Rad etildi. Payment ID: {payment_id}")
-    await state.clear()
+    await message.answer(f"❌ Rad etildi. Payment ID: {payment_id}"
+                         + ("" if delivered else "\n⚠️ O'quvchiga xabar yetkazilmadi (botni bloklagan bo'lishi mumkin)."))
 
 
 # ===================== ADMIN: STATS + EXCEL EXPORT =====================
@@ -8047,7 +8140,7 @@ async def xl_export(callback: CallbackQuery, bot: Bot):
     filename = f"test_stats_{safe_code}.xlsx"
     tmp_dir = tempfile.gettempdir()
     path = os.path.join(tmp_dir, filename)
-    wb.save(path)
+    await asyncio.to_thread(wb.save, path)  # katta faylda bot "qotib" qolmasligi uchun
 
     await bot.send_document(
         chat_id=callback.from_user.id,
@@ -8273,7 +8366,7 @@ async def users_export(callback: CallbackQuery, bot: Bot):
 
     tmp_dir = tempfile.gettempdir()
     path = os.path.join(tmp_dir, "barcha_foydalanuvchilar.xlsx")
-    wb.save(path)
+    await asyncio.to_thread(wb.save, path)  # katta faylda bot "qotib" qolmasligi uchun
 
     await bot.send_document(
         chat_id=callback.from_user.id,
@@ -8457,11 +8550,22 @@ async def _run_broadcast(bot: Bot, admin_tg_id: int, src_chat_id: int, src_messa
     sent = 0
     failed = 0
     for r in rows:
-        try:
-            await bot.copy_message(chat_id=r["telegram_id"], from_chat_id=src_chat_id, message_id=src_message_id)
-            sent += 1
-        except Exception:
-            failed += 1
+        # ✅ Telegram 429 (RetryAfter) qaytarsa, ko'rsatilgan vaqt kutib, shu
+        # foydalanuvchiga qayta urinamiz — avval u xabarni umuman olmasdi.
+        for attempt in range(3):
+            try:
+                await bot.copy_message(chat_id=r["telegram_id"], from_chat_id=src_chat_id,
+                                       message_id=src_message_id)
+                sent += 1
+                break
+            except TelegramRetryAfter as e:
+                if attempt == 2:
+                    failed += 1
+                    break
+                await asyncio.sleep(e.retry_after + 1)
+            except Exception:
+                failed += 1
+                break
         await asyncio.sleep(0.05)  # Telegram flood-limitiga urilmaslik uchun
     try:
         await bot.send_message(
@@ -9276,7 +9380,7 @@ async def admin_channels_panel(message: Message, state: FSMContext, bot: Bot):
                 f"{warn_line}"
             )
             if link:
-                text += f"\n🔗 {link}"
+                text += f"\n🔗 {_h(link)}"
             text += "\n"
 
         if warn_count:
@@ -9405,7 +9509,7 @@ async def ch_add_save(message: Message, state: FSMContext):
     if join_url == "-":
         join_url = ""
 
-    if join_url and not join_url.startswith("http"):
+    if join_url and not _is_valid_join_url(join_url):
         await message.answer("⚠️ Havola noto'g'ri ko'rinishda. Masalan: https://t.me/+AbCdEfGh. Qayta yuboring:")
         return
 
@@ -9525,7 +9629,7 @@ async def ch_edit_save(message: Message, state: FSMContext):
     elif new_link_raw.lower() == "clear":
         clear_link = True
     else:
-        if not new_link_raw.startswith("http"):
+        if not _is_valid_join_url(new_link_raw):
             await message.answer("⚠️ Link noto‘g‘ri. https://... bo‘lishi kerak. Qayta yuboring:")
             return
         new_link = new_link_raw
@@ -11090,8 +11194,10 @@ async def certificate_daemon(bot: Bot):
 # ===================== MA'LUMOTLAR BAZASI ZAXIRA NUSXASI (BACKUP) =====================
 BACKUP_TABLES = [
     "users", "tests", "payments", "results", "sessions", "required_channels", "user_limits",
-    "staged_attempts",
+    "staged_attempts", "retake_grants",
 ]
+# Eski zaxira fayllarida bo'lmagan jadvallar (ular bo'lmasa ham tiklash ishlaydi)
+BACKUP_OPTIONAL_TABLES = {"retake_grants"}
 
 
 async def _run_db_backup(bot: Bot, requester_tg_id: int | None = None):
@@ -11177,7 +11283,12 @@ async def _run_db_restore(tables: dict):
                 rows = tables.get(t) or []
                 if not rows:
                     continue
-                cols = list(rows[0].keys())
+                # ✅ Faqat hozirgi sxemada MAVJUD ustunlar yoziladi — eski zaxirada
+                # keyinchalik olib tashlangan ustun bo'lsa, tiklash butunlay yiqilardi.
+                existing_cols = {r["column_name"] for r in await db.fetch(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema=current_schema() AND table_name=$1", t)}
+                cols = [c for c in rows[0].keys() if c in existing_cols]
                 col_list = ", ".join(cols)
                 placeholders = ", ".join(f"${i + 1}" for i in range(len(cols)))
                 insert_sql = f"INSERT INTO {t} ({col_list}) VALUES ({placeholders})"
@@ -11227,7 +11338,7 @@ async def restore_got_file(message: Message, state: FSMContext, bot: Bot):
         with open(tmp_path, encoding="utf-8") as f:
             payload = json.load(f)
         tables = payload.get("tables")
-        if not tables or not all(t in tables for t in BACKUP_TABLES):
+        if not tables or not all(t in tables for t in BACKUP_TABLES if t not in BACKUP_OPTIONAL_TABLES):
             raise ValueError("noto'liq fayl")
     except Exception:
         try:
@@ -11910,10 +12021,10 @@ async def _render_alltests_list(answerable, page: int = 0):
     text = f"📚 <b>Barcha testlar</b> ({page + 1}-sahifa)\n\n"
     for r in rows:
         kind = "🆓" if r["is_free"] else "🧾"
-        creator = r["creator_name"] or "noma'lum"
+        creator = _h(r["creator_name"] or "noma'lum")
         creator_id_part = f" · <code>{r['creator_id']}</code>" if r["creator_id"] else " · admin"
         text += (
-            f"{kind} <code>{r['code']}</code> — <b>{r['title']}</b>\n"
+            f"{kind} <code>{r['code']}</code> — <b>{_h(r['title'])}</b>\n"
             f"   👤 {creator}{creator_id_part} · {r['exam_type'] or 'simple'}\n\n"
         )
 
@@ -12352,14 +12463,23 @@ async def main():
 
     asyncio.create_task(certificate_daemon(bot))
     asyncio.create_task(db_backup_daemon(bot))
-    asyncio.create_task(run_webapp_server())
+    # ✅ WEBAPP_URL bo'sh bo'lsa tugma ko'rinmaydi — portni ham ochib qo'yish shart emas.
+    if WEBAPP_URL:
+        asyncio.create_task(run_webapp_server())
 
     global FSM_STORAGE
     fsm_storage = PostgresStorage()
     await fsm_storage.preload()
     FSM_STORAGE = fsm_storage
 
-    dp = Dispatcher(storage=fsm_storage)
+    # ✅ Bitta foydalanuvchining update'lari KETMA-KET ishlanadi. aiogram
+    # standart bo'yicha har bir update'ni alohida task'da parallel ishlaydi —
+    # tugma ikki marta tez bosilsa (masalan "Bosqichni yakunlash", to'lovni
+    # tasdiqlash, reklamani tasdiqlash) ikkala nusxa bir vaqtda bir xil eski
+    # holatni o'qib, amalni ikki marta bajarardi.
+    global EVENTS_ISOLATION
+    EVENTS_ISOLATION = SimpleEventIsolation()
+    dp = Dispatcher(storage=fsm_storage, events_isolation=EVENTS_ISOLATION)
     dp.include_router(router)
     dp.errors.register(global_error_handler)
 
