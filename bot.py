@@ -13335,6 +13335,7 @@ def build_webapp_application(bot: Bot | None = None) -> web.Application:
     app = web.Application(client_max_size=WEB_MAX_PHOTO_BYTES + 1024 * 1024)
     app["bot"] = bot
     app.router.add_get("/webapp", webapp_index)
+    app.router.add_get("/", webapp_index)   # BotFather'da manzil "/webapp"siz kiritilsa ham ochiladi
     app.router.add_get("/api/me", webapp_api_me)
     app.router.add_get("/api/profile", webapp_api_profile)
     app.router.add_get("/api/certificate/{result_id}", webapp_api_certificate)
@@ -13545,8 +13546,21 @@ table.tb{width:100%;border-collapse:collapse;font-size:14px}table.tb td,table.tb
 <script>
 "use strict";
 const tg = window.Telegram && window.Telegram.WebApp;
-const initData = tg ? (tg.initData || "") : "";
-const S = { me: null, uid: (tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) || 0,
+// ✅ Telegram ma'lumoti odatda telegram-web-app.js orqali olinadi; skript
+// yuklanmasa yoki bo'sh qaytarsa — Telegram uni sahifa manzilining #...
+// qismiga ham yozadi (tgWebAppData), shu yerdan o'qiymiz.
+function readInitData() {
+  if (tg && tg.initData) return tg.initData;
+  try { const h = new URLSearchParams(location.hash.slice(1)).get("tgWebAppData"); if (h) return h; } catch (e) {}
+  try { const p = JSON.parse(sessionStorage.getItem("__telegram__initParams") || "{}"); if (p.tgWebAppData) return p.tgWebAppData; } catch (e) {}
+  return "";
+}
+const initData = readInitData();
+function readUid() {
+  if (tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) return tg.initDataUnsafe.user.id;
+  try { return JSON.parse(new URLSearchParams(initData).get("user") || "{}").id || 0; } catch (e) { return 0; }
+}
+const S = { me: null, uid: readUid(),
             back: null, tick: null, st: null, tab: "home" };
 const LETTERS = "ABCDEF";
 
@@ -13674,9 +13688,13 @@ async function boot() {
 function renderGate(kind, channels) {
   stopTick(); showTabs(false); setBack(null);
   if (kind === "tg") {
+    const diag = `${tg ? "sdk" : "nosdk"} · ${(tg && tg.platform) || "-"} · v${(tg && tg.version) || "-"} · ${initData ? "data" : "nodata"}`;
     return mount(el("div", {class: "screen center"}, el("div", {style: "font-size:48px"}, "📱"),
       el("h2", {}, "Ilovani Telegram ichida oching"),
-      el("p", {class: "muted"}, "Bu sahifa botning «📱 Mini App» tugmasi orqali ochiladi.")));
+      el("p", {class: "muted"}, initData
+        ? "Telegram ma'lumotlari tasdiqlanmadi. Ilovani yopib, botdagi «📱 Mini App» tugmasi orqali qayta oching."
+        : "Bu sahifa botning «📱 Mini App» tugmasi orqali ochiladi."),
+      el("div", {class: "muted small", style: "opacity:.6"}, diag)));
   }
   if (kind === "reg") {
     return mount(el("div", {class: "screen center"}, el("div", {style: "font-size:48px"}, "📝"),
