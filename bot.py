@@ -136,7 +136,6 @@ BTN_ADMIN_CHANNELS = "📣 Majburiy kanallar (Admin)"
 BTN_ADMIN_DEL_TEST = "🗑 Testni o'chirish (Admin)"
 BTN_ADMIN_ADD_ADMIN = "👮 Adminlarni boshqarish"
 BTN_PROFILE = "👤 Profilim"
-BTN_WEBAPP = "📱 Mini App (test yechish)"
 
 BTN_HOME = "🏠 Bosh menyu"
 # ✅ Bu tugma haqiqatda BIR QADAM ORQAGA emas — butun jarayonni bekor qilib
@@ -2245,8 +2244,6 @@ def main_menu_kb(is_admin=False):
         [KeyboardButton(text=BTN_ADD_TEST), KeyboardButton(text=BTN_MY_CREATED_TESTS)],
         [KeyboardButton(text=BTN_PROFILE)]
     ]
-    if WEBAPP_URL:
-        buttons.append([KeyboardButton(text=BTN_WEBAPP, web_app=WebAppInfo(url=f"{WEBAPP_URL}/webapp"))])
     if is_admin:
         buttons.append([KeyboardButton(text=BTN_ADMIN_PENDING), KeyboardButton(text=BTN_ADMIN_STATS)])
         buttons.append([KeyboardButton(text=BTN_ADMIN_CHANNELS), KeyboardButton(text=BTN_ADMIN_DEL_TEST)])
@@ -13735,8 +13732,8 @@ function renderGate(kind, channels) {
     return mount(el("div", {class: "screen center"}, el("div", {style: "font-size:48px"}, "📱"),
       el("h2", {}, "Ilovani Telegram ichida oching"),
       el("p", {class: "muted"}, initData
-        ? "Telegram ma'lumotlari tasdiqlanmadi. Ilovani yopib, botdagi «📱 Mini App» tugmasi orqali qayta oching."
-        : "Bu sahifa botning «📱 Mini App» tugmasi orqali ochiladi."),
+        ? "Telegram ma'lumotlari tasdiqlanmadi. Ilovani yopib, bot chatidagi «Test yechish» menyu tugmasi orqali qayta oching."
+        : "Bu sahifa bot chatidagi «Test yechish» menyu tugmasi orqali ochiladi."),
       el("div", {class: "muted small", style: "opacity:.6"}, diag)));
   }
   if (kind === "reg") {
