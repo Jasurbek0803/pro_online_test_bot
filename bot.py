@@ -22,6 +22,7 @@ from collections import defaultdict, deque
 
 import asyncpg
 import base64
+import gzip
 import hashlib
 import hmac
 from urllib.parse import parse_qsl
@@ -13269,9 +13270,47 @@ async def webapp_api_result(request: web.Request):
     return web.json_response({"ok": True, "result": await _web_result_view(ctx["user_db_id"], test_id)})
 
 
+_WEBAPP_PAGE: dict = {}
+
+
+def _webapp_page() -> dict:
+    """Sahifa bir marta tayyorlanadi: oddiy + gzip ko'rinishi va ETag."""
+    if not _WEBAPP_PAGE:
+        raw = WEBAPP_HTML.encode("utf-8")
+        tag = hashlib.sha256(raw).hexdigest()[:24]
+        # Cloudflare kuchli ETag'ni olib tashlaydi, kuchsiz (W/) ETag esa saqlanadi
+        _WEBAPP_PAGE.update(raw=raw, gz=gzip.compress(raw, 9), tag=tag, etag=f'W/"{tag}"',
+                            modified=datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT"))
+    return _WEBAPP_PAGE
+
+
 async def webapp_index(request: web.Request):
-    return web.Response(text=WEBAPP_HTML, content_type="text/html",
-                        headers={"Cache-Control": "no-cache"})
+    # ✅ Sekin internet uchun: sahifa gzip bilan bir necha barobar kichik
+    # yuboriladi, qayta ochilganda (o'zgarmagan bo'lsa) faqat "304" qaytadi.
+    page = _webapp_page()
+    headers = {"Cache-Control": "no-cache", "ETag": page["etag"], "Last-Modified": page["modified"],
+               "Vary": "Accept-Encoding"}
+    inm = request.headers.get("If-None-Match", "")
+    if (inm and page["tag"] in inm) or (not inm and request.headers.get("If-Modified-Since") == page["modified"]):
+        return web.Response(status=304, headers=headers)
+    if "gzip" in request.headers.get("Accept-Encoding", "").lower():
+        headers["Content-Encoding"] = "gzip"
+        return web.Response(body=page["gz"], content_type="text/html", charset="utf-8", headers=headers)
+    return web.Response(body=page["raw"], content_type="text/html", charset="utf-8", headers=headers)
+
+
+@web.middleware
+async def _web_compress_mw(request: web.Request, handler):
+    """1 KB dan katta JSON javoblar gzip bilan siqib yuboriladi."""
+    resp = await handler(request)
+    try:
+        if (isinstance(resp, web.Response) and resp.content_type == "application/json"
+                and resp.body is not None and len(resp.body) > 1024
+                and "gzip" in request.headers.get("Accept-Encoding", "").lower()):
+            resp.enable_compression()
+    except Exception:
+        pass
+    return resp
 
 
 async def webapp_api_profile(request: web.Request):
@@ -13369,7 +13408,7 @@ async def webapp_api_certificate(request: web.Request):
 
 
 def build_webapp_application(bot: Bot | None = None) -> web.Application:
-    app = web.Application(client_max_size=WEB_MAX_PHOTO_BYTES + 1024 * 1024)
+    app = web.Application(client_max_size=WEB_MAX_PHOTO_BYTES + 1024 * 1024, middlewares=[_web_compress_mw])
     app["bot"] = bot
     app.router.add_get("/webapp", webapp_index)
     app.router.add_get("/", webapp_index)   # BotFather'da manzil "/webapp"siz kiritilsa ham ochiladi
@@ -13404,176 +13443,262 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
-<title>Test yechish</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<meta name="theme-color" content="#14306b">
+<title>Online Olimpiada</title>
+<script async id="tgsdk" src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Montserrat:wght@700;800&display=swap" media="print" onload="this.media='all'">
+<script>
+// Mavzu (yorug'/qorong'i) birinchi chizishdan OLDIN aniqlanadi — Telegram
+// ranglarni manzilning #tgWebAppThemeParams qismida beradi.
+(function () {
+  try {
+    var p = new URLSearchParams(location.hash.slice(1)).get("tgWebAppThemeParams");
+    var bg = p ? (JSON.parse(p).bg_color || "") : "";
+    var dark = /^#[0-9a-f]{6}$/i.test(bg)
+      ? (parseInt(bg.slice(1, 3), 16) * 0.299 + parseInt(bg.slice(3, 5), 16) * 0.587 + parseInt(bg.slice(5, 7), 16) * 0.114) < 128
+      : !!(window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches);
+    if (dark) document.documentElement.setAttribute("data-theme", "dark");
+  } catch (e) {}
+})();
+</script>
 <style>
 :root{
-  --page: var(--tg-theme-secondary-bg-color, #eef1f5);
-  --card: var(--tg-theme-section-bg-color, var(--tg-theme-bg-color, #ffffff));
-  --text: var(--tg-theme-text-color, #15202b);
-  --hint: var(--tg-theme-hint-color, #6b7680);
-  --accent: var(--tg-theme-button-color, #2f6fed);
-  --accent-text: var(--tg-theme-button-text-color, #ffffff);
-  --link: var(--tg-theme-link-color, #2f6fed);
-  --line: rgba(127,127,127,.22);
-  --soft: rgba(127,127,127,.10);
-  --ok: #1f9d55; --bad: #d64545; --warn: #e08a00; --flag: #f08c00;
-  --radius: 14px;
+  --navy:#14306b; --gold:#d9a92b; --gold2:#f3d98b;
+  --page:#f3f5fa; --card:#ffffff; --text:#14213d; --hint:#5a6684;
+  --accent:#14306b; --accent-text:#ffffff; --accent-soft:#e8edf8; --ink:#14306b;
+  --cta:#d9a92b; --cta-text:#14213d;
+  --band:#14306b; --band-text:#ffffff; --band-hint:#c9d3ea;
+  --line:#e3e7f0; --soft:#eef1f7; --soft2:#f7f8fc; --bubline:#b8c2d8;
+  --ok:#1e7e34; --ok-soft:#e3f3e8; --bad:#b42318; --bad-on:#ffffff; --bad-soft:#fdeceb;
+  --warn:#8a5300; --warn-soft:#fdf3dc; --flag:#a86b00; --flag-soft:#fbf1d6; --cur:#fdf8ea;
+  --shadow:0 1px 2px rgba(20,48,107,.06),0 6px 20px rgba(20,48,107,.06);
+  --radius:16px;
+  --fh:"Montserrat",-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+  color-scheme:light;
+}
+:root[data-theme=dark]{
+  --page:#0b1430; --card:#14224a; --text:#e8ecf6; --hint:#a3b0cc;
+  --accent:#d9a92b; --accent-text:#14213d; --accent-soft:rgba(217,169,43,.16); --ink:#f3d98b;
+  --band:#102457; --band-hint:#b7c3df;
+  --line:rgba(255,255,255,.10); --soft:rgba(255,255,255,.07); --soft2:rgba(255,255,255,.04); --bubline:rgba(255,255,255,.30);
+  --ok:#5ccf86; --ok-soft:rgba(92,207,134,.14); --bad:#ff8a7a; --bad-on:#2a0a06; --bad-soft:rgba(255,138,122,.14);
+  --warn:#f2c14e; --warn-soft:rgba(242,193,78,.14); --flag:#f2c14e; --flag-soft:rgba(242,193,78,.16); --cur:rgba(217,169,43,.10);
+  --shadow:none;
+  color-scheme:dark;
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;padding:0}
-body{background:var(--page);color:var(--text);font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;min-height:100vh;-webkit-font-smoothing:antialiased}
+body{background:var(--page);color:var(--text);font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;min-height:100vh;-webkit-font-smoothing:antialiased}
 button{font:inherit;color:inherit;cursor:pointer}
 input,textarea{font:inherit;color:var(--text)}
 .hidden{display:none!important}
-.screen{max-width:760px;margin:0 auto;padding:16px 16px 96px}
-h1{font-size:22px;margin:4px 0 4px}
-h2{font-size:18px;margin:0 0 8px}
+.i{display:inline-flex;width:20px;height:20px;flex:none}
+.i svg{width:100%;height:100%;display:block}
+.screen{max-width:640px;margin:0 auto;padding:16px 16px 100px}
+h1{font-family:var(--fh);font-size:24px;font-weight:800;margin:4px 0;letter-spacing:-.01em}
+h2{font-family:var(--fh);font-size:16px;font-weight:700;margin:0 0 10px}
 .muted{color:var(--hint)}
 .small{font-size:13px}
-.card{background:var(--card);border-radius:var(--radius);padding:16px;margin:12px 0;box-shadow:0 1px 2px rgba(0,0,0,.04)}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:0;border-radius:12px;padding:12px 16px;background:var(--accent);color:var(--accent-text);font-weight:600;min-height:46px}
+/* ---- navy sarlavha bandi ---- */
+.band{background:var(--band);color:var(--band-text);margin:-16px -16px 0;padding:20px 18px 34px;border-radius:0 0 28px 28px}
+.brand{display:flex;align-items:center;gap:12px}
+.brand .logo{width:46px;height:46px;border-radius:50%;box-shadow:0 0 0 3px var(--gold);background:#fff;flex:none}
+.brand b{display:block;font-family:var(--fh);font-size:13px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--gold2)}
+.brand span{display:block;font-size:12px;color:var(--band-hint)}
+.band h1{font-size:25px;margin:16px 0 4px;color:#fff}
+.band p{margin:0;color:var(--band-hint);font-size:14px}
+.band .eyebrow{font-size:12px;color:var(--gold2);font-weight:700;letter-spacing:.06em;text-transform:uppercase;font-family:var(--fh)}
+.band .chips{margin-top:12px}
+.band .chip{background:rgba(255,255,255,.13);color:#fff}
+.band .chip.acc{background:var(--gold);color:#14213d}
+.lift{position:relative;margin-top:-20px!important}
+.sect{font-family:var(--fh);font-size:14px;font-weight:700;color:var(--ink);margin:22px 4px 8px;display:flex;align-items:center;gap:8px}
+.sect::before{content:"";width:16px;height:3px;border-radius:2px;background:var(--gold)}
+.card{background:var(--card);border-radius:var(--radius);padding:16px;margin:12px 0;box-shadow:var(--shadow)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:0;border-radius:12px;padding:12px 16px;background:var(--accent);color:var(--accent-text);font-family:var(--fh);font-weight:700;font-size:15px;min-height:48px}
+.btn .i{width:18px;height:18px}
 .btn.block{display:flex;width:100%}
-.btn.ghost{background:var(--soft);color:var(--text)}
-.btn.danger{background:var(--bad);color:#fff}
-.btn:disabled{opacity:.55}
+.btn.cta{background:var(--cta);color:var(--cta-text)}
+.btn.ghost{background:var(--soft);color:var(--ink)}
+.btn.danger{background:var(--bad);color:var(--bad-on)}
+.btn:disabled{opacity:.5}
+.btn:active{transform:scale(.985)}
 .btn + .btn{margin-top:8px}
 .row-btns{display:flex;gap:8px}.row-btns .btn{flex:1;margin-top:0}
-.input{width:100%;border:1.5px solid var(--line);background:var(--page);border-radius:12px;padding:13px 14px;font-size:18px;letter-spacing:.06em;text-transform:uppercase;outline:none}
-.input:focus{border-color:var(--accent)}
-.input::placeholder{text-transform:none;letter-spacing:0;color:var(--hint);opacity:.8}
-.resume-item{display:flex;align-items:center;gap:12px;padding:12px;border-radius:12px;background:var(--soft);margin-top:8px;cursor:pointer;border:0;width:100%;text-align:left}
-.resume-item b{display:block}
-.resume-item .go{margin-left:auto;font-weight:700;color:var(--accent);white-space:nowrap}
+.lbl{display:block;font-size:12px;color:var(--hint);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}
+.input{width:100%;border:1.5px solid var(--line);background:var(--soft2);border-radius:12px;padding:12px 14px;font-family:var(--fh);font-size:21px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--ink);outline:none}
+.input:focus{border-color:var(--gold);box-shadow:0 0 0 3px var(--accent-soft)}
+.input::placeholder{text-transform:none;letter-spacing:0;font-weight:500;font-size:16px;color:var(--hint);opacity:.85;font-family:inherit}
+.ico{width:40px;height:40px;border-radius:12px;background:var(--accent-soft);color:var(--ink);display:flex;align-items:center;justify-content:center;flex:none}
+.ico.gold{background:var(--flag-soft);color:var(--flag)}
+.ico.ok{background:var(--ok-soft);color:var(--ok)}
+.ico .i{width:20px;height:20px}
+.ico-lg{width:72px;height:72px;border-radius:24px;background:var(--accent-soft);color:var(--ink);display:flex;align-items:center;justify-content:center}
+.ico-lg .i{width:34px;height:34px}
+.resume-item{display:flex;align-items:center;gap:12px;padding:12px 0;background:none;border:0;width:100%;text-align:left}
+.resume-item + .resume-item{border-top:1px solid var(--line)}
+.resume-item b{display:block;font-weight:700}
+.resume-item .go{margin-left:auto;color:var(--hint)}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
-.chip{background:var(--soft);border-radius:999px;padding:4px 10px;font-size:13px;white-space:nowrap}
+.chip{background:var(--soft);border-radius:999px;padding:4px 10px;font-size:13px;font-weight:600;white-space:nowrap}
 .chip.acc{background:var(--accent);color:var(--accent-text)}
-.status{border-radius:12px;padding:12px 14px;margin:12px 0;font-size:14px;background:var(--soft)}
-.status.ok{background:rgba(31,157,85,.12)}.status.bad{background:rgba(214,69,69,.12)}.status.warn{background:rgba(224,138,0,.13)}
-.feat{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:4px}
-.feat div{background:var(--soft);border-radius:12px;padding:10px;font-size:13px}
-.tabs{position:fixed;left:0;right:0;bottom:0;display:flex;background:var(--card);border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom);z-index:20}
-.tabs button{flex:1;border:0;background:none;padding:10px 0 12px;font-size:12px;color:var(--hint)}
-.tabs button b{display:block;font-size:20px;line-height:1.2}
-.tabs button.on{color:var(--accent)}
-.list-item{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:12px 0;border-bottom:1px solid var(--line)}
+.status{display:flex;gap:10px;align-items:flex-start;border-radius:14px;padding:12px 14px;margin:12px 0;font-size:14px;background:var(--soft)}
+.status > .i{width:18px;height:18px;margin-top:1px}
+.status.ok{background:var(--ok-soft)}.status.ok > .i{color:var(--ok)}
+.status.bad{background:var(--bad-soft)}.status.bad > .i{color:var(--bad)}
+.status.warn{background:var(--warn-soft)}.status.warn > .i{color:var(--warn)}
+.feat{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.feat div{background:var(--card);border-radius:14px;padding:12px;display:flex;align-items:center;gap:10px;font-size:13.5px;font-weight:600;box-shadow:var(--shadow);line-height:1.3}
+.feat .i{color:var(--ink)}
+.tabs{position:fixed;left:0;right:0;bottom:0;display:flex;background:var(--card);border-top:1px solid var(--line);padding:6px 0 calc(6px + env(safe-area-inset-bottom));z-index:20}
+.tabs button{flex:1;border:0;background:none;padding:4px 0;font-size:11px;font-weight:700;color:var(--hint);display:flex;flex-direction:column;align-items:center;gap:3px}
+.tabs button .i{width:50px;height:30px;padding:3px 12px;border-radius:10px;box-sizing:border-box}
+.tabs button.on{color:var(--ink)}
+.tabs button.on .i{background:var(--flag-soft)}
+.list-item{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 0;border-bottom:1px solid var(--line)}
 .list-item:last-child{border-bottom:0}
-.badge{background:var(--accent);color:var(--accent-text);border-radius:8px;padding:3px 8px;font-size:13px;font-weight:600;white-space:nowrap}
-.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
-.stat{background:var(--soft);border-radius:12px;padding:10px 6px;text-align:center}
-.stat b{display:block;font-size:19px}.stat span{font-size:12px;color:var(--hint)}
-.sec-item{display:flex;gap:12px;align-items:center;padding:12px;border-radius:12px;background:var(--soft);margin-bottom:8px}
-.sec-item .ico{font-size:22px;width:30px;text-align:center}
-.sec-item.current{outline:2px solid var(--accent)}
-.sec-item.locked{opacity:.55}
-/* ---- solve ---- */
+.badge{background:var(--accent);color:var(--accent-text);border-radius:8px;padding:4px 9px;font-size:13px;font-weight:700;font-family:var(--fh);white-space:nowrap}
+.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.stat{background:var(--soft2);border:1px solid var(--line);border-radius:12px;padding:10px 6px;text-align:center}
+.stat b{display:block;font-size:20px;font-family:var(--fh);font-weight:800;color:var(--ink)}
+.stat span{font-size:12px;color:var(--hint)}
+.sec-item{display:flex;gap:12px;align-items:center;padding:12px;border-radius:14px;background:var(--soft2);border:1px solid var(--line);margin-bottom:8px}
+.sec-item.current{border-color:var(--gold);box-shadow:0 0 0 1px var(--gold)}
+.sec-item.locked{opacity:.6}
+.sec-item .mark .i{width:22px;height:22px}
+.sec-item.done .mark{color:var(--ok)}.sec-item.current .mark{color:var(--flag)}.sec-item.locked .mark{color:var(--hint)}
+/* ---- test yechish ---- */
 .solve{position:fixed;inset:0;display:flex;flex-direction:column;background:var(--page);z-index:10}
-.sbar{display:flex;align-items:center;gap:6px;padding:8px 10px;background:var(--card);border-bottom:1px solid var(--line)}
-.timer{font-variant-numeric:tabular-nums;font-weight:700;font-size:17px;padding:5px 10px;border-radius:10px;background:var(--soft);min-width:84px;text-align:center}
-.timer.warn{background:rgba(224,138,0,.18);color:var(--warn)}
-.timer.crit{background:rgba(214,69,69,.18);color:var(--bad);animation:pulse 1s infinite}
-@keyframes pulse{50%{opacity:.55}}
+.sbar{display:flex;align-items:center;gap:6px;padding:8px 10px;background:var(--band);color:#fff}
+.timer{display:flex;align-items:center;gap:5px;font-variant-numeric:tabular-nums;font-family:var(--fh);font-weight:800;font-size:15px;padding:7px 10px;border-radius:10px;background:var(--gold);color:#14213d;min-width:88px;justify-content:center;flex:none}
+.timer .i{width:15px;height:15px}
+.timer.warn{background:#ffcf6e}
+.timer.crit{background:#e5484d;color:#fff;animation:pulse 1s infinite}
+@keyframes pulse{50%{opacity:.6}}
 .prog{flex:1;min-width:0}
-.prog .t{font-size:12px;color:var(--hint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.prog .bar{height:5px;border-radius:5px;background:var(--soft);overflow:hidden;margin-top:3px}
-.prog .bar i{display:block;height:100%;background:var(--accent);width:0;transition:width .25s}
-.icon-btn{border:0;background:var(--soft);border-radius:10px;width:38px;height:38px;font-size:18px;display:inline-flex;align-items:center;justify-content:center;flex:none}
-.icon-btn.on{background:var(--accent);color:var(--accent-text)}
-.savest{font-size:12px;width:18px;text-align:center;flex:none}
-.seg{display:flex;gap:6px;padding:8px 10px;background:var(--card);border-bottom:1px solid var(--line)}
-.seg button{flex:1;border:0;border-radius:10px;padding:8px;background:var(--soft);font-weight:600;font-size:14px}
+.prog .t{font-size:12px;color:var(--band-hint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600}
+.prog .bar{height:5px;border-radius:3px;background:rgba(255,255,255,.18);overflow:hidden;margin-top:5px}
+.prog .bar i{display:block;height:100%;background:var(--gold);width:0;transition:width .25s}
+.icon-btn{border:0;background:var(--soft);color:var(--ink);border-radius:10px;width:38px;height:38px;display:inline-flex;align-items:center;justify-content:center;flex:none;padding:0}
+.icon-btn .i{width:19px;height:19px}
+.sbar .icon-btn{background:rgba(255,255,255,.13);color:#fff}
+.icon-btn.on{background:var(--gold);color:#14213d}
+.savest{width:20px;height:20px;flex:none;color:var(--band-hint);display:inline-flex}
+.savest .i{width:16px;height:16px;margin:2px}
+.savest.ok{color:#8fe0a8}.savest.off{color:#ffcf6e}
+.seg{display:flex;gap:4px;margin:10px 12px 0;padding:3px;background:var(--soft);border-radius:12px}
+.seg button{flex:1;border:0;border-radius:10px;padding:8px;background:none;font-family:var(--fh);font-weight:700;font-size:13px;color:var(--hint);display:flex;align-items:center;justify-content:center;gap:6px}
+.seg button .i{width:16px;height:16px}
 .seg button.on{background:var(--accent);color:var(--accent-text)}
-.panes{flex:1;display:flex;min-height:0}
+.panes{flex:1;display:flex;min-height:0;margin-top:10px}
 .pane{flex:1;overflow:auto;min-width:0;-webkit-overflow-scrolling:touch}
 @media (max-width:859px){.panes .pane{display:none}.panes .pane.active{display:block}}
 @media (min-width:860px){.seg{display:none}.pane.pdfpane{flex:1.3;border-right:1px solid var(--line)}}
 .sfoot{display:flex;gap:8px;padding:10px 12px calc(10px + env(safe-area-inset-bottom));background:var(--card);border-top:1px solid var(--line)}
 .sfoot .btn{flex:1;margin:0}
-.pane-head{position:sticky;top:0;z-index:3;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 12px;height:48px;background:var(--page);border-bottom:1px solid var(--line);font-size:13px;color:var(--hint)}
+.pane-head{position:sticky;top:0;z-index:3;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 12px;height:48px;background:var(--page);border-bottom:1px solid var(--line);font-size:13px;color:var(--hint);font-weight:600}
+.pane-head .btn{min-height:34px;padding:4px 12px;font-size:13px}
 .pdfwrap{padding:8px;display:flex;flex-direction:column;align-items:flex-start;gap:8px}
 .pdfpage{background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.18);margin:0 auto;flex:none}
 .pdfpage canvas{display:block;width:100%;height:auto}
 .media{padding:10px 12px}.media audio,.media video{width:100%}
-/* bubble sheet */
-.block-h{position:sticky;top:48px;z-index:2;background:var(--page);padding:10px 14px 8px;font-weight:700;font-size:15px;display:flex;justify-content:space-between;align-items:baseline;border-bottom:1px solid var(--line)}
-.block-h span{font-weight:500;color:var(--hint);font-size:12px}
-.qrow{display:flex;align-items:center;gap:10px;padding:6px 10px 6px 12px;border-bottom:1px solid var(--line);background:var(--card)}
-.qrow.alt{background-image:linear-gradient(rgba(127,127,127,.045),rgba(127,127,127,.045))}
-.qrow.cur{box-shadow:inset 4px 0 0 var(--accent)}
-.qn{width:30px;flex:none;text-align:right;font-weight:700;font-size:15px;color:var(--hint);background:none;border:0;padding:0;font-variant-numeric:tabular-nums}
-.qrow.done .qn{color:var(--accent)}
+.loadbar{width:min(260px,70vw);height:6px;border-radius:3px;background:var(--soft);overflow:hidden}
+.loadbar i{display:block;height:100%;width:0;background:var(--gold);transition:width .2s}
+/* javoblar varaqasi */
+.block-h{position:sticky;top:48px;z-index:2;background:var(--page);padding:10px 14px 8px;font-family:var(--fh);font-weight:700;font-size:14px;color:var(--ink);display:flex;justify-content:space-between;align-items:baseline;border-bottom:1px solid var(--line)}
+.block-h span{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;font-weight:500;color:var(--hint);font-size:12px}
+.qrow{display:flex;align-items:center;gap:10px;padding:6px 8px 6px 12px;border-bottom:1px solid var(--line);background:var(--card)}
+.qrow.alt{background-image:linear-gradient(rgba(127,127,127,.035),rgba(127,127,127,.035))}
+.qrow.cur{box-shadow:inset 4px 0 0 var(--gold);background:var(--cur)}
+.qn{width:30px;flex:none;text-align:right;font-family:var(--fh);font-weight:700;font-size:14px;color:var(--hint);background:none;border:0;padding:0;font-variant-numeric:tabular-nums}
+.qrow.done .qn{color:var(--ink)}
 .bubs{display:flex;gap:10px;flex:1}
-.bub{width:40px;height:40px;border-radius:50%;border:2px solid rgba(127,127,127,.55);background:transparent;font-weight:700;font-size:15px;padding:0;transition:transform .08s,background .12s}
-.bubs.many{gap:6px}.bubs.many .bub{width:34px;height:34px;font-size:14px}
+.bub{width:40px;height:40px;border-radius:50%;border:1.5px solid var(--bubline);background:var(--card);color:var(--ink);font-family:var(--fh);font-weight:700;font-size:14px;padding:0;transition:transform .08s,background .12s}
+.bubs.many{gap:6px}.bubs.many .bub{width:34px;height:34px;font-size:13px}
 .bub:active{transform:scale(.88)}
-.bub.on{background:var(--accent);border-color:var(--accent);color:var(--accent-text);box-shadow:0 2px 6px rgba(0,0,0,.18)}
-.flagb{border:0;background:none;font-size:18px;opacity:.3;width:36px;height:36px;border-radius:50%;flex:none;padding:0}
-.flagb.on{opacity:1;color:var(--flag);background:rgba(240,140,0,.12)}
-.openbtn{flex:1;border:1.5px dashed rgba(127,127,127,.6);background:transparent;border-radius:10px;padding:9px 12px;text-align:left;font-size:14px;min-height:40px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.openbtn.has{border-style:solid;border-color:var(--accent);background:rgba(47,111,237,.08);background:color-mix(in srgb,var(--accent) 10%,transparent)}
-/* card mode */
+.bub.on{background:var(--accent);border-color:var(--accent);color:var(--accent-text);box-shadow:0 0 0 3px var(--accent-soft)}
+:root:not([data-theme=dark]) .bub.on{box-shadow:0 0 0 3px var(--gold2)}
+.flagb{border:0;background:none;color:var(--hint);opacity:.45;width:38px;height:38px;border-radius:50%;flex:none;padding:0;display:inline-flex;align-items:center;justify-content:center}
+.flagb .i{width:19px;height:19px}
+.flagb.on{opacity:1;color:var(--flag);background:var(--flag-soft)}
+.openbtn{flex:1;border:1.5px dashed var(--bubline);background:transparent;border-radius:10px;padding:9px 12px;text-align:left;font-size:14px;min-height:40px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--hint)}
+.openbtn.has{border-style:solid;border-color:var(--accent);background:var(--accent-soft);color:var(--text)}
+/* bittalab ko'rinish */
 .qcard{padding:14px}
 .qcard .ch{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
-.qcard .ch b{font-size:20px}
-.opt{display:flex;align-items:center;gap:12px;padding:12px;border:1.5px solid var(--line);border-radius:12px;margin-bottom:8px;background:var(--card)}
-.opt.on{border-color:var(--accent);background:rgba(47,111,237,.08);background:color-mix(in srgb,var(--accent) 10%,transparent)}
-.opt{min-height:58px;cursor:pointer;font-size:17px}
-.opt.elim{opacity:.4}.opt.elim .ol{text-decoration:line-through}
-.opt .ol{width:34px;height:34px;border-radius:50%;border:1.7px solid var(--hint);display:flex;align-items:center;justify-content:center;font-weight:700;flex:none}
+.qcard .ch b{font-family:var(--fh);font-size:20px;font-weight:800;color:var(--ink)}
+.qcard .ch .btn{min-height:36px;padding:4px 12px;font-size:13px}
+.qcard .ch .btn.flagged{color:var(--flag);background:var(--flag-soft)}
+.opt{display:flex;align-items:center;gap:12px;padding:12px;border:1.5px solid var(--line);border-radius:14px;margin-bottom:8px;background:var(--card);min-height:58px;cursor:pointer;font-size:17px}
+.opt.on{border-color:var(--accent);background:var(--accent-soft)}
+.opt.elim{opacity:.4}.opt.elim .lbl2{text-decoration:line-through}
+.opt .ol{width:34px;height:34px;border-radius:50%;border:1.5px solid var(--bubline);display:flex;align-items:center;justify-content:center;font-family:var(--fh);font-weight:700;color:var(--ink);flex:none}
 .opt.on .ol{background:var(--accent);border-color:var(--accent);color:var(--accent-text)}
-.opt .lbl{flex:1}
-.opt .strike{border:0;background:var(--soft);border-radius:8px;width:32px;height:32px;flex:none}
+.opt .lbl2{flex:1}
+.opt .strike{border:0;background:var(--soft);border-radius:8px;width:34px;height:34px;flex:none;color:var(--hint);display:inline-flex;align-items:center;justify-content:center;padding:0}
+.opt .strike .i{width:16px;height:16px}
 .cnav{display:flex;gap:8px;margin-top:12px}.cnav .btn{flex:1;margin:0}
-textarea.ta{width:100%;min-height:120px;border:1.5px solid var(--line);border-radius:12px;padding:12px;background:var(--page);resize:vertical;outline:none;font-size:16px}
-textarea.ta:focus{border-color:var(--accent)}
+textarea.ta{width:100%;min-height:120px;border:1.5px solid var(--line);border-radius:12px;padding:12px;background:var(--soft2);resize:vertical;outline:none;font-size:16px}
+textarea.ta:focus{border-color:var(--gold)}
 textarea.ta.big{min-height:45vh}
 .thumb{max-width:140px;max-height:140px;border-radius:10px;display:block;margin-top:8px}
-/* modal / sheet */
-.mback{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:flex-end;justify-content:center;z-index:60;animation:fade .15s}
+/* oyna / pastki varaq */
+.mback{position:fixed;inset:0;background:rgba(8,16,40,.5);display:flex;align-items:flex-end;justify-content:center;z-index:60;animation:fade .15s}
 @keyframes fade{from{opacity:0}}
-.msheet{background:var(--card);width:100%;max-width:560px;border-radius:18px 18px 0 0;padding:18px 16px calc(16px + env(safe-area-inset-bottom));max-height:88vh;overflow:auto}
-@media (min-width:860px){.mback{align-items:center}.msheet{border-radius:18px}}
+.msheet{background:var(--card);width:100%;max-width:560px;border-radius:22px 22px 0 0;padding:20px 16px calc(16px + env(safe-area-inset-bottom));max-height:88vh;overflow:auto}
+.msheet h2{font-size:18px}
+@media (min-width:860px){.mback{align-items:center}.msheet{border-radius:22px}}
 .navgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(42px,1fr));gap:6px;margin:12px 0}
-.navgrid button{height:42px;border-radius:10px;border:1.5px solid var(--line);background:transparent;font-weight:700;position:relative}
+.navgrid button{height:42px;border-radius:10px;border:1.5px solid var(--line);background:transparent;font-family:var(--fh);font-weight:700;font-size:14px;color:var(--ink);position:relative}
 .navgrid button.ans{background:var(--accent);color:var(--accent-text);border-color:var(--accent)}
-.navgrid button.flag{box-shadow:0 0 0 2px var(--flag)}
-.navgrid button.ok{background:rgba(31,157,85,.16);border-color:var(--ok);color:var(--ok)}
-.navgrid button.bad{background:rgba(214,69,69,.14);border-color:var(--bad);color:var(--bad)}
-.navgrid button.pend{border-style:dashed}
+.navgrid button.flag{box-shadow:0 0 0 2px var(--gold)}
+.navgrid button.ok{background:var(--ok-soft);border-color:var(--ok);color:var(--ok)}
+.navgrid button.bad{background:var(--bad);border-color:var(--bad);color:var(--bad-on)}
+.navgrid button.pend{border-style:dashed;color:var(--hint)}
 .legend{display:flex;flex-wrap:wrap;gap:10px;font-size:12px;color:var(--hint)}
 .legend i{display:inline-block;width:12px;height:12px;border-radius:4px;vertical-align:-2px;margin-right:4px;border:1.5px solid var(--line)}
-.toast{position:fixed;left:50%;bottom:calc(84px + env(safe-area-inset-bottom));transform:translateX(-50%);background:rgba(20,24,30,.92);color:#fff;padding:10px 16px;border-radius:12px;font-size:14px;z-index:80;max-width:92vw;text-align:center;animation:fade .2s}
-.overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:90;display:flex;align-items:center;justify-content:center;color:#fff;flex-direction:column;gap:14px;text-align:center;padding:20px}
-.spin{width:42px;height:42px;border-radius:50%;border:4px solid rgba(255,255,255,.3);border-top-color:#fff;animation:sp 1s linear infinite}
-.spin.dark{border-color:var(--soft);border-top-color:var(--accent)}
+.toast{position:fixed;left:50%;bottom:calc(84px + env(safe-area-inset-bottom));transform:translateX(-50%);background:#14213d;color:#fff;padding:11px 16px;border-radius:12px;font-size:14px;z-index:80;max-width:92vw;text-align:center;animation:fade .2s;box-shadow:0 6px 24px rgba(0,0,0,.25)}
+:root[data-theme=dark] .toast{background:#e8ecf6;color:#14213d}
+.overlay{position:fixed;inset:0;background:rgba(8,16,40,.55);z-index:90;display:flex;align-items:center;justify-content:center;color:#fff;flex-direction:column;gap:14px;text-align:center;padding:20px;font-weight:600}
+.overlay .slow{font-size:13px;font-weight:500;opacity:.85;max-width:280px}
+.spin{width:42px;height:42px;border-radius:50%;border:4px solid rgba(255,255,255,.3);border-top-color:var(--gold);animation:sp 1s linear infinite}
+.spin.dark{border-color:var(--soft);border-top-color:var(--gold)}
 @keyframes sp{to{transform:rotate(360deg)}}
 .center{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:60vh;text-align:center;gap:10px}
-.ring{width:150px;height:150px;margin:6px auto}
-.ring text{font-weight:800}
-.kv{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--line)}.kv:last-child{border-bottom:0}
-table.tb{width:100%;border-collapse:collapse;font-size:14px}table.tb td,table.tb th{padding:7px 4px;border-bottom:1px solid var(--line);text-align:left}table.tb th{color:var(--hint);font-weight:600;font-size:12px}
-/* calculator */
-.calc{position:fixed;top:64px;right:12px;width:330px;max-width:calc(100vw - 24px);background:var(--card);border-radius:16px;box-shadow:0 8px 30px rgba(0,0,0,.28);z-index:50;overflow:hidden;border:1px solid var(--line)}
-.calc .ch{display:flex;align-items:center;gap:6px;padding:8px 10px;background:var(--soft);cursor:move;touch-action:none;user-select:none}
+.center h2{font-size:19px;margin:6px 0 0}
+.center p{margin:0;max-width:340px}
+.ring{width:150px;height:150px;margin:6px auto;display:block}
+.ring text{font-family:var(--fh);font-weight:800}
+.kv{display:flex;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px solid var(--line)}.kv:last-child{border-bottom:0}
+.kv.hero{font-weight:700;align-items:center}
+.kv.hero b{font-family:var(--fh);font-size:19px;color:var(--ink)}
+table.tb{width:100%;border-collapse:collapse;font-size:14px}table.tb td,table.tb th{padding:8px 4px;border-bottom:1px solid var(--line);text-align:left}table.tb th{color:var(--hint);font-weight:700;font-size:12px}
+.netbar{position:fixed;left:0;right:0;top:0;z-index:95;display:flex;align-items:center;justify-content:center;gap:8px;padding:7px 12px;background:#8a5300;color:#fff;font-size:13px;font-weight:600;transform:translateY(-110%);transition:transform .25s}
+.netbar.show{transform:none}
+.netbar .i{width:16px;height:16px}
+/* kalkulyator */
+.calc{position:fixed;top:64px;right:12px;width:330px;max-width:calc(100vw - 24px);background:var(--card);border-radius:18px;box-shadow:0 10px 34px rgba(8,16,40,.3);z-index:50;overflow:hidden;border:1px solid var(--line)}
+.calc .ch{display:flex;align-items:center;gap:6px;padding:8px 10px;background:var(--band);color:#fff;cursor:move;touch-action:none;user-select:none}
 .calc .ch .tb2{flex:1;display:flex;gap:4px}
-.calc .ch .tb2 button{border:0;border-radius:8px;padding:5px 9px;background:transparent;font-size:13px;font-weight:600}
-.calc .ch .tb2 button.on{background:var(--card)}
+.calc .ch .tb2 button{border:0;border-radius:8px;padding:5px 10px;background:transparent;font-size:13px;font-weight:700;color:var(--band-hint)}
+.calc .ch .tb2 button.on{background:var(--gold);color:#14213d}
+.calc .ch .icon-btn{background:rgba(255,255,255,.13);color:#fff}
 .calc .disp{padding:10px 12px}
 .calc .expr{width:100%;border:0;background:transparent;font-size:20px;text-align:right;outline:none;font-variant-numeric:tabular-nums}
 .calc .res{text-align:right;color:var(--hint);min-height:22px;font-size:16px;font-variant-numeric:tabular-nums}
 .keys{display:grid;grid-template-columns:repeat(5,1fr);gap:5px;padding:0 10px 10px}
-.keys button{border:0;border-radius:9px;height:40px;background:var(--soft);font-weight:600;font-size:15px}
-.keys button.op{background:rgba(47,111,237,.13);background:color-mix(in srgb,var(--accent) 15%,transparent);color:var(--accent)}
+.keys button{border:0;border-radius:10px;height:40px;background:var(--soft);font-weight:700;font-size:15px}
+.keys button.op{background:var(--accent-soft);color:var(--ink)}
 .keys button.eq{background:var(--accent);color:var(--accent-text)}
 .keys button.fn{font-size:13px}
 .hist{max-height:70px;overflow:auto;padding:0 12px 6px;font-size:12px;color:var(--hint);text-align:right}
 .graph{padding:8px 10px 10px}
-.graph canvas{width:100%;height:230px;background:var(--page);border-radius:10px;touch-action:none;display:block}
+.graph canvas{width:100%;height:230px;background:var(--soft2);border-radius:10px;touch-action:none;display:block}
 .fnrow{display:flex;align-items:center;gap:6px;margin-bottom:6px}
 .fnrow i{width:10px;height:10px;border-radius:50%;flex:none}
-.fnrow input{flex:1;border:1.5px solid var(--line);border-radius:8px;padding:6px 8px;background:var(--page);outline:none;font-size:14px}
-.ref h3{font-size:15px;margin:14px 0 6px}
+.fnrow input{flex:1;border:1.5px solid var(--line);border-radius:8px;padding:6px 8px;background:var(--soft2);outline:none;font-size:14px}
+.ref h3{font-family:var(--fh);font-size:14px;margin:14px 0 6px;color:var(--ink)}
 .ref .f{display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px solid var(--line);font-size:14px}
 .ref .f b{font-family:"Times New Roman",serif;font-style:italic;font-size:16px;white-space:nowrap}
 .words{font-size:12px;color:var(--hint);text-align:right;margin-top:4px}
@@ -13581,26 +13706,26 @@ table.tb{width:100%;border-collapse:collapse;font-size:14px}table.tb td,table.tb
 </style>
 </head>
 <body>
-<div id="view"></div>
+<div id="netbar" class="netbar" role="status"><span class="i"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l18 18M8.5 16.5a5 5 0 0 1 7 0M5 12.5a10 10 0 0 1 5.5-2.8M19 12.5a10 10 0 0 0-2.4-1.6M12 20h.01"/></svg></span><span>Internet yo'q — javoblar qurilmada saqlanmoqda</span></div>
+<div id="view"><div class="center"><div class="spin dark"></div><div class="muted">Yuklanmoqda...</div></div></div>
 <nav class="tabs hidden" id="tabs">
-  <button data-tab="home" class="on"><b>📝</b>Test yechish</button>
-  <button data-tab="profile"><b>👤</b>Profil</button>
+  <button data-tab="home" class="on"><span class="i"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/></svg></span>Test yechish</button>
+  <button data-tab="profile"><span class="i"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/></svg></span>Profil</button>
 </nav>
 <div id="calc" class="calc hidden"></div>
-
 <script>
 "use strict";
-const tg = window.Telegram && window.Telegram.WebApp;
-// ✅ Telegram ma'lumoti odatda telegram-web-app.js orqali olinadi; skript
-// yuklanmasa yoki bo'sh qaytarsa — Telegram uni sahifa manzilining #...
-// qismiga ham yozadi (tgWebAppData), shu yerdan o'qiymiz.
+// Telegram SDK asinxron yuklanadi (sekin internetda sahifani to'xtatib
+// turmasin). U kelguncha initData manzilning #tgWebAppData qismidan olinadi.
+let tg = (window.Telegram && window.Telegram.WebApp) || null;
+const LOGO = "data:image/webp;base64,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";
 function readInitData() {
   if (tg && tg.initData) return tg.initData;
   try { const h = new URLSearchParams(location.hash.slice(1)).get("tgWebAppData"); if (h) return h; } catch (e) {}
   try { const p = JSON.parse(sessionStorage.getItem("__telegram__initParams") || "{}"); if (p.tgWebAppData) return p.tgWebAppData; } catch (e) {}
   return "";
 }
-const initData = readInitData();
+let initData = readInitData();
 function readUid() {
   if (tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) return tg.initDataUnsafe.user.id;
   try { return JSON.parse(new URLSearchParams(initData).get("user") || "{}").id || 0; } catch (e) { return 0; }
@@ -13608,6 +13733,50 @@ function readUid() {
 const S = { me: null, uid: readUid(),
             back: null, tick: null, st: null, tab: "home" };
 const LETTERS = "ABCDEF";
+
+/* ------------ ikonkalar (inline SVG — tashqi fayl so'ralmaydi) ------------ */
+const IP = {
+  doc: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/>',
+  chart: '<path d="M5 20V11M12 20V5M19 20v-6"/>',
+  user: '<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  calc: '<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M8 7h8M8 12h.01M12 12h.01M16 12h.01M8 16h.01M12 16h.01M16 16h.01"/>',
+  grid: '<rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/>',
+  bubbles: '<circle cx="7" cy="7" r="3"/><circle cx="17" cy="7" r="3"/><circle cx="7" cy="17" r="3"/><circle cx="17" cy="17" r="3"/>',
+  flag: '<path d="M5 21V4M5 4h11l-2 4 2 4H5"/>',
+  chev: '<path d="M9 6l6 6-6 6"/>',
+  left: '<path d="M15 6l-6 6 6 6"/>',
+  check: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
+  play: '<path d="M8 5.5v13l11-6.5z"/>',
+  home: '<path d="M4 11l8-7 8 7v9a1 1 0 0 1-1 1h-4v-6H9v6H5a1 1 0 0 1-1-1z"/>',
+  chat: '<path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/>',
+  award: '<circle cx="12" cy="9" r="6"/><path d="M8.5 14.5 7 22l5-3 5 3-1.5-7.5"/>',
+  download: '<path d="M12 4v11M7 10l5 5 5-5M5 20h14"/>',
+  refresh: '<path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/>',
+  ruler: '<path d="M4 20V4l16 16z"/><path d="M8 16h3v-3"/>',
+  lock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
+  mic: '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>',
+  book: '<path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z"/><path d="M4 21h15"/>',
+  headphones: '<path d="M4 15v-3a8 8 0 0 1 16 0v3"/><rect x="3" y="14" width="4" height="7" rx="1.5"/><rect x="17" y="14" width="4" height="7" rx="1.5"/>',
+  pen: '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13 7l4 4"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/>',
+  camera: '<path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/>',
+  trash: '<path d="M5 7h14M10 7V4h4v3M7 7l1 13h8l1-13"/>',
+  x: '<path d="M6 6l12 12M18 6L6 18"/>',
+  undo: '<path d="M9 7L4 12l5 5"/><path d="M4 12h11a5 5 0 0 1 0 10h-2"/>',
+  card: '<rect x="5" y="4" width="14" height="16" rx="2"/><path d="M9 9h6M9 13h6"/>',
+  list: '<path d="M9 6h11M9 12h11M9 18h11M4.5 6h.01M4.5 12h.01M4.5 18h.01"/>',
+  wifioff: '<path d="M3 3l18 18M8.5 16.5a5 5 0 0 1 7 0M5 12.5a10 10 0 0 1 5.5-2.8M19 12.5a10 10 0 0 0-2.4-1.6M12 20h.01"/>',
+  info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>',
+  alert: '<path d="M12 3.5l9 16.5H3z"/><path d="M12 10v4M12 17h.01"/>',
+  dots: '<path d="M6 12h.01M12 12h.01M18 12h.01"/>',
+  phone: '<rect x="7" y="2.5" width="10" height="19" rx="2"/><path d="M11 18h2"/>',
+  file: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>'
+};
+function svgStr(name) {
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${IP[name] || ""}</svg>`;
+}
+function ic(name) { const s = document.createElement("span"); s.className = "i"; s.setAttribute("aria-hidden", "true"); s.innerHTML = svgStr(name); return s; }
 
 /* ------------ yordamchilar ------------ */
 function el(tag, attrs, ...kids) {
@@ -13630,7 +13799,7 @@ function clean(nodes) { return nodes.flat().filter(n => n != null && n !== false
 function mount(...nodes) { const v = $view(); v.replaceChildren(...clean(nodes)); window.scrollTo(0, 0); }
 function toast(msg, ms) {
   document.querySelectorAll(".toast").forEach(t => t.remove());
-  const t = el("div", {class: "toast"}, msg); document.body.append(t);
+  const t = el("div", {class: "toast", role: "status"}, msg); document.body.append(t);
   setTimeout(() => t.remove(), ms || 2600);
 }
 function haptic(kind) {
@@ -13641,9 +13810,12 @@ function haptic(kind) {
     else tg.HapticFeedback.impactOccurred(kind || "light");
   } catch (e) {}
 }
+// Kutish oynasi; internet sekin bo'lsa 6 soniyadan keyin izoh qo'shiladi.
 function overlay(text) {
-  const o = el("div", {class: "overlay"}, el("div", {class: "spin"}), el("div", {}, text));
-  document.body.append(o); return () => o.remove();
+  const slow = el("div", {class: "slow hidden"}, "Internet sekin ko'rinadi — biroz kuting, so'rov avtomatik qayta yuboriladi.");
+  const o = el("div", {class: "overlay"}, el("div", {class: "spin"}), el("div", {}, text), slow);
+  const tm = setTimeout(() => slow.classList.remove("hidden"), 6000);
+  document.body.append(o); return () => { clearTimeout(tm); o.remove(); };
 }
 function fmtTime(sec) {
   sec = Math.max(0, Math.floor(sec));
@@ -13651,25 +13823,59 @@ function fmtTime(sec) {
   const p = n => String(n).padStart(2, "0");
   return h ? `${h}:${p(m)}:${p(s)}` : `${p(m)}:${p(s)}`;
 }
-function plural(n, w) { return `${n} ta ${w}`; }
 function lsGet(k) { try { return JSON.parse(localStorage.getItem(k) || "null"); } catch (e) { return null; } }
 function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
 function lsDel(k) { try { localStorage.removeItem(k); } catch (e) {} }
 function stopTick() { if (S.tick) { clearInterval(S.tick); S.tick = null; } }
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+/* ------------ tarmoq: timeout + avtomatik qayta urinish ------------ */
+let netOk = true;
+function netState(ok) {
+  if (ok === netOk) return;
+  netOk = ok;
+  document.getElementById("netbar").classList.toggle("show", !ok);
+  if (ok && S.st && !S.st.submitted && !S.st.writing && S.st.ui) flushSave(S.st);
+}
+window.addEventListener("offline", () => netState(false));
+window.addEventListener("online", () => netState(true));
+
+// retries: tarmoq uzilsa yoki server vaqtincha band bo'lsa (502-504) necha
+// marta qayta yuborilsin. GET va bir xil natija beradigan ("idem") so'rovlar
+// avtomatik qayta yuboriladi; topshirish kabi so'rovlar — yo'q.
 async function api(path, opts) {
   opts = opts || {};
-  const o = {method: opts.method || (opts.body || opts.form ? "POST" : "GET"), headers: {"X-Telegram-Init-Data": initData}};
-  if (opts.body !== undefined) { o.headers["Content-Type"] = "application/json"; o.body = JSON.stringify(opts.body); }
-  if (opts.form) o.body = opts.form;
-  if (opts.keepalive) o.keepalive = true;
-  let res;
-  try { res = await fetch(path, o); }
-  catch (e) { throw {network: true, message: "Internet aloqasi yo'q. Qayta urinib ko'ring."}; }
-  let data = {};
-  try { data = await res.json(); } catch (e) {}
-  if (!res.ok || data.ok === false) throw Object.assign({status: res.status}, data, {message: data.message || "Xatolik yuz berdi."});
-  return data;
+  const method = opts.method || (opts.body !== undefined || opts.form ? "POST" : "GET");
+  const tries = opts.retries != null ? opts.retries : (method === "GET" || opts.idem ? 2 : 0);
+  for (let i = 0; ; i++) {
+    const ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const tm = ctl ? setTimeout(() => ctl.abort(), opts.timeout || 20000) : null;
+    const o = {method, headers: {"X-Telegram-Init-Data": initData}};
+    if (ctl) o.signal = ctl.signal;
+    if (opts.body !== undefined) { o.headers["Content-Type"] = "application/json"; o.body = JSON.stringify(opts.body); }
+    if (opts.form) o.body = opts.form;
+    if (opts.keepalive) o.keepalive = true;
+    let res, data = {}, netErr = false;
+    try {
+      res = await fetch(path, o);
+      try { data = await res.json(); } catch (e) { if (e && e.name === "AbortError") netErr = true; }
+    } catch (e) { netErr = true; }
+    clearTimeout(tm);
+    if (netErr) {
+      if (i < tries) { await sleep(700 * Math.pow(2, i)); continue; }
+      netState(false);
+      throw {network: true, message: navigator.onLine === false
+        ? "Internet aloqasi yo'q. Ulanib, qayta urinib ko'ring."
+        : "Internet sekin yoki uzildi. Qayta urinib ko'ring."};
+    }
+    netState(true);
+    if (res.status >= 502 && res.status <= 504 && i < tries) { await sleep(1000 * (i + 1)); continue; }
+    if (!res.ok || data.ok === false) {
+      throw Object.assign({status: res.status}, data, {message: data.message ||
+        (res.status >= 500 ? "Server hozir band. Birozdan keyin qayta urinib ko'ring." : "Xatolik yuz berdi.")});
+    }
+    return data;
+  }
 }
 function handleErr(e) {
   if (e && e.error === "not_subscribed") return renderGate("sub", e.channels);
@@ -13686,7 +13892,7 @@ function openBot() {
 function setBack(fn) {
   S.back = fn;
   if (!tg || !tg.BackButton) return;
-  if (fn) tg.BackButton.show(); else tg.BackButton.hide();
+  try { if (fn) tg.BackButton.show(); else tg.BackButton.hide(); } catch (e) {}
 }
 let confirmOpen = false;
 function confirmBox(title, text, okText, danger) {
@@ -13696,75 +13902,135 @@ function confirmBox(title, text, okText, danger) {
   return new Promise(resolve => {
     const close = v => { confirmOpen = false; back.remove(); resolve(v); };
     const back = el("div", {class: "mback", onclick: e => { if (e.target === back) close(false); }},
-      el("div", {class: "msheet"},
+      el("div", {class: "msheet", role: "dialog", "aria-modal": "true"},
         el("h2", {}, title), text ? el("p", {class: "muted"}, text) : null,
-        el("button", {class: "btn block" + (danger ? " danger" : ""), onclick: () => close(true)}, okText || "Ha"),
+        el("button", {class: "btn block" + (danger ? " danger" : " cta"), onclick: () => close(true)}, okText || "Ha"),
         el("button", {class: "btn block ghost", onclick: () => close(false)}, "Bekor qilish")));
     document.body.append(back);
   });
 }
 function sheet(...kids) {
   const back = el("div", {class: "mback"});
-  const box = el("div", {class: "msheet"}, ...kids);
+  const box = el("div", {class: "msheet", role: "dialog", "aria-modal": "true"}, ...kids);
   back.append(box);
   back.addEventListener("click", e => { if (e.target === back) back.remove(); });
   document.body.append(back);
   return back;
 }
 function showTabs(on) { document.getElementById("tabs").classList.toggle("hidden", !on); }
+function band(...kids) { return el("div", {class: "band"}, ...kids); }
+function brandRow() {
+  return el("div", {class: "brand"}, el("img", {class: "logo", src: LOGO, alt: "", width: "46", height: "46"}),
+    el("div", {}, el("b", {}, "Online Olimpiada"), el("span", {}, (S.me && S.me.academy) || "Telegram bot")));
+}
+function statusBox(kind, ...kids) {
+  const name = {ok: "check", bad: "alert", warn: "info"}[kind] || "info";
+  return el("div", {class: "status " + (kind || "")}, ic(name), el("div", {}, ...kids));
+}
+function centerMsg(iconName, title, text, ...rest) {
+  return el("div", {class: "screen center"}, el("div", {class: "ico-lg"}, ic(iconName)),
+    el("h2", {}, title), text ? el("p", {class: "muted"}, text) : null, ...rest);
+}
 
-/* ------------ kirish ------------ */
-// Bir martalik sozlash. Avval boot() ichida edi — "A'zo bo'ldim" bosilib boot()
-// qayta chaqirilganda tugma tutqichlari ikki marta ulanardi (orqaga tugmasi
-// tasdiqlash oynasini 2 marta ochardi).
-function initOnce() {
-  if (tg) {
-    try { tg.ready(); tg.expand(); } catch (e) {}
-    try { tg.BackButton.onClick(() => S.back && S.back()); } catch (e) {}
-    try { tg.setHeaderColor("secondary_bg_color"); tg.setBackgroundColor("secondary_bg_color"); } catch (e) {}
-    try { if (tg.disableVerticalSwipes) tg.disableVerticalSwipes(); } catch (e) {}
+/* ------------ mavzu va Telegram sozlamalari ------------ */
+function cssVar(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+function applyTheme() {
+  if (tg && tg.colorScheme) {
+    if (tg.colorScheme === "dark") document.documentElement.setAttribute("data-theme", "dark");
+    else document.documentElement.removeAttribute("data-theme");
   }
+  if (!tg) return;
+  try { tg.setHeaderColor(cssVar("--band") || "#14306b"); } catch (e) {}
+  try { tg.setBackgroundColor(cssVar("--page") || "#f3f5fa"); } catch (e) {}
+  try { if (tg.setBottomBarColor) tg.setBottomBarColor(cssVar("--card") || "#ffffff"); } catch (e) {}
+}
+let tgReady = false;
+function initTg() {
+  tg = (window.Telegram && window.Telegram.WebApp) || null;
+  if (!tg || tgReady) return;
+  tgReady = true;
+  if (!initData) initData = readInitData();
+  if (!S.uid) S.uid = readUid();
+  try { tg.ready(); tg.expand(); } catch (e) {}
+  try { tg.BackButton.onClick(() => S.back && S.back()); } catch (e) {}
+  try { if (tg.disableVerticalSwipes) tg.disableVerticalSwipes(); } catch (e) {}
+  try { tg.onEvent("themeChanged", applyTheme); } catch (e) {}
+  applyTheme();
+  if (S.back) setBack(S.back);
+}
+// Bir martalik sozlash (boot() qayta chaqirilsa ham tutqichlar ikki marta ulanmaydi).
+function initOnce() {
+  initTg();
   document.querySelectorAll("#tabs button").forEach(b => b.addEventListener("click", () => {
     const t = b.dataset.tab; if (t === "home") renderHome(); else renderProfile();
   }));
+  const sdk = document.getElementById("tgsdk");
+  if (sdk) sdk.addEventListener("load", initTg);
+  window.addEventListener("online", () => { if (S.failedBoot) boot(); });
+}
+function renderNetError(retry) {
+  stopTick(); showTabs(false);
+  mount(centerMsg("wifioff", "Internet aloqasi sekin yoki uzilgan",
+    "Aloqa tiklanishi bilan qayta urinib ko'ring — javoblaringiz yo'qolmaydi.",
+    el("button", {class: "btn cta", onclick: retry}, ic("refresh"), "Qayta urinish")));
 }
 async function boot() {
+  if (!initData) initData = readInitData();
   if (!initData) return renderGate("tg");
-  mount(el("div", {class: "center"}, el("div", {class: "spin dark"}), el("div", {class: "muted"}, "Yuklanmoqda...")));
-  try { S.me = await api("/api/me"); S.meTs = Date.now(); }
-  catch (e) { return handleErr(e); }
-  if (!S.me.registered) return renderGate("reg");
-  if (!S.me.subscribed) return renderGate("sub", S.me.channels);
+  S.failedBoot = false;
   const params = new URLSearchParams(location.search);
-  const code = params.get("code") || (tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param) || "";
+  let hashStart = "";
+  try { hashStart = new URLSearchParams(location.hash.slice(1)).get("tgWebAppStartParam") || ""; } catch (e) {}
+  const code = params.get("code") || (tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param) || hashStart;
+  // Avval kirgan foydalanuvchiga bosh sahifa DARHOL (keshdan) ko'rsatiladi,
+  // ma'lumot esa fonda yangilanadi — sekin internetda kutib o'tirmaydi.
+  const cached = lsGet("me:" + S.uid);
+  if (cached && cached.registered && cached.subscribed && Date.now() - (cached._ts || 0) < 3 * 86400e3) {
+    S.me = cached; S.meTs = 0;
+    renderHome();
+    if (code) lookup(code);
+    return;
+  }
+  mount(el("div", {class: "center"}, el("div", {class: "spin dark"}), el("div", {class: "muted"}, "Yuklanmoqda...")));
+  let me;
+  try { me = await api("/api/me", {timeout: 15000}); }
+  catch (e) {
+    if (e && e.network) { S.failedBoot = true; return renderNetError(boot); }
+    return handleErr(e);
+  }
+  gotMe(me);
+  if (!me.registered) return renderGate("reg");
+  if (!me.subscribed) return renderGate("sub", me.channels);
   renderHome();
   if (code) lookup(code);
+}
+function gotMe(me) {
+  S.me = Object.assign(S.me || {}, me); S.meTs = Date.now();
+  if (me.registered && me.subscribed) lsSet("me:" + S.uid, Object.assign({}, me, {_ts: Date.now()}));
+  else lsDel("me:" + S.uid);
 }
 
 function renderGate(kind, channels) {
   stopTick(); showTabs(false); setBack(null);
   if (kind === "tg") {
     const diag = `${tg ? "sdk" : "nosdk"} · ${(tg && tg.platform) || "-"} · v${(tg && tg.version) || "-"} · ${initData ? "data" : "nodata"}`;
-    return mount(el("div", {class: "screen center"}, el("div", {style: "font-size:48px"}, "📱"),
-      el("h2", {}, "Ilovani Telegram ichida oching"),
-      el("p", {class: "muted"}, initData
-        ? "Telegram ma'lumotlari tasdiqlanmadi. Ilovani yopib, bot chatidagi «Test yechish» menyu tugmasi orqali qayta oching."
-        : "Bu sahifa bot chatidagi «Test yechish» menyu tugmasi orqali ochiladi."),
+    return mount(centerMsg("phone", "Ilovani Telegram ichida oching",
+      initData ? "Telegram ma'lumotlari tasdiqlanmadi. Ilovani yopib, bot chatidagi «Test yechish» menyu tugmasi orqali qayta oching."
+               : "Bu sahifa bot chatidagi «Test yechish» menyu tugmasi orqali ochiladi.",
       el("div", {class: "muted small", style: "opacity:.6"}, diag)));
   }
   if (kind === "reg") {
-    return mount(el("div", {class: "screen center"}, el("div", {style: "font-size:48px"}, "📝"),
-      el("h2", {}, "Avval ro'yxatdan o'ting"),
-      el("p", {class: "muted"}, "Botga /start yuboring, ism va telefon raqamingizni kiriting. So'ng ilovani qayta oching."),
-      el("button", {class: "btn", onclick: openBot}, "Botga o'tish")));
+    return mount(centerMsg("user", "Avval ro'yxatdan o'ting",
+      "Botga /start yuboring, ism va telefon raqamingizni kiriting. So'ng ilovani qayta oching.",
+      el("button", {class: "btn cta", onclick: openBot}, ic("chat"), "Botga o'tish")));
   }
   const box = el("div", {class: "card"});
   (channels || []).forEach(c => box.append(el("div", {class: "list-item"}, el("b", {}, c.title),
     c.url ? el("button", {class: "btn", onclick: () => tg ? tg.openTelegramLink(c.url) : window.open(c.url)}, "A'zo bo'lish") : null)));
   mount(el("div", {class: "screen"}, el("div", {class: "center", style: "min-height:auto;padding-top:20px"},
-      el("div", {style: "font-size:48px"}, "🔒"), el("h2", {}, "Kanallarga a'zo bo'ling"),
+      el("div", {class: "ico-lg"}, ic("lock")), el("h2", {}, "Kanallarga a'zo bo'ling"),
       el("p", {class: "muted"}, "Testlardan foydalanish uchun quyidagi kanal/guruhlarga a'zo bo'ling.")), box,
-    el("button", {class: "btn block", onclick: () => boot()}, "✅ A'zo bo'ldim — tekshirish")));
+    el("button", {class: "btn block cta", onclick: () => { lsDel("me:" + S.uid); boot(); }}, ic("check"), "A'zo bo'ldim — tekshirish")));
 }
 
 /* ------------ bosh sahifa: kod kiritish ------------ */
@@ -13779,34 +14045,38 @@ function renderHome() {
   const activeBox = el("div", {});
   const drawActive = (list) => {
     if (!list || !list.length) { activeBox.replaceChildren(); return; }
-    activeBox.replaceChildren(el("div", {class: "card"}, el("h2", {}, "▶️ Davom ettirilayotgan testlar"),
+    activeBox.replaceChildren(el("div", {class: "sect"}, "Davom ettirish"), el("div", {class: "card", style: "padding:4px 16px;margin-top:0"},
       ...list.map(a => el("button", {class: "resume-item", onclick: () => lookup(a.code)},
-        el("div", {}, el("b", {}, a.title || a.code),
+        el("div", {class: "ico"}, ic(a.staged ? "grid" : "doc")),
+        el("div", {style: "min-width:0"}, el("b", {}, a.title || a.code),
           el("div", {class: "muted small"}, a.staged ? `${a.code} · bosqichli imtihon` :
             `${a.code} · ${Math.max(0, Math.round((a.end_ts - Date.now() / 1000) / 60))} daqiqa qoldi`)),
-        el("span", {class: "go"}, "Davom ›")))));
+        el("span", {class: "go"}, ic("chev"))))));
   };
   drawActive(S.me && S.me.active);
   if (!S.meTs || Date.now() - S.meTs > 3000) {
     S.meTs = Date.now();
-    api("/api/me").then(me => { S.me = Object.assign(S.me || {}, me); if (activeBox.isConnected) drawActive(me.active); }).catch(() => {});
+    api("/api/me").then(me => {
+      gotMe(me);
+      if (!me.registered) return renderGate("reg");
+      if (!me.subscribed) return renderGate("sub", me.channels);
+      if (activeBox.isConnected) drawActive(me.active);
+    }).catch(() => {});
   }
+  const tile = (icon, text) => el("div", {}, ic(icon), text);
   mount(el("div", {class: "screen"},
-    el("div", {class: "muted small"}, (S.me && S.me.academy) || ""),
-    el("h1", {}, "Assalomu alaykum" + (name ? ", " + name.split(" ")[0] : "") + "! 👋"),
-    el("p", {class: "muted"}, "Ustozingiz bergan test kodini kiriting — test turiga mos interaktiv oyna ochiladi."),
-    el("div", {class: "card"},
-      el("label", {class: "muted small", for: "code"}, "Test kodi"), el("div", {style: "height:6px"}), inp,
-      el("div", {style: "height:12px"}), el("button", {class: "btn block", onclick: go}, "🔎 Testni ochish")),
+    band(brandRow(),
+      el("h1", {}, "Salom" + (name ? ", " + name.split(" ")[0] : "") + "!"),
+      el("p", {}, "Ustozingiz bergan test kodini kiriting — test turiga mos interaktiv oyna ochiladi.")),
+    el("div", {class: "card lift"},
+      el("label", {class: "lbl", for: "code"}, "Test kodi"), inp,
+      el("div", {style: "height:12px"}), el("button", {class: "btn block cta", onclick: go}, ic("search"), "Testni ochish")),
     activeBox,
-    el("div", {class: "card"}, el("h2", {}, "Imkoniyatlar"),
-      el("div", {class: "feat"},
-        el("div", {}, "🔵 DTM javoblar varaqasi — doirachani bosib belgilang"),
-        el("div", {}, "🧮 SAT: kalkulyator, grafik va formulalar"),
-        el("div", {}, "✍️ Ochiq savollarga matn yoki rasm"),
-        el("div", {}, "💾 Javoblar avtomatik saqlanadi"),
-        el("div", {}, "⏱ Taymer: vaqt tugasa avtomatik topshiriladi"),
-        el("div", {}, "🎧 Listening audio va 📄 PDF shu yerda")))));
+    el("div", {class: "sect"}, "Imkoniyatlar"),
+    el("div", {class: "feat"},
+      tile("bubbles", "DTM javoblar varaqasi"), tile("calc", "SAT kalkulyator va grafik"),
+      tile("pen", "Ochiq savolga matn yoki rasm"), tile("check", "Javoblar avtomatik saqlanadi"),
+      tile("clock", "Taymer va avto-topshirish"), tile("headphones", "Audio va PDF shu yerda"))));
 }
 function setTab(t) {
   S.tab = t;
@@ -13817,7 +14087,7 @@ function setTab(t) {
 async function lookup(code) {
   const done = overlay("Test qidirilmoqda...");
   let r;
-  try { r = await api("/api/test/lookup", {body: {code}}); }
+  try { r = await api("/api/test/lookup", {body: {code}, idem: true}); }
   catch (e) { done(); return handleErr(e); }
   done(); renderInfo(r);
 }
@@ -13828,34 +14098,34 @@ function renderInfo(r) {
   stopTick(); showTabs(false); setBack(renderHome);
   const t = r.test, a = r.access, st = a.state;
   const chips = el("div", {class: "chips"},
-    el("span", {class: "chip acc"}, t.exam_label), el("span", {class: "chip"}, t.is_free ? "🆓 Tekin" : `💰 ${t.price.toLocaleString("ru-RU")} so'm`),
-    t.staged ? el("span", {class: "chip"}, `🧩 ${t.sections.length} bo'lim`) : el("span", {class: "chip"}, `🧮 ${t.qcount} savol`),
-    el("span", {class: "chip"}, `⏳ ${t.duration} daqiqa`), t.subject ? el("span", {class: "chip"}, "📚 " + t.subject) : null);
-  const statusBox = el("div", {class: "status " + (STATE_STYLE[st] || "")}, r.message);
+    el("span", {class: "chip acc"}, t.exam_label), el("span", {class: "chip"}, t.is_free ? "Tekin" : `${t.price.toLocaleString("ru-RU")} so'm`),
+    t.staged ? el("span", {class: "chip"}, `${t.sections.length} bo'lim`) : el("span", {class: "chip"}, `${t.qcount} savol`),
+    el("span", {class: "chip"}, `${t.duration} daqiqa`), t.subject ? el("span", {class: "chip"}, t.subject) : null);
+  const stBox = statusBox(STATE_STYLE[st] || "", r.message);
   const body = [];
   if (t.staged) {
     const list = el("div", {});
-    t.sections.forEach((s, i) => list.append(el("div", {class: "sec-item"}, el("div", {class: "ico"}, secIcon(s)),
-      el("div", {style: "flex:1"}, el("b", {}, `${i + 1}. ${s.name}`),
+    t.sections.forEach((s, i) => list.append(el("div", {class: "sec-item"}, el("div", {class: "ico"}, ic(secIcon(s))),
+      el("div", {style: "flex:1;min-width:0"}, el("b", {}, `${i + 1}. ${secName(s)}`),
         el("div", {class: "muted small"}, `${s.type_label}${s.qcount ? " · " + s.qcount + " savol" : ""} · ${s.duration_min} daqiqa`)))));
-    body.push(el("div", {class: "card"}, el("h2", {}, "Bo'limlar"), list));
+    body.push(el("div", {class: "sect"}, "Bo'limlar"), el("div", {class: "card", style: "margin-top:0"}, list));
   }
   const btns = [];
   const start = async (retake) => {
     const txt = t.staged ? "Bo'limlar ketma-ket topshiriladi, har birining o'z vaqti bor." :
       `Vaqt ${t.duration} daqiqa. Boshlangach taymer to'xtamaydi — ilovani yopsangiz ham vaqt ketaveradi, javoblaringiz saqlanadi.`;
-    if (st === "ready" || retake) { if (!await confirmBox("Testni boshlaysizmi?", txt, "🚀 Boshlash")) return; }
+    if (st === "ready" || retake) { if (!await confirmBox("Testni boshlaysizmi?", txt, "Boshlash")) return; }
     startTest(t, retake);
   };
-  if (st === "ready") btns.push(el("button", {class: "btn block", onclick: () => start(false)}, "🚀 Testni boshlash"));
-  if (st === "resume") btns.push(el("button", {class: "btn block", onclick: () => start(false)}, "▶️ Davom ettirish"));
-  if (st === "done" || st === "staged_done" || st === "pending_review") btns.push(el("button", {class: "btn block", onclick: () => showResult(t.id)}, "📊 Natijani ko'rish"));
-  if (st === "staged_done" && a.can_retake) btns.push(el("button", {class: "btn block ghost", onclick: () => start(true)}, "🔄 Qaytadan yechish"));
-  if (st === "need_payment" || st === "payment_rejected" || st === "payment_pending") btns.push(el("button", {class: "btn block", onclick: openBot}, "💳 Botga o'tish"));
-  btns.push(el("button", {class: "btn block ghost", onclick: renderHome}, "⬅️ Boshqa kod"));
+  if (st === "ready") btns.push(el("button", {class: "btn block cta", onclick: () => start(false)}, ic("play"), "Testni boshlash"));
+  if (st === "resume") btns.push(el("button", {class: "btn block cta", onclick: () => start(false)}, ic("play"), "Davom ettirish"));
+  if (st === "done" || st === "staged_done" || st === "pending_review") btns.push(el("button", {class: "btn block", onclick: () => showResult(t.id)}, ic("chart"), "Natijani ko'rish"));
+  if (st === "staged_done" && a.can_retake) btns.push(el("button", {class: "btn block ghost", onclick: () => start(true)}, ic("refresh"), "Qaytadan yechish"));
+  if (st === "need_payment" || st === "payment_rejected" || st === "payment_pending") btns.push(el("button", {class: "btn block", onclick: openBot}, ic("chat"), "Botga o'tish"));
+  btns.push(el("button", {class: "btn block ghost", onclick: renderHome}, ic("left"), "Boshqa kod"));
   if (st === "not_started" && a.left) {
     const cd = el("b", {}, fmtTime(a.left));
-    statusBox.append(el("div", {style: "margin-top:6px"}, "Boshlanishiga: ", cd));
+    stBox.lastChild.append(el("div", {style: "margin-top:6px"}, "Boshlanishiga: ", cd));
     const until = Date.now() / 1000 + a.left;
     S.tick = setInterval(() => {
       const left = until - Date.now() / 1000; cd.textContent = fmtTime(left);
@@ -13863,19 +14133,21 @@ function renderInfo(r) {
     }, 1000);
   }
   mount(el("div", {class: "screen"},
-    el("div", {class: "muted small"}, "Kod: " + t.code), el("h1", {}, t.title || "Test"), chips,
-    t.scheduled && t.start_at ? el("div", {class: "muted small"}, "📅 Boshlanish: " + t.start_at) : null,
-    statusBox, ...body, el("div", {class: "card"}, ...btns)));
+    band(el("div", {class: "eyebrow"}, "Kod: " + t.code), el("h1", {}, t.title || "Test"), chips,
+      t.scheduled && t.start_at ? el("p", {style: "margin-top:8px"}, "Boshlanish: " + t.start_at) : null),
+    el("div", {class: "card lift"}, stBox, ...btns), ...body));
 }
+// bo'lim nomi boshidagi emoji olib tashlanadi — yonida ikonka bor
+function secName(s) { return String(s.name || "").replace(/^[^\p{L}\p{N}]+/u, "") || s.name; }
 function secIcon(s) {
-  const byKey = {listening: "🎧", reading: "📖", reading_writing: "📖", math: "🧮", writing: "✍️", speaking: "🎙"};
-  return byKey[s.key] || {mcq: "📝", mcq_band: "📖", open_text: "✍️", open_voice: "🎙"}[s.type] || "📝";
+  const byKey = {listening: "headphones", reading: "book", reading_writing: "book", math: "calc", writing: "pen", speaking: "mic"};
+  return byKey[s.key] || {mcq: "doc", mcq_band: "book", open_text: "pen", open_voice: "mic"}[s.type] || "doc";
 }
 
 async function startTest(t, retake) {
   const done = overlay("Tayyorlanmoqda...");
   let p;
-  try { p = await api("/api/test/start", {body: {test_id: t.id, retake: !!retake}}); }
+  try { p = await api("/api/test/start", {body: {test_id: t.id, retake: !!retake}, idem: true}); }
   catch (e) { done(); return handleErr(e); }
   done();
   if (p.kind === "staged") renderOverview(p); else renderSolve(p, null);
@@ -13890,42 +14162,43 @@ function renderOverview(ov) {
   let current = null;
   ov.sections.forEach((s, i) => {
     if (s.status === "current") current = s;
-    const mark = s.status === "done" ? "✅" : s.status === "current" ? "▶️" : "🔒";
-    list.append(el("div", {class: "sec-item " + s.status}, el("div", {class: "ico"}, secIcon(s)),
-      el("div", {style: "flex:1"}, el("b", {}, `${i + 1}. ${s.name}`),
+    const mark = s.status === "done" ? "check" : s.status === "current" ? "play" : "lock";
+    list.append(el("div", {class: "sec-item " + s.status}, el("div", {class: "ico"}, ic(secIcon(s))),
+      el("div", {style: "flex:1;min-width:0"}, el("b", {}, `${i + 1}. ${secName(s)}`),
         el("div", {class: "muted small"}, `${s.type_label}${s.qcount ? " · " + s.qcount + " savol" : ""} · ${s.duration_min} daqiqa`)),
-      el("div", {style: "font-size:20px"}, mark)));
+      el("div", {class: "mark"}, ic(mark))));
   });
   const actions = el("div", {class: "card"});
   if (current) {
     if (current.type === "open_voice") {
-      actions.append(el("p", {}, el("b", {}, current.name), " bo'limi Telegram'ning ovozli xabari orqali topshiriladi — bu eng qulay va ishonchli usul."),
+      actions.append(el("p", {style: "margin-top:0"}, el("b", {}, current.name), " bo'limi Telegram'ning ovozli xabari orqali topshiriladi — bu eng qulay va ishonchli usul."),
         el("p", {class: "muted small"}, "Tugmani bosganingizda bot chatda topshiriqni yuboradi va vaqt boshlanadi. Ovozli javobdan keyin qolgan bo'limlarni chatda yoki shu ilovada (kodni qayta kiritib) davom ettirishingiz mumkin."),
-        el("button", {class: "btn block", onclick: () => handoff(t)}, "🎙 Botda ovozli javob berish"));
+        el("button", {class: "btn block cta", onclick: () => handoff(t)}, ic("mic"), "Botda ovozli javob berish"));
     } else {
-      actions.append(el("button", {class: "btn block", onclick: async () => {
-        if (!await confirmBox(`${current.name} bo'limini boshlaysizmi?`, `Vaqt: ${current.duration_min} daqiqa. Boshlangach taymer to'xtamaydi.`, "▶️ Boshlash")) return;
+      actions.append(el("button", {class: "btn block cta", onclick: async () => {
+        if (!await confirmBox(`${current.name} bo'limini boshlaysizmi?`, `Vaqt: ${current.duration_min} daqiqa. Boshlangach taymer to'xtamaydi.`, "Boshlash")) return;
         openSection(t);
-      }}, `▶️ ${current.name} bo'limini boshlash`));
+      }}, ic("play"), `${current.name} bo'limini boshlash`));
     }
   }
-  actions.append(el("button", {class: "btn block ghost", onclick: renderHome}, "🏠 Bosh sahifa"));
-  mount(el("div", {class: "screen"}, el("div", {class: "muted small"}, "Kod: " + t.code), el("h1", {}, t.title),
-    el("div", {class: "chips"}, el("span", {class: "chip acc"}, t.exam_label)),
-    el("div", {class: "card"}, el("h2", {}, "Imtihon xaritasi"), list), actions));
+  actions.append(el("button", {class: "btn block ghost", onclick: renderHome}, ic("home"), "Bosh sahifa"));
+  mount(el("div", {class: "screen"},
+    band(el("div", {class: "eyebrow"}, "Kod: " + t.code), el("h1", {}, t.title),
+      el("div", {class: "chips"}, el("span", {class: "chip acc"}, t.exam_label))),
+    el("div", {class: "card lift"}, el("h2", {}, "Imtihon xaritasi"), list), actions));
 }
 async function openSection(t) {
   const done = overlay("Bo'lim ochilmoqda...");
   let p;
-  try { p = await api("/api/staged/section", {body: {test_id: t.id}}); }
+  try { p = await api("/api/staged/section", {body: {test_id: t.id}, idem: true}); }
   catch (e) { done(); return handleErr(e); }
   done();
   if (p.kind === "expired") {
-    toast(`⏱ «${p.section_name}» vaqti tugagan edi — saqlangan javoblar bilan topshirildi.`, 4000);
+    toast(`«${p.section_name}» vaqti tugagan edi — saqlangan javoblar bilan topshirildi.`, 4000);
     return p.finished ? renderResult(p.result) : renderOverview(p.overview);
   }
   if (p.handoff) {
-    try { return renderOverview(await api("/api/test/start", {body: {test_id: t.id}})); }
+    try { return renderOverview(await api("/api/test/start", {body: {test_id: t.id}, idem: true})); }
     catch (e) { return handleErr(e); }
   }
   if (p.type === "open_text") return renderWriting(p);
@@ -13936,9 +14209,9 @@ async function handoff(t) {
   try { await api("/api/staged/handoff", {body: {test_id: t.id}}); }
   catch (e) { done(); return handleErr(e); }
   done();
-  mount(el("div", {class: "screen center"}, el("div", {style: "font-size:52px"}, "🎙"), el("h2", {}, "Topshiriq bot chatiga yuborildi"),
-    el("p", {class: "muted"}, "Chatga qayting, topshiriqni o'qing va javobingizni ovozli xabar qilib yuboring. Vaqt boshlandi."),
-    el("button", {class: "btn", onclick: openBot}, "💬 Chatga qaytish")));
+  mount(centerMsg("mic", "Topshiriq bot chatiga yuborildi",
+    "Chatga qayting, topshiriqni o'qing va javobingizni ovozli xabar qilib yuboring. Vaqt boshlandi.",
+    el("button", {class: "btn cta", onclick: openBot}, ic("chat"), "Chatga qaytish")));
   setBack(renderHome);
 }
 
@@ -13970,40 +14243,42 @@ function renderSolve(p, sectionKey) {
   });
 
   const hasFiles = st.files.length > 0;
-  const timer = el("div", {class: "timer"}, "--:--");
+  const timer = el("div", {class: "timer", role: "timer"}, "--:--");
   const progT = el("div", {class: "t"}), progBar = el("i");
-  const saveSt = el("span", {class: "savest", title: "Saqlash holati"}, "");
+  const saveSt = el("span", {class: "savest", title: "Saqlash holati"});
   const tools = el("div", {style: "display:flex;gap:6px"});
-  if (st.tools.calculator) tools.append(el("button", {class: "icon-btn", title: "Kalkulyator", onclick: () => toggleCalc()}, "🧮"));
-  if (st.tools.reference) tools.append(el("button", {class: "icon-btn", title: "Formulalar", onclick: showReference}, "📐"));
-  tools.append(el("button", {class: "icon-btn", title: "Savollar xaritasi", onclick: () => showNavigator(st)}, "☰"));
+  if (st.tools.calculator) tools.append(el("button", {class: "icon-btn", title: "Kalkulyator", "aria-label": "Kalkulyator", onclick: () => toggleCalc()}, ic("calc")));
+  if (st.tools.reference) tools.append(el("button", {class: "icon-btn", title: "Formulalar", "aria-label": "Formulalar", onclick: showReference}, ic("ruler")));
+  tools.append(el("button", {class: "icon-btn", title: "Savollar xaritasi", "aria-label": "Savollar xaritasi", onclick: () => showNavigator(st)}, ic("grid")));
   const bar = el("div", {class: "sbar"}, timer, el("div", {class: "prog"}, progT, el("div", {class: "bar"}, progBar)), saveSt, tools);
 
   const ansPane = el("div", {class: "pane anspane active"});
   const pdfPane = el("div", {class: "pane pdfpane"});
   const seg = el("div", {class: "seg" + (hasFiles ? "" : " hidden")});
-  const segBtn = (key, txt) => el("button", {class: key === "ans" ? "on" : "", onclick: (ev) => {
+  const segBtn = (key, icon, txt) => el("button", {class: key === "ans" ? "on" : "", "data-pane": key, onclick: (ev) => {
     st.pane = key; seg.querySelectorAll("button").forEach(b => b.classList.toggle("on", b === ev.currentTarget));
     ansPane.classList.toggle("active", key === "ans"); pdfPane.classList.toggle("active", key === "pdf");
     if (key === "pdf") ensureFiles(st, pdfPane);
-  }}, txt);
-  seg.append(segBtn("pdf", "📄 Savollar"), segBtn("ans", "📝 Javoblar"));
-  const submitBtn = el("button", {class: "btn", onclick: () => askSubmit(st)}, "Yakunlash");
+  }}, ic(icon), txt);
+  seg.append(segBtn("pdf", "file", "Savollar"), segBtn("ans", "bubbles", "Javoblar"));
+  const submitBtn = el("button", {class: "btn cta", onclick: () => askSubmit(st)}, "Yakunlash");
   const foot = el("div", {class: "sfoot"}, submitBtn);
   const panes = el("div", {class: "panes"}, hasFiles ? pdfPane : null, ansPane);
   const root = el("div", {class: "solve"}, bar, seg, panes, foot);
   mount(root);
   st.ui = {timer, progT, progBar, saveSt, ansPane, pdfPane, submitBtn};
-  if (hasFiles && window.matchMedia("(min-width: 860px)").matches) ensureFiles(st, pdfPane);
+  // Savollar fayli darhol fonda yuklana boshlaydi — o'quvchi "Savollar"ni
+  // bosguncha (sekin internetda ham) tayyor bo'lib turadi.
+  if (hasFiles) ensureFiles(st, pdfPane);
   renderAnswers(st); updateProgress(st);
 
   const tick = () => {
     const remain = st.endTs - (Date.now() / 1000 + st.offset);
-    timer.textContent = "⏱ " + fmtTime(remain);
+    timer.replaceChildren(ic("clock"), fmtTime(remain));
     timer.className = "timer" + (remain <= 60 ? " crit" : remain <= 300 ? " warn" : "");
-    if (remain <= 300 && remain > 60 && !st.warned[5]) { st.warned[5] = 1; toast("⚠️ 5 daqiqa qoldi"); haptic("warning"); }
-    if (remain <= 60 && !st.warned[1]) { st.warned[1] = 1; toast("⚠️ 1 daqiqa qoldi!"); haptic("warning"); }
-    if (remain <= 0 && !st.submitted) { stopTick(); toast("⏱ Vaqt tugadi — javoblaringiz topshirilmoqda", 3000); doSubmit(st, true); }
+    if (remain <= 300 && remain > 60 && !st.warned[5]) { st.warned[5] = 1; toast("5 daqiqa qoldi"); haptic("warning"); }
+    if (remain <= 60 && !st.warned[1]) { st.warned[1] = 1; toast("1 daqiqa qoldi!"); haptic("warning"); }
+    if (remain <= 0 && !st.submitted) { stopTick(); toast("Vaqt tugadi — javoblaringiz topshirilmoqda", 3000); doSubmit(st, true); }
   };
   tick(); S.tick = setInterval(tick, 500);
 }
@@ -14021,9 +14296,9 @@ function renderAnswers(st) {
   const pane = st.ui.ansPane;
   const head = el("div", {class: "pane-head"},
     el("span", {}, st.view === "sheet" ? "Javoblar varaqasi" : "Bittalab ko'rinish"),
-    el("button", {class: "btn ghost", style: "min-height:32px;padding:4px 10px;font-size:13px", onclick: () => {
+    el("button", {class: "btn ghost", onclick: () => {
       st.view = st.view === "sheet" ? "card" : "sheet"; renderAnswers(st);
-    }}, st.view === "sheet" ? "▭ Bittalab" : "▦ Varaq"));
+    }}, ic(st.view === "sheet" ? "card" : "list"), st.view === "sheet" ? "Bittalab" : "Varaq"));
   pane.replaceChildren(head, st.view === "sheet" ? buildSheet(st) : buildCard(st));
 }
 
@@ -14048,13 +14323,14 @@ function buildSheet(st) {
   });
   return wrap;
 }
+const FLAG_SVG = svgStr("flag");
 function buildRow(st, q) {
   const row = el("div", {class: "qrow" + (q % 2 === 0 ? " alt" : "") + (isAnswered(st, q) ? " done" : ""), "data-q": q, id: "row" + q});
   row.append(el("button", {class: "qn", title: "Bittalab ko'rinishda ochish"}, q));
   if (st.open.has(q)) {
     const oa = st.openAnswers[String(q)];
-    const label = oa && (oa.text || oa.photo_id) ? ("✅ " + (oa.text ? oa.text : "📷 Rasm biriktirilgan")) : "✍️ Yozma javob (bosing)";
-    row.append(el("button", {class: "openbtn" + (oa && (oa.text || oa.photo_id) ? " has" : "")}, label));
+    const has = oa && (oa.text || oa.photo_id);
+    row.append(el("button", {class: "openbtn" + (has ? " has" : "")}, has ? (oa.text ? oa.text : "Rasm biriktirilgan") : "Yozma javob — bosing"));
   } else {
     const bubs = el("div", {class: "bubs" + (st.nOpts > 4 ? " many" : "")});
     for (let i = 0; i < st.nOpts; i++) {
@@ -14063,7 +14339,8 @@ function buildRow(st, q) {
     }
     row.append(bubs);
   }
-  row.append(el("button", {class: "flagb" + (st.flags.has(q) ? " on" : ""), title: "Keyinroq qaytish uchun belgilash"}, "⚑"));
+  row.append(el("button", {class: "flagb" + (st.flags.has(q) ? " on" : ""), title: "Keyinroq qaytish uchun belgilash", "aria-label": `${q}-savolni belgilash`,
+    html: `<span class="i" aria-hidden="true">${FLAG_SVG}</span>`}));
   return row;
 }
 function refreshRow(st, q) {
@@ -14074,35 +14351,35 @@ function refreshRow(st, q) {
 function buildCard(st) {
   const q = st.current, sq = String(q);
   const box = el("div", {class: "qcard"});
-  const flagBtn = el("button", {class: "btn ghost", style: "min-height:34px;padding:4px 10px;font-size:13px" + (st.flags.has(q) ? ";color:var(--flag)" : ""),
-    onclick: () => { toggleFlag(st, q); renderAnswers(st); }}, st.flags.has(q) ? "⚑ Belgilangan" : "⚑ Belgilash");
+  const flagBtn = el("button", {class: "btn ghost" + (st.flags.has(q) ? " flagged" : ""),
+    onclick: () => { toggleFlag(st, q); renderAnswers(st); }}, ic("flag"), st.flags.has(q) ? "Belgilangan" : "Belgilash");
   box.append(el("div", {class: "ch"}, el("div", {}, el("b", {}, q + "-savol"), el("span", {class: "muted"}, " / " + st.qcount)), flagBtn));
   if (st.open.has(q)) {
     const oa = st.openAnswers[sq] || {};
     const ta = el("textarea", {class: "ta", maxlength: "500", placeholder: "Javobingizni shu yerga yozing..."});
     ta.value = oa.text || "";
     ta.addEventListener("input", () => setOpen(st, q, ta.value, (st.openAnswers[sq] || {}).photo_id || null, true));
-    box.append(el("div", {class: "status warn small"}, "❗️ Bu savol variantsiz — javobni matn bilan yozing (yoki yechimingiz rasmini yuboring)."),
+    box.append(statusBox("warn", "Bu savol variantsiz — javobni matn bilan yozing (yoki yechimingiz rasmini yuboring)."),
       ta, photoControl(st, q));
   } else {
     const elim = st.elim[q] || (st.elim[q] = new Set());
     for (let i = 0; i < st.nOpts; i++) {
       const l = LETTERS[i].toLowerCase();
       const on = st.answers[sq] === l, crossed = elim.has(l);
-      const opt = el("div", {class: "opt" + (on ? " on" : "") + (crossed ? " elim" : "")},
-        el("div", {class: "ol"}, LETTERS[i]), el("div", {class: "lbl"}, `${LETTERS[i]} variant`),
-        st.tools.eliminator ? el("button", {class: "strike", title: "Variantni chiqarib tashlash", onclick: e => {
+      const opt = el("div", {class: "opt" + (on ? " on" : "") + (crossed ? " elim" : ""), role: "button", tabindex: "0"},
+        el("div", {class: "ol"}, LETTERS[i]), el("div", {class: "lbl2"}, `${LETTERS[i]} variant`),
+        st.tools.eliminator ? el("button", {class: "strike", title: "Variantni chiqarib tashlash", "aria-label": `${LETTERS[i]} variantni chiqarib tashlash`, onclick: e => {
           e.stopPropagation(); if (elim.has(l)) elim.delete(l); else { elim.add(l); if (st.answers[sq] === l) setAnswer(st, q, null); }
           renderAnswers(st);
-        }}, crossed ? "↺" : "✕") : null);
+        }}, ic(crossed ? "undo" : "x")) : null);
       opt.addEventListener("click", () => { setAnswer(st, q, on ? null : l); renderAnswers(st); });
       box.append(opt);
     }
   }
   box.append(el("div", {class: "cnav"},
-    el("button", {class: "btn ghost", disabled: q <= 1, onclick: () => { st.current = q - 1; renderAnswers(st); scheduleSave(st); }}, "⬅️ Oldingi"),
-    q < st.qcount ? el("button", {class: "btn", onclick: () => { st.current = q + 1; renderAnswers(st); scheduleSave(st); }}, "Keyingi ➡️")
-      : el("button", {class: "btn", onclick: () => askSubmit(st)}, "✅ Yakunlash")));
+    el("button", {class: "btn ghost", disabled: q <= 1, onclick: () => { st.current = q - 1; renderAnswers(st); scheduleSave(st); }}, ic("left"), "Oldingi"),
+    q < st.qcount ? el("button", {class: "btn", onclick: () => { st.current = q + 1; renderAnswers(st); scheduleSave(st); }}, "Keyingi", ic("chev"))
+      : el("button", {class: "btn cta", onclick: () => askSubmit(st)}, ic("check"), "Yakunlash")));
   return box;
 }
 
@@ -14141,24 +14418,25 @@ function photoControl(st, q) {
         const fd = new FormData();
         fd.append("test_id", st.testId); if (st.sectionKey) fd.append("section_key", st.sectionKey);
         fd.append("q", String(q)); fd.append("file", blob, "javob.jpg");
-        const r = await api("/api/upload_photo", {form: fd});
+        const r = await api("/api/upload_photo", {form: fd, timeout: 90000});
         st.photos[sq] = URL.createObjectURL(blob);
         setOpen(st, q, (st.openAnswers[sq] || {}).text || "", r.photo_id);
-        toast("📷 Rasm biriktirildi"); haptic("ok");
+        toast("Rasm biriktirildi"); haptic("ok");
       } catch (e) { handleErr(e); }
       done(); draw();
     });
-    const kids = [file, el("button", {class: "btn ghost", onclick: () => file.click()}, oa.photo_id ? "📷 Rasmni almashtirish" : "📷 Rasm biriktirish")];
+    const kids = [file, el("button", {class: "btn ghost", onclick: () => file.click()}, ic("camera"), oa.photo_id ? "Rasmni almashtirish" : "Rasm biriktirish")];
     if (oa.photo_id) {
-      kids.push(el("button", {class: "btn ghost", style: "margin-left:8px", onclick: () => { setOpen(st, q, oa.text || "", null); draw(); }}, "🗑"));
+      kids.push(el("button", {class: "btn ghost", style: "margin-left:8px", "aria-label": "Rasmni olib tashlash", onclick: () => { setOpen(st, q, oa.text || "", null); draw(); }}, ic("trash")));
       if (st.photos[sq]) kids.push(el("img", {class: "thumb", src: st.photos[sq], alt: "javob rasmi"}));
-      else kids.push(el("div", {class: "muted small", style: "margin-top:6px"}, "✅ Rasm biriktirilgan"));
+      else kids.push(el("div", {class: "muted small", style: "margin-top:6px"}, "Rasm biriktirilgan"));
     }
     wrap.replaceChildren(...kids);
   };
   draw();
   return wrap;
 }
+// Rasm yuborishdan oldin kichraytiriladi (1600px, JPEG 80%) — sekin internetda tez ketadi.
 async function compressImage(file) {
   try {
     const bmp = await createImageBitmap(file);
@@ -14166,7 +14444,7 @@ async function compressImage(file) {
     const c = document.createElement("canvas");
     c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
     c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
-    return await new Promise(res => c.toBlob(b => res(b || file), "image/jpeg", 0.85));
+    return await new Promise(res => c.toBlob(b => res(b || file), "image/jpeg", 0.8));
   } catch (e) { return file; }
 }
 function openEditor(st, q) {
@@ -14180,16 +14458,16 @@ function openEditor(st, q) {
   const s = sheet(el("h2", {}, `${q}-savol — yozma javob`), el("p", {class: "muted small"}, "Kalit bilan avtomatik tekshiriladi. Rasm yuborsangiz, ustoz tekshiradi."),
     ta, cnt, photoControl(st, q),
     el("div", {style: "height:12px"}),
-    el("button", {class: "btn block", onclick: () => { s.remove(); refreshRow(st, q); }}, "✅ Saqlash"));
+    el("button", {class: "btn block cta", onclick: () => { s.remove(); refreshRow(st, q); }}, ic("check"), "Saqlash"));
   setTimeout(() => ta.focus(), 120);
   s.addEventListener("click", e => { if (e.target === s) refreshRow(st, q); });
 }
 
 function goToQuestion(st, q) {
   st.current = q;
-  // ✅ Avval "Javoblar" panelini ochamiz — yashirin (display:none) panelda
+  // Avval "Javoblar" panelini ochamiz — yashirin (display:none) panelda
   // kerakli qatorga aylantirib bo'lmaydi.
-  if (st.pane !== "ans") { const b = document.querySelector(".seg button:last-child"); if (b) b.click(); }
+  if (st.pane !== "ans") { const b = document.querySelector('.seg button[data-pane="ans"]'); if (b) b.click(); }
   if (st.view === "card") return renderAnswers(st);
   requestAnimationFrame(() => {
     const r = document.getElementById("row" + q);
@@ -14207,10 +14485,10 @@ function showNavigator(st) {
   const firstFlag = Array.from(st.flags).sort((a, b) => a - b)[0];
   const s = sheet(el("h2", {}, "Savollar xaritasi"), el("div", {class: "muted small"}, `Javob berilgan: ${n}/${st.qcount} · Belgilangan: ${st.flags.size}`),
     el("div", {class: "row-btns", style: "margin-top:10px"},
-      miss.length ? el("button", {class: "btn ghost", onclick: () => { s.remove(); goToQuestion(st, miss[0]); }}, `➡️ Javobsiz: ${miss[0]}`) : null,
-      firstFlag ? el("button", {class: "btn ghost", onclick: () => { s.remove(); goToQuestion(st, firstFlag); }}, `⚑ Belgilangan: ${firstFlag}`) : null),
+      miss.length ? el("button", {class: "btn ghost", onclick: () => { s.remove(); goToQuestion(st, miss[0]); }}, ic("chev"), `Javobsiz: ${miss[0]}`) : null,
+      firstFlag ? el("button", {class: "btn ghost", onclick: () => { s.remove(); goToQuestion(st, firstFlag); }}, ic("flag"), `Belgilangan: ${firstFlag}`) : null),
     grid, el("div", {class: "legend"}, el("span", {}, el("i", {style: "background:var(--accent);border-color:var(--accent)"}), "javob berilgan"),
-      el("span", {}, el("i", {style: "box-shadow:0 0 0 2px var(--flag)"}), "belgilangan"), el("span", {}, el("i", {}), "javobsiz"), el("span", {}, "✍ — ochiq savol")));
+      el("span", {}, el("i", {style: "box-shadow:0 0 0 2px var(--gold)"}), "belgilangan"), el("span", {}, el("i", {}), "javobsiz"), el("span", {}, "✍ — ochiq savol")));
 }
 
 /* ------------ avtomatik saqlash ------------ */
@@ -14218,11 +14496,13 @@ function savePayload(st) {
   return {test_id: st.testId, section_key: st.sectionKey, answers: st.answers, open_answers: st.openAnswers,
           flags: Array.from(st.flags), current_q: st.current};
 }
-function setSaveState(st, s) {
-  if (!st.ui) return;
-  st.ui.saveSt.textContent = {saving: "⏳", ok: "✓", offline: "⚠️", "": ""}[s] || "";
-  st.ui.saveSt.title = {saving: "Saqlanmoqda...", ok: "Saqlandi", offline: "Internet yo'q — javoblar qurilmada saqlandi"}[s] || "";
+function setSaveIcon(node, s) {
+  if (!node) return;
+  node.className = "savest" + (s === "ok" ? " ok" : s === "offline" ? " off" : "");
+  node.innerHTML = s ? `<span class="i" aria-hidden="true">${svgStr({saving: "dots", ok: "check", offline: "wifioff"}[s])}</span>` : "";
+  node.title = {saving: "Saqlanmoqda...", ok: "Saqlandi", offline: "Internet yo'q — javoblar qurilmada saqlandi"}[s] || "";
 }
+function setSaveState(st, s) { if (st.ui) setSaveIcon(st.ui.saveSt, s); }
 function scheduleSave(st) {
   if (st.submitted) return;
   lsSet(lsKeyFor(st), {answers: st.answers, openAnswers: st.openAnswers, flags: Array.from(st.flags), ts: Math.floor(Date.now() / 1000 + st.offset)});
@@ -14236,11 +14516,17 @@ async function flushSave(st) {
   if (st.saving) { st.again = true; return; }
   st.saving = true;
   try {
-    const r = await api("/api/test/save", {body: savePayload(st)});
+    const r = await api("/api/test/save", {body: savePayload(st), idem: true, retries: 1, timeout: 15000});
     if (r.end_ts) st.endTs = r.end_ts;
+    st.saveFails = 0;
     setSaveState(st, "ok");
   } catch (e) {
-    if (e.network) { setSaveState(st, "offline"); st.saveTimer = setTimeout(() => flushSave(st), 5000); }
+    if (e.network) {
+      // javoblar qurilmada turibdi; aloqa tiklanguncha borgan sari kamroq urinamiz
+      st.saveFails = (st.saveFails || 0) + 1;
+      setSaveState(st, "offline");
+      st.saveTimer = setTimeout(() => flushSave(st), Math.min(30000, 4000 * st.saveFails));
+    }
     else if (e.error === "time_over" || e.error === "no_session" || e.error === "stale") { setSaveState(st, ""); }
     else setSaveState(st, "offline");
   }
@@ -14249,8 +14535,8 @@ async function flushSave(st) {
 }
 document.addEventListener("visibilitychange", () => {
   const st = S.st;
-  if (document.visibilityState === "hidden" && st && !st.submitted && st.ui) {
-    fetch(st.writing ? "/api/test/save" : "/api/test/save", {method: "POST", keepalive: true,
+  if (document.visibilityState === "hidden" && st && !st.submitted && (st.ui || st.writing)) {
+    fetch("/api/test/save", {method: "POST", keepalive: true,
       headers: {"X-Telegram-Init-Data": initData, "Content-Type": "application/json"},
       body: JSON.stringify(st.writing ? writingPayload(st) : savePayload(st))}).catch(() => {});
   }
@@ -14258,12 +14544,12 @@ document.addEventListener("visibilitychange", () => {
 
 /* ------------ topshirish ------------ */
 async function askSubmit(st) {
-  const n = answeredCount(st), missList = unansweredList(st), miss = missList.length;
+  const missList = unansweredList(st), miss = missList.length;
   const lines = [];
   if (miss) lines.push(`${miss} ta savol javobsiz qolgan: ${missList.slice(0, 12).join(", ")}${miss > 12 ? " va boshqalar." : "."}`);
   if (st.flags.size) lines.push(`${st.flags.size} ta savol "keyinroq qaytish" uchun belgilangan.`);
   lines.push(st.sectionKey ? "Bo'lim yakunlangach unga qaytib bo'lmaydi." : "Topshirgandan keyin javoblarni o'zgartirib bo'lmaydi.");
-  if (await confirmBox(st.sectionKey ? "Bo'limni yakunlaysizmi?" : "Testni yakunlaysizmi?", lines.join(" "), "✅ Ha, topshirish")) doSubmit(st, false);
+  if (await confirmBox(st.sectionKey ? "Bo'limni yakunlaysizmi?" : "Testni yakunlaysizmi?", lines.join(" "), "Ha, topshirish")) doSubmit(st, false);
 }
 async function doSubmit(st, auto) {
   if (st.submitted) return;
@@ -14271,20 +14557,29 @@ async function doSubmit(st, auto) {
   const done = overlay(auto ? "Vaqt tugadi — topshirilmoqda..." : "Javoblar baholanmoqda...");
   try {
     let r;
-    if (st.sectionKey) r = await api("/api/staged/submit", {body: savePayload(st)});
-    else r = await api("/api/test/submit", {body: {test_id: st.testId, answers: st.answers, open_answers: st.openAnswers}});
+    if (st.sectionKey) r = await api("/api/staged/submit", {body: savePayload(st), timeout: 60000});
+    else r = await api("/api/test/submit", {body: {test_id: st.testId, answers: st.answers, open_answers: st.openAnswers}, timeout: 60000});
     lsDel(lsKeyFor(st));
     done(); haptic("ok"); closeCalc();
     if (tg) { try { tg.disableClosingConfirmation(); } catch (e) {} }
     S.st = null;
-    if (st.sectionKey && !r.finished) { toast(`✅ «${st.name}» topshirildi`); return renderOverview(r.overview); }
+    if (st.sectionKey && !r.finished) { toast(`«${st.name}» topshirildi`); return renderOverview(r.overview); }
     renderResult(r.result);
   } catch (e) {
     done();
     if (e.network) {
+      // So'rov serverga yetib borgan bo'lishi mumkin — avval natija bor-yo'qligini tekshiramiz.
+      try {
+        const rr = await api("/api/result/" + st.testId, {timeout: 15000});
+        if (!st.sectionKey && rr.result && rr.result.state !== "none") {
+          lsDel(lsKeyFor(st)); S.st = null; closeCalc();
+          if (tg) { try { tg.disableClosingConfirmation(); } catch (x) {} }
+          return renderResult(rr.result);
+        }
+      } catch (x) {}
       st.submitted = false; toast("Internet yo'q — javoblar saqlangan. Aloqa tiklangach qayta bosing.", 4000);
       if (!auto) return;
-      setTimeout(() => doSubmit(st, true), 4000); return;
+      setTimeout(() => doSubmit(st, true), 5000); return;
     }
     if (e.error === "stale" || e.error === "no_session") {
       S.st = null; toast(e.message, 3500);
@@ -14303,21 +14598,22 @@ function renderWriting(p) {
   stopTick(); showTabs(false);
   const st = {writing: true, testId: p.test.id, sectionKey: p.key, name: p.name, text: p.text || "", photoId: p.photo_id || null,
     endTs: p.end_ts, offset: p.server_now - Date.now() / 1000, submitted: false, saveTimer: null, warned: {}, qcount: 0};
-  const local = lsGet(`et:${S.uid}:${st.testId}:${st.sectionKey}:${st.endTs}`);
+  const lkey = `et:${S.uid}:${st.testId}:${st.sectionKey}:${st.endTs}`;
+  const local = lsGet(lkey);
   if (local && local.ts > (p.updated || 0) && typeof local.text === "string") st.text = local.text;
   S.st = st;
   if (tg) { try { tg.enableClosingConfirmation(); } catch (e) {} }
   setBack(async () => { if (await confirmBox("Bo'limdan chiqasizmi?", "Matningiz saqlangan, vaqt ketaveradi.", "Chiqish")) { await saveWriting(st); renderHome(); } });
-  const timer = el("div", {class: "timer"}, "--:--");
+  const timer = el("div", {class: "timer", role: "timer"}, "--:--");
   const saveSt = el("span", {class: "savest"});
   const ta = el("textarea", {class: "ta big", maxlength: String(p.text_max || 4000), placeholder: "Javobingizni shu yerga yozing..."});
   ta.value = st.text;
   const words = el("div", {class: "words"});
   const upd = () => { const w = ta.value.trim() ? ta.value.trim().split(/\s+/).length : 0; words.textContent = `${w} so'z · ${ta.value.length}/${p.text_max || 4000} belgi`; };
   ta.addEventListener("input", () => {
-    st.text = ta.value; upd(); saveSt.textContent = "⏳";
-    lsSet(`et:${S.uid}:${st.testId}:${st.sectionKey}:${st.endTs}`, {text: st.text, ts: Math.floor(Date.now() / 1000 + st.offset)});
-    clearTimeout(st.saveTimer); st.saveTimer = setTimeout(() => saveWriting(st).then(ok => { saveSt.textContent = ok ? "✓" : "⚠️"; }), 1500);
+    st.text = ta.value; upd(); setSaveIcon(saveSt, "saving");
+    lsSet(lkey, {text: st.text, ts: Math.floor(Date.now() / 1000 + st.offset)});
+    clearTimeout(st.saveTimer); st.saveTimer = setTimeout(() => saveWriting(st).then(ok => setSaveIcon(saveSt, ok ? "ok" : "offline")), 1500);
   });
   upd();
   const photoBox = el("div", {});
@@ -14329,94 +14625,156 @@ function renderWriting(p) {
       try {
         const blob = await compressImage(file.files[0]);
         const fd = new FormData(); fd.append("test_id", st.testId); fd.append("section_key", st.sectionKey); fd.append("file", blob, "javob.jpg");
-        const r = await api("/api/upload_photo", {form: fd});
-        st.photoId = r.photo_id; st.photoUrl = URL.createObjectURL(blob); await saveWriting(st); toast("📷 Rasm biriktirildi");
+        const r = await api("/api/upload_photo", {form: fd, timeout: 90000});
+        st.photoId = r.photo_id; st.photoUrl = URL.createObjectURL(blob); await saveWriting(st); toast("Rasm biriktirildi");
       } catch (e) { handleErr(e); }
       done(); drawPhoto();
     });
-    photoBox.replaceChildren(...clean([file, el("button", {class: "btn ghost", onclick: () => file.click()}, st.photoId ? "📷 Rasmni almashtirish" : "📷 Qo'lda yozilgan javob rasmini biriktirish"),
-      st.photoId ? (st.photoUrl ? el("img", {class: "thumb", src: st.photoUrl}) : el("div", {class: "muted small"}, "✅ Rasm biriktirilgan")) : null]));
+    photoBox.replaceChildren(...clean([file, el("button", {class: "btn ghost", onclick: () => file.click()}, ic("camera"), st.photoId ? "Rasmni almashtirish" : "Qo'lda yozilgan javob rasmini biriktirish"),
+      st.photoId ? (st.photoUrl ? el("img", {class: "thumb", src: st.photoUrl, alt: "javob rasmi"}) : el("div", {class: "muted small"}, "Rasm biriktirilgan")) : null]));
   };
   drawPhoto();
   const submit = async () => {
     if (!st.text.trim() && !st.photoId) return toast("Avval javob yozing yoki rasm biriktiring");
-    if (!await confirmBox("Bo'limni yakunlaysizmi?", "Topshirgandan keyin matnni o'zgartirib bo'lmaydi.", "✅ Topshirish")) return;
+    if (!await confirmBox("Bo'limni yakunlaysizmi?", "Topshirgandan keyin matnni o'zgartirib bo'lmaydi.", "Topshirish")) return;
     submitWriting(st);
   };
   mount(el("div", {class: "solve"},
     el("div", {class: "sbar"}, timer, el("div", {class: "prog"}, el("div", {class: "t"}, p.name)), saveSt),
     el("div", {class: "pane active", style: "padding:12px 14px"},
-      el("div", {class: "card", style: "margin-top:0"}, el("div", {class: "muted small"}, "✍️ Topshiriq"), el("div", {class: "prompt"}, p.prompt)),
+      el("div", {class: "card", style: "margin-top:0"}, el("div", {class: "lbl"}, "Topshiriq"), el("div", {class: "prompt"}, p.prompt)),
       ta, words, el("div", {style: "height:10px"}), photoBox),
-    el("div", {class: "sfoot"}, el("button", {class: "btn", onclick: submit}, "✅ Bo'limni topshirish"))));
+    el("div", {class: "sfoot"}, el("button", {class: "btn cta", onclick: submit}, ic("check"), "Bo'limni topshirish"))));
   const tick = () => {
     const remain = st.endTs - (Date.now() / 1000 + st.offset);
-    timer.textContent = "⏱ " + fmtTime(remain);
+    timer.replaceChildren(ic("clock"), fmtTime(remain));
     timer.className = "timer" + (remain <= 60 ? " crit" : remain <= 300 ? " warn" : "");
-    if (remain <= 0 && !st.submitted) { stopTick(); toast("⏱ Vaqt tugadi — matningiz topshirilmoqda"); submitWriting(st, true); }
+    if (remain <= 0 && !st.submitted) { stopTick(); toast("Vaqt tugadi — matningiz topshirilmoqda"); submitWriting(st, true); }
   };
   tick(); S.tick = setInterval(tick, 500);
 }
 async function saveWriting(st) {
   if (st.submitted) return true;
-  try { await api("/api/test/save", {body: writingPayload(st)}); return true; } catch (e) { return false; }
+  try { await api("/api/test/save", {body: writingPayload(st), idem: true, retries: 1, timeout: 15000}); return true; } catch (e) { return false; }
 }
 async function submitWriting(st, auto) {
   if (st.submitted) return;
   st.submitted = true; stopTick(); clearTimeout(st.saveTimer);
   const done = overlay("Topshirilmoqda... (AI tekshirsa bir necha soniya davom etadi)");
   try {
-    const r = await api("/api/staged/submit", {body: writingPayload(st)});
+    const r = await api("/api/staged/submit", {body: writingPayload(st), timeout: 90000});
     lsDel(`et:${S.uid}:${st.testId}:${st.sectionKey}:${st.endTs}`);
     done(); haptic("ok"); S.st = null;
     if (tg) { try { tg.disableClosingConfirmation(); } catch (e) {} }
-    if (!r.finished) { toast(`✅ «${st.name}» topshirildi`); return renderOverview(r.overview); }
+    if (!r.finished) { toast(`«${st.name}» topshirildi`); return renderOverview(r.overview); }
     renderResult(r.result);
   } catch (e) {
     done(); st.submitted = false;
-    if (e.network && auto) { setTimeout(() => submitWriting(st, true), 4000); return; }
+    if (e.network && auto) { setTimeout(() => submitWriting(st, true), 5000); return; }
     handleErr(e);
   }
 }
 
 /* ------------ fayllar: PDF / audio ------------ */
+// pdf.js (~1 MB) faqat PDF kerak bo'lganda yuklanadi — sahifa ochilishini sekinlashtirmaydi.
+let pdfJsP = null;
+function loadPdfJs() {
+  if (window.pdfjsLib) return Promise.resolve(true);
+  if (pdfJsP) return pdfJsP;
+  pdfJsP = new Promise(res => {
+    const s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+    s.onload = () => res(!!window.pdfjsLib);
+    s.onerror = () => { pdfJsP = null; s.remove(); res(false); };
+    document.head.append(s);
+  });
+  return pdfJsP;
+}
+// Fayl qismlab o'qiladi — sekin internetda yuklanish foizi ko'rinib turadi.
+async function readBlob(res, onProgress) {
+  const total = +res.headers.get("Content-Length") || 0;
+  if (!res.body || !res.body.getReader || !total) return await res.blob();
+  const reader = res.body.getReader(), chunks = [];
+  let got = 0;
+  for (;;) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    chunks.push(value); got += value.length;
+    onProgress(Math.min(1, got / total));
+  }
+  return new Blob(chunks, {type: res.headers.get("Content-Type") || ""});
+}
+async function fetchFile(url, onProgress) {
+  let lastErr;
+  for (let i = 0; i < 3; i++) {
+    try {
+      const res = await fetch(url, {headers: {"X-Telegram-Init-Data": initData}});
+      if (!res.ok) {
+        let m = "Faylni yuklab bo'lmadi."; try { m = (await res.json()).message || m; } catch (e) {}
+        if (res.status >= 500 && i < 2) { lastErr = new Error(m); await sleep(1500 * (i + 1)); continue; }
+        throw Object.assign(new Error(m), {final: true});
+      }
+      const blob = await readBlob(res, onProgress);
+      return {blob, ct: res.headers.get("Content-Type") || blob.type || ""};
+    } catch (e) {
+      if (e.final) throw e;
+      lastErr = e; await sleep(1500 * (i + 1));
+    }
+  }
+  throw new Error("Internet sekin — faylni yuklab bo'lmadi. Qayta urinib ko'ring.");
+}
 async function ensureFiles(st, pane) {
   if (st.filesLoaded) return;
   st.filesLoaded = true;
-  pane.replaceChildren(el("div", {class: "center", style: "min-height:40vh"}, el("div", {class: "spin dark"}), el("div", {class: "muted"}, "Fayl yuklanmoqda...")));
+  const lb = el("i");
+  const pct = el("div", {class: "muted small"}, "");
+  pane.replaceChildren(el("div", {class: "center", style: "min-height:40vh"}, el("div", {class: "spin dark"}),
+    el("div", {class: "muted"}, "Savollar fayli yuklanmoqda..."), el("div", {class: "loadbar"}, lb), pct));
+  if (st.files.some(f => !f.kind || f.kind === "document")) loadPdfJs();
   const parts = [];
+  let failed = false;
   for (const f of st.files) {
     const box = el("div", {});
     parts.push(box);
     try {
-      const res = await fetch(`/api/file/${st.testId}/${f.slot}`, {headers: {"X-Telegram-Init-Data": initData}});
-      if (!res.ok) { let m = "Faylni yuklab bo'lmadi."; try { m = (await res.json()).message || m; } catch (e) {} throw new Error(m); }
-      const ct = res.headers.get("Content-Type") || "";
-      const blob = await res.blob();
-      if (ct.includes("pdf")) await renderPdf(await blob.arrayBuffer(), box, pane);
-      else if (ct.startsWith("audio")) box.append(el("div", {class: "media"}, el("div", {class: "muted small"}, "🎧 Audio (Listening)"), el("audio", {controls: true, src: URL.createObjectURL(blob), preload: "auto"})));
+      const {blob, ct} = await fetchFile(`/api/file/${st.testId}/${f.slot}`, p => {
+        lb.style.width = Math.round(p * 100) + "%"; pct.textContent = Math.round(p * 100) + "%";
+      });
+      if (ct.includes("pdf")) await renderPdf(blob, box, pane);
+      else if (ct.startsWith("audio")) box.append(el("div", {class: "media"}, el("div", {class: "lbl"}, "Audio (Listening)"), el("audio", {controls: true, src: URL.createObjectURL(blob), preload: "auto"})));
       else if (ct.startsWith("video")) box.append(el("div", {class: "media"}, el("video", {controls: true, src: URL.createObjectURL(blob), playsinline: true})));
-      else if (ct.startsWith("image")) box.append(el("div", {class: "pdfwrap"}, el("img", {src: URL.createObjectURL(blob), class: "pdfpage", style: "width:100%"})));
-      else box.append(el("div", {class: "media"}, el("a", {href: URL.createObjectURL(blob), download: "savollar"}, "📥 Faylni yuklab olish")));
+      else if (ct.startsWith("image")) box.append(el("div", {class: "pdfwrap"}, el("img", {src: URL.createObjectURL(blob), class: "pdfpage", style: "width:100%", alt: "savollar"})));
+      else box.append(el("div", {class: "media"}, el("a", {href: URL.createObjectURL(blob), download: "savollar"}, "Faylni yuklab olish")));
     } catch (e) {
-      box.append(el("div", {class: "status bad", style: "margin:12px"}, "⚠️ " + (e.message || "Faylni yuklab bo'lmadi.")));
+      failed = true;
+      box.append(el("div", {style: "margin:12px"}, statusBox("bad", e.message || "Faylni yuklab bo'lmadi.")));
     }
   }
   // audio har doim tepada tursin
   parts.sort((a, b) => (b.querySelector("audio") ? 1 : 0) - (a.querySelector("audio") ? 1 : 0));
+  if (failed) {
+    st.filesLoaded = false;
+    parts.push(el("div", {style: "padding:0 12px"}, el("button", {class: "btn block cta", onclick: () => ensureFiles(st, pane)}, ic("refresh"), "Qayta yuklash")));
+  }
   pane.replaceChildren(...parts);
 }
-async function renderPdf(buf, box, pane) {
-  if (!window.pdfjsLib) { box.append(el("div", {class: "status bad", style: "margin:12px"}, "PDF ko'ruvchini yuklab bo'lmadi.")); return; }
+async function renderPdf(blob, box, pane) {
+  const ok = await loadPdfJs();
+  if (!ok || !window.pdfjsLib) {
+    // ko'ruvchi yuklanmasa ham fayl yo'qolmaydi — to'g'ridan-to'g'ri ochish mumkin
+    box.append(el("div", {style: "margin:12px"}, statusBox("warn", "PDF ko'ruvchini yuklab bo'lmadi (internet sekin)."),
+      el("a", {class: "btn block ghost", href: URL.createObjectURL(blob), target: "_blank", rel: "noopener"}, ic("file"), "PDF'ni ochish")));
+    return;
+  }
   pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
-  const pdf = await pdfjsLib.getDocument({data: buf}).promise;
+  const pdf = await pdfjsLib.getDocument({data: await blob.arrayBuffer()}).promise;
   let zoom = 1;
   const pages = el("div", {class: "pdfwrap"});
   const info = el("span", {}, `${pdf.numPages} sahifa`);
   const z = d => { zoom = Math.min(3, Math.max(0.6, zoom + d)); zl.textContent = Math.round(zoom * 100) + "%"; rerender(); };
   const zl = el("span", {}, "100%");
   const head = el("div", {class: "pane-head"}, info, el("div", {style: "display:flex;gap:6px;align-items:center"},
-    el("button", {class: "icon-btn", onclick: () => z(-0.2)}, "−"), zl, el("button", {class: "icon-btn", onclick: () => z(0.2)}, "+")));
+    el("button", {class: "icon-btn", "aria-label": "Kichraytirish", onclick: () => z(-0.2)}, "−"), zl, el("button", {class: "icon-btn", "aria-label": "Kattalashtirish", onclick: () => z(0.2)}, "+")));
   box.append(head, pages);
   const slots = [];
   const io = new IntersectionObserver(ents => ents.forEach(en => { if (en.isIntersecting) draw(en.target); }), {root: pane, rootMargin: "600px 0px"});
@@ -14452,65 +14810,69 @@ async function showResult(testId) {
 }
 function ring(pct, label) {
   const p = Math.max(0, Math.min(100, pct || 0)), R = 62, C = 2 * Math.PI * R;
-  const color = p >= 70 ? "var(--ok)" : p >= 50 ? "var(--warn)" : "var(--bad)";
-  const svg = `<svg class="ring" viewBox="0 0 150 150"><circle cx="75" cy="75" r="${R}" fill="none" stroke="rgba(127,127,127,.18)" stroke-width="12"/>
+  const color = p >= 70 ? "var(--ok)" : p >= 50 ? "var(--gold)" : "var(--bad)";
+  const svg = `<svg class="ring" viewBox="0 0 150 150" role="img"><circle cx="75" cy="75" r="${R}" fill="none" stroke="var(--soft)" stroke-width="12"/>
     <circle cx="75" cy="75" r="${R}" fill="none" stroke="${color}" stroke-width="12" stroke-linecap="round" stroke-dasharray="${C}" stroke-dashoffset="${C * (1 - p / 100)}" transform="rotate(-90 75 75)"/>
-    <text x="75" y="${label ? 76 : 84}" text-anchor="middle" font-size="30" fill="currentColor">${label ? "" : (Number.isInteger(p) ? p : p.toFixed(1)) + "%"}</text></svg>`;
+    <text x="75" y="${label ? 85 : 85}" text-anchor="middle" font-size="30" fill="var(--ink)"></text></svg>`;
   const d = el("div", {html: svg});
-  if (label) d.querySelector("text").textContent = label;
+  const txt = label ? label : (Number.isInteger(p) ? p : p.toFixed(1)) + "%";
+  d.querySelector("text").textContent = txt;
+  d.querySelector("svg").setAttribute("aria-label", "Natija: " + txt);
   return d;
 }
 function renderResult(v) {
   stopTick(); closeCalc(); showTabs(false); setBack(renderHome); S.st = null;
   if (tg) { try { tg.disableClosingConfirmation(); } catch (e) {} }
   const t = v.test;
-  const kids = [el("div", {class: "muted small"}, `${t.exam_label} · ${t.code}`), el("h1", {}, t.title)];
+  const kids = [band(el("div", {class: "eyebrow"}, `${t.exam_label} · ${t.code}`), el("h1", {}, t.title))];
+  let first = true;
+  const card = (...c) => { const k = el("div", {class: "card" + (first ? " lift" : "")}, ...c); first = false; return k; };
   if (v.state === "none") {
-    kids.push(el("div", {class: "status warn"}, "Bu test bo'yicha natija hali yo'q."));
+    kids.push(card(statusBox("warn", "Bu test bo'yicha natija hali yo'q.")));
   } else if (v.state === "staged") {
     const pend = v.status === "pending_review";
-    const big = v.overall_grade != null && !pend ? String(v.overall_grade) : "⏳";
-    kids.push(el("div", {class: "card", style: "text-align:center"}, ring(pend ? 0 : (v.percent != null ? v.percent : 0), big),
-      el("div", {class: "muted"}, pend ? "Ustoz (yoki AI) baholayapti — yakuniy natija botga keladi." : "Umumiy natija")));
+    const big = v.overall_grade != null && !pend ? String(v.overall_grade) : "…";
+    kids.push(card(ring(pend ? 0 : (v.percent != null ? v.percent : 0), big),
+      el("div", {class: "muted", style: "text-align:center"}, pend ? "Ustoz (yoki AI) baholayapti — yakuniy natija botga keladi." : "Umumiy natija")));
     const tb = el("table", {class: "tb"}, el("tr", {}, el("th", {}, "Bo'lim"), el("th", {}, "Natija"), el("th", {}, "Daraja/ball")));
     v.sections.forEach(s => tb.append(el("tr", {}, el("td", {}, s.name),
       el("td", {}, s.total != null ? `${s.score}/${s.total}` : (s.submitted ? "topshirildi" : "—")),
-      el("td", {}, s.band != null ? String(s.band) : (s.earned != null ? `${(+s.earned).toFixed(1)}/${(+s.max).toFixed(1)}` : (s.submitted ? "⏳" : "—"))))));
-    kids.push(el("div", {class: "card"}, el("h2", {}, "Bo'limlar"), tb));
-    v.sections.filter(s => s.feedback).forEach(s => kids.push(el("div", {class: "card"}, el("b", {}, s.name + " — fikr-mulohaza"), el("p", {class: "prompt"}, s.feedback))));
+      el("td", {}, s.band != null ? String(s.band) : (s.earned != null ? `${(+s.earned).toFixed(1)}/${(+s.max).toFixed(1)}` : (s.submitted ? "tekshirilmoqda" : "—"))))));
+    kids.push(el("div", {class: "sect"}, "Bo'limlar"), el("div", {class: "card", style: "margin-top:0"}, tb));
+    v.sections.filter(s => s.feedback).forEach(s => kids.push(el("div", {class: "card"}, el("h2", {}, s.name + " — fikr-mulohaza"), el("p", {class: "prompt", style: "margin:0"}, s.feedback))));
   } else {
     const rasch = v.rasch;
-    let big;
-    if (rasch && !rasch.finalized) kids.push(el("div", {class: "card", style: "text-align:center"}, ring(0, "⏳"),
-      el("div", {}, "⚡ Rasch ball test yakunlangach hammaga bir vaqtda e'lon qilinadi."), el("div", {class: "muted small"}, rasch.remain_text || "")));
-    else if (rasch) kids.push(el("div", {class: "card", style: "text-align:center"}, ring(rasch.percent, (rasch.ball != null ? (+rasch.ball).toFixed(1) : "-")),
-      el("div", {}, "Rasch ball (0–75)"), rasch.grade ? el("div", {class: "chips", style: "justify-content:center"}, el("span", {class: "chip acc"}, "Daraja: " + rasch.grade)) : null));
-    else kids.push(el("div", {class: "card", style: "text-align:center"}, ring(v.percent),
+    if (rasch && !rasch.finalized) kids.push(card(ring(0, "…"),
+      el("div", {style: "text-align:center"}, "Rasch ball test yakunlangach hammaga bir vaqtda e'lon qilinadi."), el("div", {class: "muted small", style: "text-align:center"}, rasch.remain_text || "")));
+    else if (rasch) kids.push(card(ring(rasch.percent, (rasch.ball != null ? (+rasch.ball).toFixed(1) : "-")),
+      el("div", {class: "muted", style: "text-align:center"}, "Rasch ball (0–75)"), rasch.grade ? el("div", {class: "chips", style: "justify-content:center"}, el("span", {class: "chip acc"}, "Daraja: " + rasch.grade)) : null));
+    else kids.push(card(ring(v.percent),
       v.grade ? el("div", {class: "chips", style: "justify-content:center"}, el("span", {class: "chip acc"}, gradeLabel(t.exam_type) + v.grade)) : null));
     if (!rasch || rasch.finalized) {
       const wrong = (v.scored_total != null ? v.scored_total : v.total) - v.score;
       kids.push(el("div", {class: "stats"}, el("div", {class: "stat"}, el("b", {style: "color:var(--ok)"}, v.score), el("span", {}, "to'g'ri")),
         el("div", {class: "stat"}, el("b", {style: "color:var(--bad)"}, Math.max(0, wrong)), el("span", {}, "xato/javobsiz")),
         el("div", {class: "stat"}, el("b", {}, (v.percent || 0).toFixed(1) + "%"), el("span", {}, "foiz"))));
-    } else kids.push(el("div", {class: "status"}, "📊 Javoblaringiz qabul qilindi."));
-    if (t.exam_type === "dtm" && v.max) kids.push(el("div", {class: "card"}, el("div", {class: "kv"}, el("span", {}, "🏁 DTM ball"), el("b", {}, `${(+v.earned).toFixed(1)} / ${(+v.max).toFixed(1)}`)),
-      ...(v.subjects || []).map(s => el("div", {class: "kv"}, el("span", {}, `${s.name} (${s.q} savol × ${s.w})`), el("span", {}, `${s.correct} ta · ${(+s.earned).toFixed(1)} ball`)))));
-    if (v.open_pending) kids.push(el("div", {class: "status warn"}, `✍️ ${v.open_pending} ta ochiq javobingizni ustoz tekshiradi — yakuniy natija botga keladi.`));
+    } else kids.push(statusBox("", "Javoblaringiz qabul qilindi."));
+    if (t.exam_type === "dtm" && v.max) kids.push(el("div", {class: "card"}, el("div", {class: "kv hero"}, el("span", {}, "DTM ball"), el("b", {}, `${(+v.earned).toFixed(1)} / ${(+v.max).toFixed(1)}`)),
+      ...(v.subjects || []).map(s => el("div", {class: "kv"}, el("span", {}, `${s.name} (${s.q} savol × ${s.w})`), el("span", {class: "muted"}, `${s.correct} ta · ${(+s.earned).toFixed(1)} ball`)))));
+    if (v.open_pending) kids.push(statusBox("warn", `${v.open_pending} ta ochiq javobingizni ustoz tekshiradi — yakuniy natija botga keladi.`));
     if (v.review) {
       const grid = el("div", {class: "navgrid"});
       v.review.forEach(it => grid.append(el("button", {class: it.ok == null ? "pend" : it.ok ? "ok" : "bad", onclick: () => {
         toast(it.open ? `${it.n}-savol (ochiq): siz — «${it.you || "javobsiz"}», kalit — «${it.key || "-"}»` :
           `${it.n}-savol: siz — ${it.you || "javobsiz"}, to'g'ri — ${it.key}`, 3500);
       }}, it.n)));
-      kids.push(el("div", {class: "card"}, el("h2", {}, "Javoblar tahlili"), el("div", {class: "muted small"}, "Raqamni bosing — javobingiz va to'g'ri javob ko'rinadi."), grid,
-        el("div", {class: "legend"}, el("span", {}, el("i", {style: "background:rgba(31,157,85,.3);border-color:var(--ok)"}), "to'g'ri"),
-          el("span", {}, el("i", {style: "background:rgba(214,69,69,.25);border-color:var(--bad)"}), "xato"), el("span", {}, el("i", {style: "border-style:dashed"}), "tekshirilmoqda"))));
-    } else if (v.review_allowed === false) kids.push(el("div", {class: "status"}, "🔒 Guruh xavfsizligi uchun batafsil tahlil test vaqti tugagach ochiladi."));
+      kids.push(el("div", {class: "sect"}, "Javoblar tahlili"), el("div", {class: "card", style: "margin-top:0"}, el("div", {class: "muted small"}, "Raqamni bosing — javobingiz va to'g'ri javob ko'rinadi."), grid,
+        el("div", {class: "legend"}, el("span", {}, el("i", {style: "background:var(--ok-soft);border-color:var(--ok)"}), "to'g'ri"),
+          el("span", {}, el("i", {style: "background:var(--bad);border-color:var(--bad)"}), "xato"), el("span", {}, el("i", {style: "border-style:dashed"}), "tekshirilmoqda"))));
+    } else if (v.review_allowed === false) kids.push(statusBox("", "Guruh xavfsizligi uchun batafsil tahlil test vaqti tugagach ochiladi."));
   }
-  if (v.certificate && v.result_id) kids.push(el("div", {class: "card"}, el("b", {}, "🎓 Sertifikat"), el("p", {class: "muted small"}, "Sertifikatingiz botga ham yuborilgan."),
-    el("button", {class: "btn block", onclick: () => downloadCert(v.result_id, t.code)}, "📥 Sertifikatni yuklab olish")));
-  kids.push(el("div", {class: "card"}, el("p", {class: "muted small"}, "Batafsil natija bot chatiga ham yuborildi."),
-    el("button", {class: "btn block", onclick: renderHome}, "🏠 Bosh sahifa"), el("button", {class: "btn block ghost", onclick: openBot}, "💬 Botga qaytish")));
+  if (v.certificate && v.result_id) kids.push(el("div", {class: "card"}, el("div", {style: "display:flex;gap:12px;align-items:center;margin-bottom:12px"},
+      el("div", {class: "ico gold"}, ic("award")), el("div", {}, el("b", {}, "Sertifikat"), el("div", {class: "muted small"}, "Sertifikatingiz botga ham yuborilgan."))),
+    el("button", {class: "btn block cta", onclick: () => downloadCert(v.result_id, t.code)}, ic("download"), "Sertifikatni yuklab olish")));
+  kids.push(el("div", {class: "card"}, el("p", {class: "muted small", style: "margin-top:0"}, "Batafsil natija bot chatiga ham yuborildi."),
+    el("button", {class: "btn block", onclick: renderHome}, ic("home"), "Bosh sahifa"), el("button", {class: "btn block ghost", onclick: openBot}, ic("chat"), "Botga qaytish")));
   mount(el("div", {class: "screen"}, ...kids));
 }
 // Telegram WebView oddiy <a href> orqali faylni yuklab ololmaydi (ayniqsa
@@ -14533,20 +14895,22 @@ async function renderProfile() {
   stopTick(); closeCalc(); showTabs(true); setBack(renderHome); setTab("profile");
   mount(el("div", {class: "center"}, el("div", {class: "spin dark"})));
   let d;
-  try { d = await api("/api/profile"); } catch (e) { return handleErr(e); }
+  try { d = await api("/api/profile"); }
+  catch (e) { if (S.tab !== "profile") return; if (e && e.network) return renderNetError(renderProfile); return handleErr(e); }
   if (S.tab !== "profile") return;
   const list = el("div", {});
   if (!d.results.length) list.append(el("div", {class: "muted", style: "text-align:center;padding:24px 0"}, "Hali natijalar yo'q"));
-  d.results.forEach(r => list.append(el("div", {class: "list-item", style: "cursor:pointer", onclick: () => showResult(r.test_id)},
-    el("div", {}, el("b", {}, r.title), el("div", {class: "muted small"}, `${r.code} · ${r.exam_label} · ${r.date || ""}`),
-      r.has_certificate ? el("div", {class: "small"}, "🎓 sertifikat bor") : null),
+  d.results.forEach(r => list.append(el("div", {class: "list-item", style: "cursor:pointer", role: "button", tabindex: "0", onclick: () => showResult(r.test_id)},
+    el("div", {style: "min-width:0"}, el("b", {}, r.title), el("div", {class: "muted small"}, `${r.code} · ${r.exam_label} · ${r.date || ""}`),
+      r.has_certificate ? el("div", {class: "small", style: "color:var(--flag);font-weight:600"}, "Sertifikat bor") : null),
     el("span", {class: "badge"}, r.percent.toFixed(1) + "%"))));
-  mount(el("div", {class: "screen"}, el("h1", {}, d.full_name || "Profil"), el("div", {class: "muted"}, "Statistika va natijalar"),
-    el("div", {class: "card"}, el("div", {class: "stats"},
+  mount(el("div", {class: "screen"},
+    band(brandRow(), el("h1", {}, d.full_name || "Profil"), el("p", {}, "Statistika va natijalar")),
+    el("div", {class: "card lift"}, el("div", {class: "stats"},
       el("div", {class: "stat"}, el("b", {}, d.summary.count), el("span", {}, "jami test")),
       el("div", {class: "stat"}, el("b", {}, d.summary.avg_percent.toFixed(1) + "%"), el("span", {}, "o'rtacha")),
       el("div", {class: "stat"}, el("b", {}, d.summary.best_percent.toFixed(1) + "%"), el("span", {}, "eng yaxshi")))),
-    el("div", {class: "card"}, el("h2", {}, "So'nggi natijalar"), list)));
+    el("div", {class: "sect"}, "So'nggi natijalar"), el("div", {class: "card", style: "margin-top:0;padding-top:4px;padding-bottom:4px"}, list)));
 }
 
 /* ------------ SAT: kalkulyator ------------ */
@@ -14638,7 +15002,7 @@ function buildCalc(c) {
   const tabs = el("div", {class: "tb2"});
   const tabBtn = (m, t) => el("button", {class: Calc.mode === m ? "on" : "", onclick: () => { Calc.mode = m; renderCalcBody(); tabs.querySelectorAll("button").forEach(b => b.classList.toggle("on", b.textContent === t)); }}, t);
   tabs.append(tabBtn("calc", "Kalkulyator"), tabBtn("graph", "Grafik"));
-  const head = el("div", {class: "ch"}, el("span", {}, "🧮"), tabs, el("button", {class: "icon-btn", style: "width:30px;height:30px", onclick: closeCalc}, "✕"));
+  const head = el("div", {class: "ch"}, ic("calc"), tabs, el("button", {class: "icon-btn", style: "width:32px;height:32px", "aria-label": "Yopish", onclick: closeCalc}, ic("x")));
   const body = el("div", {});
   c.append(head, body);
   // sudrab ko'chirish
@@ -14732,7 +15096,7 @@ function drawGraph() {
 }
 function showReference() {
   const F = (name, f) => el("div", {class: "f"}, el("span", {}, name), el("b", {}, f));
-  sheet(el("div", {class: "ref"}, el("h2", {}, "📐 SAT Math ma'lumotnomasi"),
+  sheet(el("div", {class: "ref"}, el("h2", {}, "SAT Math ma'lumotnomasi"),
     el("div", {class: "muted small"}, "Imtihonda beriladigan formulalar"),
     el("h3", {}, "Yuzalar"), F("Doira yuzasi", "A = πr²"), F("Aylana uzunligi", "C = 2πr"), F("To'g'ri to'rtburchak", "A = ℓw"), F("Uchburchak", "A = ½·b·h"),
     el("h3", {}, "Uchburchaklar"), F("Pifagor teoremasi", "c² = a² + b²"), F("30°–60°–90°", "x,  x√3,  2x"), F("45°–45°–90°", "s,  s,  s√2"),
@@ -14740,8 +15104,20 @@ function showReference() {
     el("h3", {}, "Faktlar"), F("Aylanadagi yoy", "360° = 2π radian"), F("Uchburchak burchaklari yig'indisi", "180°")));
 }
 
-initOnce();
-boot();
+/* ------------ ishga tushirish ------------ */
+// Telegram SDK kelishini ko'pi bilan 2.5 soniya kutamiz; kelmasa ham ilova
+// manzildagi ma'lumot bilan ishlaydi, SDK keyinroq kelganda ulanadi.
+function whenSdk(ms) {
+  return new Promise(res => {
+    if (window.Telegram && window.Telegram.WebApp) return res();
+    let fin = false;
+    const done = () => { if (!fin) { fin = true; res(); } };
+    const s = document.getElementById("tgsdk");
+    if (s) { s.addEventListener("load", done); s.addEventListener("error", done); }
+    setTimeout(done, ms);
+  });
+}
+whenSdk(2500).then(() => { initOnce(); boot(); });
 </script>
 </body>
 </html>
