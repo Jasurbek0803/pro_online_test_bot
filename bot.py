@@ -13504,7 +13504,7 @@ h2{font-family:var(--fh);font-size:16px;font-weight:700;margin:0 0 10px}
 .band{background:var(--band);color:var(--band-text);margin:-16px -16px 0;padding:20px 18px 34px;border-radius:0 0 28px 28px}
 .brand{display:flex;align-items:center;gap:12px}
 .brand .logo{width:46px;height:46px;border-radius:50%;box-shadow:0 0 0 3px var(--gold);background:#fff;flex:none}
-.brand b{display:block;font-family:var(--fh);font-size:13px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--gold2)}
+.brand b{display:block;font-family:var(--fh);font-size:15px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--gold2)}
 .brand span{display:block;font-size:12px;color:var(--band-hint)}
 .band h1{font-size:25px;margin:16px 0 4px;color:#fff}
 .band p{margin:0;color:var(--band-hint);font-size:14px}
@@ -13921,7 +13921,7 @@ function showTabs(on) { document.getElementById("tabs").classList.toggle("hidden
 function band(...kids) { return el("div", {class: "band"}, ...kids); }
 function brandRow() {
   return el("div", {class: "brand"}, el("img", {class: "logo", src: LOGO, alt: "", width: "46", height: "46"}),
-    el("div", {}, el("b", {}, "Online Olimpiada"), el("span", {}, (S.me && S.me.academy) || "Telegram bot")));
+    el("div", {}, el("b", {}, "Online Olimpiada")));
 }
 function statusBox(kind, ...kids) {
   const name = {ok: "check", bad: "alert", warn: "info"}[kind] || "info";
