@@ -3037,7 +3037,7 @@ def test_ui_kb(current_q: int, qcount: int, answers_dict: dict, correct_key: str
 # ===================== FREE TESTS =====================
 # Foydalanuvchiga ko'rinadigan ro'yxatlar sahifalab chiqariladi — testlar soni
 # 50+ ga yetganda bitta ulkan, chalkash xabar+tugmalar to'plami chiqmasligi uchun.
-USER_LIST_PAGE_SIZE = 8
+USER_LIST_PAGE_SIZE = 6
 
 
 def _user_pagination_nav_row(list_key: str, page: int, has_more: bool):
@@ -3049,13 +3049,33 @@ def _user_pagination_nav_row(list_key: str, page: int, has_more: bool):
     return row
 
 
+class _EditInPlace:
+    """Sahifalash tugmasi bosilganda ro'yxat YANGI xabar bo'lib chiqmaydi —
+    o'sha xabarning o'zi keyingi/oldingi sahifa bilan almashtiriladi (avval
+    har bosishda yangi xabar qo'shilib, chat ro'yxatlarga to'lib ketardi)."""
+
+    def __init__(self, message: Message):
+        self._m = message
+        self._edited = False
+
+    async def answer(self, text, **kw):
+        if not self._edited:
+            self._edited = True
+            try:
+                return await self._m.edit_text(text, **kw)
+            except TelegramBadRequest as e:
+                if "not modified" in str(e):
+                    return self._m
+        return await self._m.answer(text, **kw)
+
+
 @router.callback_query(F.data.startswith("ulp_"))
 async def user_list_page_nav(callback: CallbackQuery):
     _, list_key, page_s = callback.data.split("_", 2)
-    page = int(page_s)
+    page = max(0, int(page_s))
     renderer = _USER_PAGINATED_RENDERERS.get(list_key)
     if renderer:
-        await renderer(callback.message, callback.from_user.id, page)
+        await renderer(_EditInPlace(callback.message), callback.from_user.id, page)
 
 
 async def _render_free_tests(answerable, user_tg_id: int, page: int = 0):
@@ -3668,38 +3688,41 @@ async def _render_my_tests(answerable, user_tg_id: int, page: int = 0):
     if not user_db_id:
         return await answerable.answer("Avval /start orqali ro‘yxatdan o‘ting.")
 
-    # Har bir sahifa uchun ko'proq qator olamiz, chunki bir test uchun bir necha
-    # to'lov urinishi bo'lishi mumkin (masalan rad etilib, qayta to'langan) —
-    # keyin ular test_id bo'yicha bittaga birlashtiriladi.
-    fetch_n = USER_LIST_PAGE_SIZE * 3 + 1
-    offset = max(0, page) * USER_LIST_PAGE_SIZE * 3
+    # ✅ Har bir test uchun faqat ENG SO'NGGI to'lov olinadi (bir testga bir
+    # necha urinish bo'lishi mumkin — rad etilib, qayta to'langan), sahifalash
+    # esa testlar soni bo'yicha. Avval to'lovlar soni bo'yicha bo'linib,
+    # testlar ko'p bo'lsa 2-sahifaga o'tganda ularning bir qismi umuman
+    # ko'rinmay qolardi.
     rows = await POOL.fetch("""
-        SELECT
-            p.id AS payment_id,
-            p.status,
-            p.test_id,
-            p.reject_reason,
-            p.started_at,
-            t.code,
-            t.title,
-            t.duration,
-            t.price,
-            t.questions_count,
-            t.start_mode,
-            t.start_ts,
-            t.start_at,
-            (
-                SELECT r.percent
-                FROM results r
-                WHERE r.user_id=p.user_id AND r.test_id=p.test_id
-                ORDER BY r.id ASC LIMIT 1
-            ) AS first_percent
-        FROM payments p
-        JOIN tests t ON t.id=p.test_id
-        WHERE p.user_id=$1
-        ORDER BY p.id DESC
+        SELECT * FROM (
+            SELECT DISTINCT ON (p.test_id)
+                p.id AS payment_id,
+                p.status,
+                p.test_id,
+                p.reject_reason,
+                p.started_at,
+                t.code,
+                t.title,
+                t.duration,
+                t.price,
+                t.questions_count,
+                t.start_mode,
+                t.start_ts,
+                t.start_at,
+                (
+                    SELECT r.percent
+                    FROM results r
+                    WHERE r.user_id=p.user_id AND r.test_id=p.test_id
+                    ORDER BY r.id ASC LIMIT 1
+                ) AS first_percent
+            FROM payments p
+            JOIN tests t ON t.id=p.test_id
+            WHERE p.user_id=$1
+            ORDER BY p.test_id, p.id DESC
+        ) latest
+        ORDER BY payment_id DESC
         LIMIT $2 OFFSET $3
-    """, user_db_id, fetch_n, offset)
+    """, user_db_id, USER_LIST_PAGE_SIZE + 1, max(0, page) * USER_LIST_PAGE_SIZE)
 
     actions = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔎 Kod orqali topish", callback_data="askcode_my")]
@@ -3714,15 +3737,8 @@ async def _render_my_tests(answerable, user_tg_id: int, page: int = 0):
             await answerable.answer("Boshqa test yo'q.")
         return
 
-    seen = set()
-    items = []
-    for r in rows:
-        if r["test_id"] in seen:
-            continue
-        seen.add(r["test_id"])
-        items.append(r)
-    has_more = len(items) > USER_LIST_PAGE_SIZE
-    items = items[:USER_LIST_PAGE_SIZE]
+    has_more = len(rows) > USER_LIST_PAGE_SIZE
+    items = rows[:USER_LIST_PAGE_SIZE]
 
     text = f"<b>📦 Mening pullik testlarim</b> ({page + 1}-sahifa)\n\n"
     for r in items:
