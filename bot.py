@@ -51,7 +51,9 @@ from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 from aiogram.utils.callback_answer import CallbackAnswerMiddleware
 from aiogram.client.session.middlewares.base import BaseRequestMiddleware
-from aiogram.methods import AnswerCallbackQuery
+from aiogram.methods import (AnswerCallbackQuery, EditMessageText, EditMessageCaption, EditMessageReplyMarkup,
+                             EditMessageMedia, DeleteMessage)
+import contextvars
 
 # ===================== CONFIG =====================
 load_dotenv()
@@ -2567,8 +2569,127 @@ class CallbackAnswerDedupMiddleware(BaseRequestMiddleware):
         return await make_request(bot, method)
 
 
+# ===================== ISHLATILGAN TUGMALARNI YOPISH =====================
+# ✅ Amal bajarilgach (test o'chirildi, to'lov tasdiqlandi, tanlov qilindi...)
+# o'sha xabardagi tugmalar chatdan olib tashlanadi — foydalanuvchi eski
+# tugmani qayta bosib, bajarilgan ishni takrorlay olmasin.
+_EDITED_MSGS: contextvars.ContextVar = contextvars.ContextVar("_EDITED_MSGS", default=None)
+
+
+class EditTrackerMiddleware(BaseRequestMiddleware):
+    """Handler ichida qaysi xabarlar tahrirlangan/o'chirilganini eslab qoladi —
+    shunda handler o'zi yangi tugmalar qo'ygan xabarni tasodifan "yopib"
+    qo'ymaymiz."""
+
+    async def __call__(self, make_request, bot, method):
+        if isinstance(method, (EditMessageText, EditMessageCaption, EditMessageReplyMarkup,
+                               EditMessageMedia, DeleteMessage)):
+            seen = _EDITED_MSGS.get()
+            mid = getattr(method, "message_id", None)
+            if seen is not None and mid:
+                seen.add((str(getattr(method, "chat_id", "")), int(mid)))
+        return await make_request(bot, method)
+
+
 def _install_bot_session_middlewares(bot: Bot) -> None:
     bot.session.middleware(CallbackAnswerDedupMiddleware())
+    bot.session.middleware(EditTrackerMiddleware())
+
+
+async def _close_buttons(callback: CallbackQuery, note: str | None = None, replace: bool = False) -> None:
+    """Bosilgan xabardagi tugmalarni olib tashlaydi. note berilsa — xabarga
+    holat yozuvi qo'shiladi (replace=True bo'lsa, matn shu yozuv bilan
+    almashtiriladi)."""
+    msg = callback.message
+    if msg is None or not getattr(msg, "reply_markup", None):
+        return
+    try:
+        if note and getattr(msg, "text", None) is not None:
+            body = note if replace else f"{msg.html_text}\n\n{note}"
+            await msg.edit_text(body[:4096], parse_mode=ParseMode.HTML, reply_markup=None)
+            return
+        if note and getattr(msg, "caption", None) is not None:
+            body = note if replace else f"{msg.html_text}\n\n{note}"
+            await msg.edit_caption(caption=body[:1024], parse_mode=ParseMode.HTML, reply_markup=None)
+            return
+    except TelegramBadRequest:
+        pass
+    try:
+        await msg.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+
+
+async def _close_markup_by_id(bot: Bot, chat_id, message_id, caption_note: str | None = None,
+                              caption_html: str | None = None) -> None:
+    """Callback'siz (masalan keyingi matnli qadamda) eski xabar tugmalarini yopish."""
+    if not chat_id or not message_id:
+        return
+    try:
+        if caption_note and caption_html is not None:
+            await bot.edit_message_caption(chat_id=chat_id, message_id=int(message_id),
+                                           caption=f"{caption_html}\n\n{caption_note}"[:1024],
+                                           parse_mode=ParseMode.HTML, reply_markup=None)
+            return
+    except TelegramBadRequest:
+        pass
+    try:
+        await bot.edit_message_reply_markup(chat_id=chat_id, message_id=int(message_id), reply_markup=None)
+    except TelegramBadRequest:
+        pass
+
+
+async def _update_button(callback: CallbackQuery, new_text: str | None = None, remove_row: bool = False) -> None:
+    """Ro'yxatdagi faqat bosilgan tugmani yangilaydi (holat yozuvi) yoki
+    uning qatorini olib tashlaydi; boshqa tugmalar joyida qoladi."""
+    msg = callback.message
+    mk = getattr(msg, "reply_markup", None) if msg else None
+    if not mk or not getattr(mk, "inline_keyboard", None):
+        return
+    rows, changed = [], False
+    for row in mk.inline_keyboard:
+        if any(b.callback_data == callback.data for b in row):
+            changed = True
+            if remove_row:
+                continue
+            row = [b.model_copy(update={"text": new_text}) if (b.callback_data == callback.data and new_text) else b
+                   for b in row]
+        rows.append(row)
+    if not changed:
+        return
+    # faqat sahifalash tugmalari qolsa — ro'yxat bo'sh, tugmalar kerak emas
+    if not any(not (b.callback_data or "").startswith(("tlp_", "ulp_")) for row in rows for b in row):
+        rows = []
+    try:
+        await msg.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
+    except TelegramBadRequest:
+        pass
+
+
+# Bir martalik tanlov tugmalari (test yaratish sehrgari va h.k.): handler
+# muvaffaqiyatli bajarilgach o'sha xabardagi tugmalar avtomatik yopiladi.
+_CLOSE_AFTER_CHOICE = ("setfree_", "qdq_", "etype_", "sch_normal", "sch_scheduled", "stg_on", "stg_off",
+                       "stg_grader_", "edtg_grader_", "edtf_", "profregion_")
+
+
+class CloseUsedButtonsMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: CallbackQuery, data):
+        if not (event.data or "").startswith(_CLOSE_AFTER_CHOICE):
+            return await handler(event, data)
+        seen: set = set()
+        token = _EDITED_MSGS.set(seen)
+        try:
+            result = await handler(event, data)
+        finally:
+            _EDITED_MSGS.reset(token)
+        msg = event.message
+        if msg is not None and getattr(msg, "reply_markup", None) and \
+                (str(msg.chat.id), msg.message_id) not in seen:
+            try:
+                await msg.edit_reply_markup(reply_markup=None)
+            except TelegramBadRequest:
+                pass
+        return result
 
 
 router = Router()
@@ -2588,6 +2709,7 @@ router.callback_query.middleware(CallbackSecurityMiddleware())
 # ✅ Forced subscription as GLOBAL gate
 router.message.middleware(SubscriptionMessageMiddleware())
 router.callback_query.middleware(SubscriptionCallbackMiddleware())
+router.callback_query.middleware(CloseUsedButtonsMiddleware())
 
 
 # ===================== REQUIRED SUB CHECK BUTTON =====================
@@ -2610,6 +2732,7 @@ async def check_subscribed_cb(callback: CallbackQuery, bot: Bot, state: FSMConte
         return
 
     await callback.answer("✅ Tasdiqlandi, xush kelibsiz!", show_alert=False)
+    await _close_buttons(callback)
     await state.clear()
     admin_flag = await is_admin_user(callback.from_user.id)
     await callback.message.answer("✅ Kirish ruxsat berildi.", reply_markup=main_menu_kb(admin_flag))
@@ -5166,6 +5289,20 @@ async def staged_retake_confirm(callback: CallbackQuery, state: FSMContext, bot:
     cfg = _load_skills_cfg(t["skills_cfg"])
     order = cfg.get("order") or []
 
+    # ✅ Tugma yopiladi; ikkinchi bosish (yoki eski tugma) yangi urinish
+    # yaratmasin — boshlangan urinish bo'lsa, o'sha davom ettiriladi.
+    await _close_buttons(callback)
+    running = await POOL.fetchrow(
+        "SELECT id, section_idx FROM staged_attempts WHERE user_id=$1 AND test_id=$2 AND status='in_progress' "
+        "ORDER BY id DESC LIMIT 1", user_db_id, test_id)
+    if running:
+        await callback.answer("Siz bu testni allaqachon qaytadan boshlagansiz — davom etamiz.")
+        await state.update_data(staged_attempt_id=running["id"], staged_test_id=test_id, staged_order=order,
+                                staged_pos=int(running["section_idx"] or 0))
+        await state.set_state(StagedSolvingState.in_section)
+        await _send_stage_section(callback.from_user.id, bot, state)
+        return
+
     last_attempt_no = await POOL.fetchval(
         "SELECT COALESCE(MAX(attempt_no), 0) FROM staged_attempts WHERE user_id=$1 AND test_id=$2",
         user_db_id, test_id
@@ -6219,11 +6356,15 @@ async def staged_grading_start(callback: CallbackQuery, state: FSMContext, bot: 
         await callback.answer("Sizda ruxsat yo'q!", show_alert=True)
         return
     if row["status"] != "pending_review":
+        if row["status"] == "graded":
+            await _update_button(callback, remove_row=True)
         await callback.answer("Bu topshiriq allaqachon baholangan yoki hali tugallanmagan.", show_alert=True)
         return
 
     cfg = _load_skills_cfg(row["skills_cfg"])
     sections = json.loads(row["sections_json"] or "{}")
+    # ✅ baholash boshlangan o'quvchining tugmasi ro'yxatdan olinadi
+    await _update_button(callback, remove_row=True)
 
     await state.update_data(
         grading_attempt_id=attempt_id, grading_test_id=row["test_id"], grading_user_db_id=row["user_id"],
@@ -7276,6 +7417,7 @@ async def open_force_confirm(callback: CallbackQuery, bot: Bot):
     test_id = int(callback.data.split("_")[1])
     if not await _is_admin_or_creator(callback.from_user.id, test_id):
         return await callback.answer("Sizda ruxsat yo'q!", show_alert=True)
+    await _close_buttons(callback)
     ok = await finalize_rush_for_test_if_ready(test_id, bot=bot, force=True)
     if ok:
         await callback.message.answer("✅ Rasch natijalari hisoblandi va e'lon qilindi.")
@@ -7773,8 +7915,10 @@ async def approve_payment(callback: CallbackQuery, bot: Bot):
     """, payment_id)
 
     if not row:
+        await _close_buttons(callback, "ℹ️ Bu to'lov endi mavjud emas.")
         return await callback.message.answer("Xatolik: payment topilmadi.")
     if row["status"] == "approved":
+        await _close_buttons(callback, "✅ <b>Allaqachon tasdiqlangan.</b>")
         return await callback.answer("Bu to'lov allaqachon tasdiqlangan.", show_alert=True)
 
     user_tg_id, code, title, duration, qcount, start_mode, start_ts_val, start_at = (
@@ -7799,8 +7943,11 @@ async def approve_payment(callback: CallbackQuery, bot: Bot):
                           AND p2.test_id=payments.test_id AND p2.status='approved')
     """, payment_id, now_str_local())
     if upd.endswith(" 0"):
+        await _close_buttons(callback, "✅ <b>Allaqachon tasdiqlangan.</b>")
         return await callback.answer("Bu to'lov (yoki shu o'quvchining shu testga boshqa to'lovi) "
                                      "allaqachon tasdiqlangan.", show_alert=True)
+    # ✅ Tasdiqlash/Rad etish tugmalari yopiladi — qayta bosib bo'lmaydi
+    await _close_buttons(callback, f"✅ <b>Tasdiqlandi</b> ({_h(now_str_local())})")
 
     start_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 Testni boshlash", callback_data=f"begin_{payment_id}")]
@@ -7842,10 +7989,19 @@ async def reject_ask_reason(callback: CallbackQuery, state: FSMContext):
     payment_id = int(callback.data.split("_")[1])
     cur = await POOL.fetchval("SELECT status FROM payments WHERE id=$1", payment_id)
     if cur == "approved":
+        await _close_buttons(callback, "✅ <b>Allaqachon tasdiqlangan.</b>")
         return await callback.answer(
             "Bu to'lov allaqachon TASDIQLANGAN — o'quvchi testdan foydalanmoqda, rad etib bo'lmaydi.",
             show_alert=True)
-    await state.update_data(payment_id=payment_id)
+    if cur is None or cur == "rejected":
+        await _close_buttons(callback, "❌ <b>Allaqachon rad etilgan.</b>" if cur else "ℹ️ Bu to'lov endi mavjud emas.")
+        return await callback.answer("Bu to'lov allaqachon rad etilgan." if cur else "To'lov topilmadi.",
+                                     show_alert=True)
+    # sabab yozilgach shu xabardagi tugmalar yopiladi (qarang: reject_with_reason)
+    msg = callback.message
+    await state.update_data(payment_id=payment_id, rej_chat_id=msg.chat.id if msg else None,
+                            rej_msg_id=msg.message_id if msg else None,
+                            rej_caption=msg.html_text if msg and getattr(msg, "caption", None) else None)
     await callback.message.answer(
         "❌ <b>Rad etish sababi</b>ni yozing (1-2 jumla):",
         parse_mode=ParseMode.HTML,
@@ -7876,7 +8032,12 @@ async def reject_with_reason(message: Message, state: FSMContext, bot: Bot):
         reason, payment_id)
     if upd.endswith(" 0"):
         await state.clear()
+        await _close_markup_by_id(bot, data.get("rej_chat_id"), data.get("rej_msg_id"),
+                                  "✅ <b>Allaqachon tasdiqlangan.</b>", data.get("rej_caption"))
         return await message.answer("⚠️ Bu to'lov allaqachon tasdiqlangan — rad etilmadi.")
+    # ✅ Skrinshot ostidagi Tasdiqlash/Rad etish tugmalari yopiladi
+    await _close_markup_by_id(bot, data.get("rej_chat_id"), data.get("rej_msg_id"),
+                              f"❌ <b>Rad etildi:</b> <i>{_h(reason)}</i>", data.get("rej_caption"))
 
     # ✅ Holat yuborishdan OLDIN tozalanadi — avval o'quvchi botni bloklagan
     # bo'lsa xato tufayli admin "sabab kutish" holatida qolib ketardi va uning
@@ -8553,7 +8714,7 @@ async def broadcast_preview(message: Message, state: FSMContext):
 @router.callback_query(AdminBroadcastState.waiting_text, F.data == "broadcast_cancel")
 async def broadcast_cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.answer("Bekor qilindi.")
+    await _close_buttons(callback, "❌ <b>Bekor qilindi.</b>", replace=True)
 
 
 @router.callback_query(AdminBroadcastState.waiting_text, F.data == "broadcast_confirm")
@@ -8564,6 +8725,8 @@ async def broadcast_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot
     src_chat_id = data.get("broadcast_chat_id")
     src_message_id = data.get("broadcast_message_id")
     await state.clear()
+    # ✅ "Tasdiqlash" qayta bosilib xabar ikki marta yuborilmasin
+    await _close_buttons(callback, "🚀 <b>Yuborish boshlandi.</b>", replace=True)
     if not src_chat_id or not src_message_id:
         await callback.message.answer("⚠️ Xatolik: yubormoqchi bo'lgan xabar topilmadi. Qaytadan boshlang.")
         return
@@ -9283,6 +9446,8 @@ async def hidetest_toggle(callback: CallbackQuery):
     new_val = 0 if int(row["is_hidden"] or 0) == 1 else 1
     await POOL.execute("UPDATE tests SET is_hidden=$1 WHERE id=$2", new_val, test_id)
     status = "yashirildi ⏸" if new_val == 1 else "qaytarildi ✅"
+    # ✅ ro'yxatdagi tugma yangi holatni ko'rsatadi (eski yozuv qolib ketmaydi)
+    await _update_button(callback, f"{'⏸ Yashirilgan' if new_val else '✅ Faol'} — {row['code']}")
     await callback.answer(f"{row['code']} {status}", show_alert=False)
 
 
@@ -9590,6 +9755,11 @@ async def ch_toggle(callback: CallbackQuery):
     new_val = 0 if int(row["is_active"] or 0) == 1 else 1
     await POOL.execute("UPDATE required_channels SET is_active=$1 WHERE id=$2", new_val, _id)
 
+    # ✅ tugmadagi ON/OFF yozuvi yangi holatga almashadi
+    old = next((b.text for r_ in (getattr(callback.message.reply_markup, "inline_keyboard", None) or [])
+                for b in r_ if b.callback_data == callback.data), "") if callback.message else ""
+    name = old.split(" ", 1)[1] if " " in old else old
+    await _update_button(callback, f"{'ON✅' if new_val else 'OFF⛔'} {name}".strip())
     await callback.answer("✅ Yangilandi", show_alert=False)
 
 
@@ -9601,6 +9771,8 @@ async def ch_delete(callback: CallbackQuery):
 
     await POOL.execute("DELETE FROM required_channels WHERE id=$1", _id)
 
+    # ✅ o'chirilgan kanal qatori (ON/OFF, ✏️, 🗑) ro'yxatdan olib tashlanadi
+    await _update_button(callback, remove_row=True)
     await callback.answer("🗑 O‘chirildi", show_alert=False)
 
 
@@ -10335,6 +10507,7 @@ async def certcfg_got_signee(message: Message, state: FSMContext, bot: Bot):
     await message.answer("⏳ <b>3/3 — Namunalar tayyorlanmoqda...</b>", parse_mode=ParseMode.HTML)
 
     tmp_dir = tempfile.gettempdir()
+    sample_msg_ids: list[int] = []
     for tpl_key, tpl_meta in CERT_TEMPLATES.items():
         pdf_path = os.path.join(tmp_dir, f"certpreview_{test_id}_{tpl_key}.pdf")
         make_certificate_pdf(
@@ -10352,19 +10525,22 @@ async def certcfg_got_signee(message: Message, state: FSMContext, bot: Bot):
             [InlineKeyboardButton(text=f"✅ {tpl_meta['label']} — shuni tanlash",
                                   callback_data=f"certcfg_pick_{test_id}_{tpl_key}")]
         ])
-        await bot.send_document(
+        sent = await bot.send_document(
             chat_id=message.from_user.id,
             document=FSInputFile(pdf_path),
             caption=tpl_meta["label"],
             reply_markup=kb
         )
+        sample_msg_ids.append(sent.message_id)
 
     await message.answer("👆 Yoqqan ko'rinishni yuqoridagi 3 ta namunadan tanlang.")
+    # tanlov qilingach 3 ta namunadagi tugmalarning hammasi yopiladi
+    await state.update_data(certcfg_sample_msgs=sample_msg_ids)
     await state.set_state(CertConfigState.waiting_template)
 
 
 @router.callback_query(CertConfigState.waiting_template, F.data.startswith("certcfg_pick_"))
-async def certcfg_pick(callback: CallbackQuery, state: FSMContext):
+async def certcfg_pick(callback: CallbackQuery, state: FSMContext, bot: Bot):
     parts = callback.data.split("_")
     test_id, tpl_key = int(parts[2]), parts[3]
     if not await _cert_settings_entry_check(callback.from_user.id, test_id):
@@ -10379,6 +10555,11 @@ async def certcfg_pick(callback: CallbackQuery, state: FSMContext):
         academy, signee, tpl_key, test_id
     )
     await state.clear()
+    # ✅ 3 ta namunadagi "shuni tanlash" tugmalari yopiladi; tanlangani belgilanadi
+    await _close_buttons(callback, "✅ <b>Tanlandi</b>")
+    for mid in data.get("certcfg_sample_msgs") or []:
+        if mid != (callback.message.message_id if callback.message else None):
+            await _close_markup_by_id(bot, callback.from_user.id, mid)
     await callback.answer("✅ Saqlandi!", show_alert=False)
     await callback.message.answer(
         f"✅ <b>Sertifikat sozlamalari saqlandi:</b> {CERT_TEMPLATES[tpl_key]['label']}.\n"
@@ -10724,6 +10905,10 @@ async def _send_delete_confirm(answerable, test_id: int):
 @router.callback_query(F.data.startswith("admdel_ask_"))
 async def admdel_ask(callback: CallbackQuery):
     test_id = int(callback.data.split("_")[2])
+    if not await POOL.fetchval("SELECT 1 FROM tests WHERE id=$1", test_id):
+        # ro'yxatdagi eski tugma — test allaqachon o'chirilgan, tugmasini olib tashlaymiz
+        await _update_button(callback, remove_row=True)
+        return await callback.answer("Bu test allaqachon o'chirilgan.", show_alert=True)
     if not await _is_admin_or_creator(callback.from_user.id, test_id):
         return await callback.answer("Bu testga huquqingiz yo'q!", show_alert=True)
     await _send_delete_confirm(callback.message, test_id)
@@ -10737,7 +10922,8 @@ async def admdel_confirm(callback: CallbackQuery):
 
     t = await POOL.fetchrow("SELECT code, title FROM tests WHERE id=$1", test_id)
     if not t:
-        return await callback.answer("Test topilmadi", show_alert=True)
+        await _close_buttons(callback, "ℹ️ Bu test allaqachon o'chirilgan.", replace=True)
+        return await callback.answer("Test allaqachon o'chirilgan", show_alert=True)
 
     async with POOL.acquire() as db:
         async with db.transaction():
@@ -10747,7 +10933,11 @@ async def admdel_confirm(callback: CallbackQuery):
             await db.execute("DELETE FROM staged_attempts WHERE test_id=$1", test_id)
             await db.execute("DELETE FROM tests WHERE id=$1", test_id)
 
-    await callback.message.answer(f"✅ <code>{t['code']}</code> — <b>{t['title']}</b> o'chirildi.", parse_mode=ParseMode.HTML)
+    # ✅ Tasdiqlash xabari natija bilan almashtiriladi — "Ha, o'chirilsin"
+    # tugmasi chatda qolib ketmaydi.
+    await _close_buttons(callback, f"✅ <code>{_h(t['code'])}</code> — <b>{_h(t['title'])}</b> o'chirildi.",
+                         replace=True)
+    await callback.answer("🗑 O'chirildi")
 
 
 # ===================== SLASH (/) BUYRUQLAR MENYUSI =====================
@@ -11401,7 +11591,7 @@ async def restore_cancel(callback: CallbackQuery, state: FSMContext):
         except Exception:
             pass
     await state.clear()
-    await callback.message.answer("Bekor qilindi.")
+    await _close_buttons(callback, "❌ <b>Tiklash bekor qilindi.</b>", replace=True)
 
 
 @router.callback_query(RestoreState.waiting_file, F.data == "restore_confirm")
@@ -11411,6 +11601,7 @@ async def restore_confirm(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     path = data.get("restore_path")
     await state.clear()
+    await _close_buttons(callback, "⏳ <b>Tiklash boshlandi.</b>", replace=True)
 
     if not path or not os.path.exists(path):
         return await callback.message.answer("⚠️ Fayl topilmadi, qaytadan boshlang.")
@@ -11492,6 +11683,11 @@ async def closetest_toggle(callback: CallbackQuery, state: FSMContext, bot: Bot)
     new_val = 0 if int(row["is_closed"] or 0) == 1 else 1
     await POOL.execute("UPDATE tests SET is_closed=$1 WHERE id=$2", new_val, test_id)
     et = row["exam_type"] or "simple"
+    # ✅ ro'yxatda bosilgan bo'lsa — tugma yozuvi yangi holatga almashadi
+    btn_text = next((b.text for r_ in (getattr(callback.message.reply_markup, "inline_keyboard", None) or [])
+                     for b in r_ if b.callback_data == callback.data), "") if callback.message else ""
+    if " — " in btn_text:
+        await _update_button(callback, f"{'🛑 Yakunlangan' if new_val else '🟢 Faol'} — {row['code']}")
 
     if new_val == 1:
         active_now = await POOL.fetchval(
@@ -11586,7 +11782,8 @@ async def retake_offer_send(callback: CallbackQuery, bot: Bot):
     if not await _is_admin_or_creator(callback.from_user.id, test_id):
         return await callback.answer("Bu testga huquqingiz yo'q!", show_alert=True)
 
-    await callback.message.answer("🚀 Taklif yuborilmoqda...")
+    # ✅ taklif o'quvchilarga ikki marta yuborilmasin
+    await _close_buttons(callback, "🚀 <b>Taklif yuborilmoqda...</b>")
     asyncio.create_task(_run_retake_offer(bot, callback.from_user.id, test_id))
 
 
@@ -11643,14 +11840,19 @@ async def retake_ask(callback: CallbackQuery):
     has_result = await POOL.fetchrow(
         "SELECT 1 FROM results WHERE user_id=$1 AND test_id=$2", user_db_id, test_id)
     if not has_result:
+        await _close_buttons(callback)
         return await callback.message.answer("Sizda bu test bo'yicha oldingi natija topilmadi.")
     if not await _has_retake_grant(user_db_id, test_id):
+        await _close_buttons(callback)
         return await callback.message.answer(
             "ℹ️ Bu taklif allaqachon ishlatilgan yoki muddati o'tgan. Har bir testga bitta urinish beriladi — "
             "qayta yechish faqat ustoz yangi taklif yuborsa mumkin.")
 
+    # taklif xabarining id'si tasdiqlash tugmasiga qo'shiladi — qayta yechish
+    # boshlangach taklif xabaridagi tugma ham yopiladi (qarang: retake_confirm)
+    offer_mid = callback.message.message_id if callback.message else 0
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Ha, qaytadan boshlayman", callback_data=f"retakeok_{test_id}")],
+        [InlineKeyboardButton(text="✅ Ha, qaytadan boshlayman", callback_data=f"retakeok_{test_id}_{offer_mid}")],
         [InlineKeyboardButton(text="❌ Yo'q", callback_data="dismiss_msg")],
     ])
     await callback.message.answer(
@@ -11661,11 +11863,19 @@ async def retake_ask(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("retakeok_"))
-async def retake_confirm(callback: CallbackQuery):
-    test_id = int(callback.data.split("_")[1])
+async def retake_confirm(callback: CallbackQuery, bot: Bot):
+    parts = callback.data.split("_")
+    test_id = int(parts[1])
     user_db_id = await get_user_db_id(callback.from_user.id)
     if not user_db_id:
         return await callback.message.answer("Avval /start orqali ro'yxatdan o'ting.")
+
+    async def close_all():
+        # ✅ "Ha, qaytadan boshlayman" va taklifdagi "Qayta yechish" tugmalari
+        # yopiladi — eski natija ikkinchi marta o'chirib yuborilmasin.
+        await _close_buttons(callback)
+        if len(parts) > 2 and parts[2].isdigit() and int(parts[2]):
+            await _close_markup_by_id(bot, callback.from_user.id, int(parts[2]))
 
     t = await POOL.fetchrow(
         "SELECT is_free, is_hidden, is_closed, start_mode, start_ts, duration, exam_type FROM tests WHERE id=$1",
@@ -11673,6 +11883,7 @@ async def retake_confirm(callback: CallbackQuery):
     if not t:
         return await callback.message.answer("Test topilmadi.")
     if (t["exam_type"] or "") not in STAGED_EXAM_TYPES and not await _has_retake_grant(user_db_id, test_id):
+        await close_all()
         return await callback.message.answer(
             "ℹ️ Qayta yechish uchun ruxsat yo'q (taklif ishlatilgan yoki yuborilmagan). "
             "Avvalgi natijangiz saqlanib qoldi.")
@@ -11719,6 +11930,7 @@ async def retake_confirm(callback: CallbackQuery):
             [InlineKeyboardButton(text="🚀 Boshlash", callback_data=f"begin_{payment['id']}")]
         ])
 
+    await close_all()
     await callback.message.answer(
         "✅ Eski natijangiz o'chirildi. Qaytadan boshlash uchun tugmani bosing:",
         reply_markup=kb
@@ -12112,6 +12324,9 @@ async def fallback_callback(callback: CallbackQuery):
     else:
         text = "⚠️ Bu tugma eskirgan yoki hozir ishlamaydi. Menyudan qaytadan oching."
     await callback.answer(text, show_alert=True)
+    # ✅ Eskirgan (ishlamaydigan) tugmalar chatda qolib, qayta-qayta
+    # bosilmasligi uchun o'sha xabardan olib tashlanadi.
+    await _close_buttons(callback)
 
 
 _PAGINATED_LIST_RENDERERS = {
