@@ -207,6 +207,21 @@ class AdminAddTestState(StatesGroup):
     open_ref_answers = State()
 
 
+class AntiCheatState(StatesGroup):
+    b_file = State()
+    b_answers = State()
+    b_refs = State()
+
+
+class PracticeState(StatesGroup):
+    """Xatolar ustida ishlash — natijaga ta'sir qilmaydigan mashq."""
+    solving = State()
+
+
+class DuplicateTestState(StatesGroup):
+    waiting_start = State()
+
+
 class TestProcessState(StatesGroup):
     solving = State()
     awaiting_free_text = State()  # variantsiz savolga matn javob kutilmoqda
@@ -2037,6 +2052,39 @@ async def init_db(db):
     # Mavjud testlar avvalgidek ko'rsatishda davom etadi (DEFAULT 1).
     await _ensure_column(db, "tests", "show_review", "INTEGER DEFAULT 1")
 
+    # ✅ Ko'chirishga qarshi: ixtiyoriy B variant (boshqa PDF + kalit) — o'quvchilar
+    # navbatma-navbat A yoki B oladi; fayl himoyasi (forward/saqlash taqiqlanadi).
+    await _ensure_column(db, "tests", "b_file_id", "TEXT")
+    await _ensure_column(db, "tests", "b_answers", "TEXT")
+    await _ensure_column(db, "tests", "b_open_ref_answers", "TEXT")
+    await _ensure_column(db, "tests", "protect_files", "INTEGER DEFAULT 0")
+    await _ensure_column(db, "sessions", "variant", "TEXT DEFAULT 'a'")
+    await _ensure_column(db, "results", "variant", "TEXT DEFAULT 'a'")
+
+    # ✅ Rejalashtirilgan test eslatmalari (30 daqiqa, 5 daqiqa oldin va boshlanganda)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS test_reminders (
+            user_id INTEGER NOT NULL,
+            test_id INTEGER NOT NULL,
+            created_ts BIGINT DEFAULT 0,
+            sent30 INTEGER DEFAULT 0,
+            sent5 INTEGER DEFAULT 0,
+            sent0 INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, test_id)
+        )
+    """)
+    # ✅ Shubhali faollik (bir telefonda bir nechta akkaunt, juda tez yechish)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS suspicious_events (
+            id SERIAL PRIMARY KEY,
+            kind TEXT,
+            user_id INTEGER,
+            test_id INTEGER,
+            details TEXT,
+            created_ts BIGINT DEFAULT 0
+        )
+    """)
+
     # ✅ O'quvchi testdan menyuga chiqib ketsa, belgilagan javoblari shu yerda
     # saqlanadi — testga qaytganda (vaqt qolgan bo'lsa) davom ettiradi.
     await _ensure_column(db, "sessions", "saved_answers", "TEXT")
@@ -2520,22 +2568,77 @@ async def _restore_test_progress(user_db_id: int, test_id: int, mode: str) -> di
 
 
 async def upsert_session(user_id: int, test_id: int, mode: str, start_ts_: int, duration_sec: int):
+    # ✅ B variantli testda o'quvchiga variant sessiya ochilganda BIR MARTA
+    # biriktiriladi (keyin o'zgarmaydi) — fayl, kalit va natija shunga qarab.
+    variant = "a"
+    if mode in ("free", "paid"):
+        has_b = await POOL.fetchval(
+            "SELECT 1 FROM tests WHERE id=$1 AND COALESCE(b_answers,'')<>'' AND COALESCE(b_file_id,'')<>''", test_id)
+        if has_b:
+            variant = _pick_variant(user_id, test_id)
     await POOL.execute("""
-        INSERT INTO sessions (user_id, test_id, mode, start_ts, duration_sec, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO sessions (user_id, test_id, mode, start_ts, duration_sec, created_at, variant)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT(user_id, test_id, mode) DO UPDATE SET
             start_ts=excluded.start_ts,
             duration_sec=excluded.duration_sec,
             created_at=excluded.created_at
-    """, user_id, test_id, mode, start_ts_, duration_sec, now_str_local())
+    """, user_id, test_id, mode, start_ts_, duration_sec, now_str_local(), variant)
 
 
 async def get_session(user_id: int, test_id: int, mode: str):
     return await POOL.fetchrow("""
-        SELECT start_ts, duration_sec
+        SELECT start_ts, duration_sec, COALESCE(variant,'a') AS variant
         FROM sessions
         WHERE user_id=$1 AND test_id=$2 AND mode=$3
     """, user_id, test_id, mode)
+
+
+# ===================== B VARIANT (ko'chirishga qarshi) =====================
+B_VARIANT_EXAM_TYPES = ("simple", "dtm", "cefr", "ielts", "sat")
+
+
+def _pick_variant(user_db_id: int, test_id: int) -> str:
+    # ketma-ket ro'yxatdan o'tganlar (odatda yonma-yon o'tirganlar) har xil variant oladi
+    return "b" if (int(user_db_id) + int(test_id)) % 2 == 1 else "a"
+
+
+def _variant_fields(t, variant: str) -> tuple[str, str | None, str | None]:
+    """(javob kaliti, ochiq savol kalitlari JSON, fayl) — o'quvchining variantiga ko'ra."""
+    keys = set(t.keys())
+
+    def g(k):
+        return t[k] if k in keys else None
+    if variant == "b" and g("b_answers"):
+        return g("b_answers"), g("b_open_ref_answers"), g("b_file_id") or g("file_id")
+    return g("answers") or "", g("open_ref_answers"), g("file_id")
+
+
+async def _user_variant(user_db_id: int, test_id: int) -> str:
+    """Faol sessiyadagi, bo'lmasa topshirilgan natijadagi variant."""
+    v = await POOL.fetchval(
+        "SELECT variant FROM sessions WHERE user_id=$1 AND test_id=$2 AND mode IN ('free','paid') "
+        "ORDER BY id DESC LIMIT 1", user_db_id, test_id)
+    if not v:
+        v = await POOL.fetchval("SELECT variant FROM results WHERE user_id=$1 AND test_id=$2", user_db_id, test_id)
+    return v or "a"
+
+
+async def _variant_for_start(user_db_id: int, test_id: int, file_id, answer_key: str):
+    """Test boshlanganda: o'quvchi variantining fayli/kaliti, fayl himoyasi va izoh."""
+    t = await _test_variant_row(test_id)
+    if not t:
+        return file_id, answer_key, False, ""
+    variant = await _user_variant(user_db_id, test_id)
+    key_raw, _refs, fid = _variant_fields(t, variant)
+    note = f"\n📑 Variant: <b>{variant.upper()}</b>" if (t["b_answers"] or "") else ""
+    return fid or file_id, normalize_answers(key_raw) or answer_key, int(t["protect_files"]) == 1, note
+
+
+async def _test_variant_row(test_id: int):
+    return await POOL.fetchrow(
+        "SELECT answers, open_ref_answers, file_id, b_answers, b_open_ref_answers, b_file_id, "
+        "COALESCE(protect_files,0) AS protect_files FROM tests WHERE id=$1", test_id)
 
 
 async def delete_session(user_id: int, test_id: int, mode: str):
@@ -2738,9 +2841,18 @@ async def check_subscribed_cb(callback: CallbackQuery, bot: Bot, state: FSMConte
 
     await callback.answer("✅ Tasdiqlandi, xush kelibsiz!", show_alert=False)
     await _close_buttons(callback)
+    start_code = (await state.get_data()).get("deeplink_code")
     await state.clear()
     admin_flag = await is_admin_user(callback.from_user.id)
     await callback.message.answer("✅ Kirish ruxsat berildi.", reply_markup=main_menu_kb(admin_flag))
+    if start_code:
+        if await get_user_db_id(callback.from_user.id) and \
+                (await POOL.fetchval("SELECT full_name FROM users WHERE telegram_id=$1", callback.from_user.id) or ""):
+            await _open_test_by_deeplink(callback.message, callback.from_user.id, start_code)
+        else:
+            # ro'yxatdan o'tmagan — /start bosilganda test ochiladi
+            await state.update_data(deeplink_code=start_code)
+            await callback.message.answer("Ro'yxatdan o'tish uchun /start ni bosing — so'ng test avtomatik ochiladi.")
 
 
 # ===================== GLOBAL NAVIGATION (STATE RESET) =====================
@@ -2846,9 +2958,17 @@ async def cancel_action(message: Message, state: FSMContext):
 # ===================== /start + REGISTRATION =====================
 @router.message(CommandStart())
 async def command_start(message: Message, state: FSMContext, bot: Bot):
+    # ✅ Test havolasi: t.me/<bot>?start=<KOD> — kod eslab qolinadi (obuna yoki
+    # ro'yxatdan o'tish talab qilinsa ham, ular tugagach test o'zi ochiladi).
+    parts = (message.text or "").split(maxsplit=1)
+    start_code = parts[1].strip()[:32] if len(parts) > 1 else ""
+    if start_code:
+        await state.update_data(deeplink_code=start_code)
+
     if not await ensure_subscribed_message(message, bot):
         return
 
+    start_code = start_code or (await state.get_data()).get("deeplink_code") or ""
     user = await POOL.fetchrow("SELECT * FROM users WHERE telegram_id=$1", message.from_user.id)
 
     # ✅ Foydalanuvchi bazada bo'lishi mumkin, lekin hali ro'yxatdan o'tmagan
@@ -2860,7 +2980,14 @@ async def command_start(message: Message, state: FSMContext, bot: Bot):
         admin_flag = await is_admin_user(message.from_user.id)
         await message.answer(f"👋 Xush kelibsiz, <b>{_h(user['full_name'])}</b>!", parse_mode=ParseMode.HTML,
                              reply_markup=main_menu_kb(admin_flag))
+        if start_code:
+            await state.update_data(deeplink_code=None)
+            await _open_test_by_deeplink(message, message.from_user.id, start_code)
         return
+
+    if start_code:
+        await message.answer("🔗 Siz test havolasi orqali keldingiz — ro'yxatdan o'tganingizdan so'ng test "
+                             "avtomatik ochiladi.")
 
     await message.answer(
         f"👋 Assalomu alaykum!\n\n"
@@ -2890,7 +3017,7 @@ async def process_name(message: Message, state: FSMContext):
 
 
 @router.message(RegistrationState.phone)
-async def process_phone(message: Message, state: FSMContext):
+async def process_phone(message: Message, state: FSMContext, bot: Bot):
     if (message.text or "") in TOP_MENU_BTNS:
         return
     if message.contact:
@@ -2915,6 +3042,20 @@ async def process_phone(message: Message, state: FSMContext):
         message.from_user.id, data.get("full_name", ""), contact, role, now_ts()
     )
 
+    # ✅ Shubhali faollik: shu telefon raqami bilan boshqa akkaunt allaqachon bor
+    digits = _phone_digits(contact)
+    if digits:
+        others = await POOL.fetch(
+            "SELECT telegram_id, full_name FROM users WHERE telegram_id<>$1 AND "
+            "RIGHT(REGEXP_REPLACE(COALESCE(phone,''), '[^0-9]', '', 'g'), 9)=$2 LIMIT 5",
+            message.from_user.id, digits)
+        if others:
+            me_id = await get_user_db_id(message.from_user.id)
+            names = ", ".join(f"{o['full_name'] or '-'} (ID {o['telegram_id']})" for o in others)
+            asyncio.create_task(_report_suspicious(
+                bot, "phone", me_id, None,
+                f"Bu telefon raqami bilan avval ro'yxatdan o'tgan akkaunt(lar): {names}"))
+
     admin_flag = await is_admin_user(message.from_user.id)
     await message.answer(
         "✅ <b>Ro'yxatdan muvaffaqiyatli o'tdingiz!</b>\n\n"
@@ -2922,7 +3063,10 @@ async def process_phone(message: Message, state: FSMContext):
         f"ℹ️ Savol yoki takliflar bo'lsa: {PAYMENT_PHONE}",
         parse_mode=ParseMode.HTML,
         reply_markup=main_menu_kb(admin_flag))
+    start_code = data.get("deeplink_code")
     await state.clear()
+    if start_code:
+        await _open_test_by_deeplink(message, message.from_user.id, start_code)
 
 
 # ===================== SEARCH BY CODE =====================
@@ -2965,6 +3109,162 @@ async def handle_code_search(message: Message, state: FSMContext):
         await message.answer("❌ Bunday kodli test topilmadi. Qayta urinib ko‘ring.")
         return
 
+    await _send_test_card(message, user_db_id, t, scope)
+    await state.clear()
+
+
+async def _deeplink_scope(user_db_id: int, t) -> str:
+    """Havola orqali kelganda qaysi bo'lim tugmalari ko'rsatilishi kerak."""
+    if int(t["is_free"] or 0) == 1:
+        return "free"
+    st = await POOL.fetchval(
+        "SELECT status FROM payments WHERE user_id=$1 AND test_id=$2 ORDER BY id DESC LIMIT 1", user_db_id, t["id"])
+    return "my" if st == "approved" else "paid"
+
+
+async def _test_deep_link(bot, code: str) -> str:
+    """Testni bir bosishda ochadigan havola: https://t.me/<bot>?start=<KOD>."""
+    if bot is not None and not isinstance(bot, Bot):
+        try:  # Message/CallbackQuery berilsa — unga bog'langan bot
+            bot = bot.bot
+        except Exception:
+            bot = None
+    username = await _web_bot_username(bot) if bot is not None else ""
+    return f"https://t.me/{username}?start={code}" if username else f"<code>{code}</code>"
+
+
+async def _open_test_by_deeplink(message: Message, user_tg_id: int, code: str) -> bool:
+    code = normalize_code(code or "")
+    if not is_valid_code(code):
+        return False
+    t = await test_by_code(code)
+    user_db_id = await get_user_db_id(user_tg_id)
+    if not t or not user_db_id:
+        if not t:
+            await message.answer("❌ Havoladagi test topilmadi (o'chirilgan bo'lishi mumkin).")
+        return bool(t)
+    await _send_test_card(message, user_db_id, t, await _deeplink_scope(user_db_id, t))
+    return True
+
+
+@router.callback_query(F.data.startswith("tlink_"))
+async def test_link_cb(callback: CallbackQuery, bot: Bot):
+    test_id = int(callback.data.split("_")[1])
+    if not await _is_admin_or_creator(callback.from_user.id, test_id):
+        return await callback.answer("Bu testga huquqingiz yo'q!", show_alert=True)
+    t = await POOL.fetchrow("SELECT code, title FROM tests WHERE id=$1", test_id)
+    if not t:
+        return await callback.answer("Test topilmadi.", show_alert=True)
+    await callback.answer()
+    link = await _test_deep_link(bot, t["code"])
+    await callback.message.answer(
+        f"🔗 <b>{_h(t['title'])}</b> testi havolasi:\n{link}\n\n"
+        f"<i>Shu havolani o'quvchilarga yuboring — bosishi bilan bot ochiladi va test darhol chiqadi "
+        f"(kod yozish shart emas). Ro'yxatdan o'tmaganlar avval ro'yxatdan o'tadi, so'ng test ochiladi.</i>",
+        parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+# ===================== REJALASHTIRILGAN TEST ESLATMASI =====================
+def _reminder_btn(test_id: int, on: bool) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text="🔕 Eslatmani bekor qilish" if on else "🔔 Boshlanishidan oldin eslatish",
+                                callback_data=f"remind_{test_id}")
+
+
+async def _set_reminder(user_db_id: int, test_id: int, on: bool) -> None:
+    if on:
+        await POOL.execute(
+            "INSERT INTO test_reminders (user_id, test_id, created_ts) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
+            user_db_id, test_id, now_ts())
+    else:
+        await POOL.execute("DELETE FROM test_reminders WHERE user_id=$1 AND test_id=$2", user_db_id, test_id)
+
+
+@router.callback_query(F.data.startswith("remind_"))
+async def reminder_toggle_cb(callback: CallbackQuery):
+    test_id = int(callback.data.split("_")[1])
+    user_db_id = await get_user_db_id(callback.from_user.id)
+    if not user_db_id:
+        return await callback.answer("Avval /start orqali ro'yxatdan o'ting.", show_alert=True)
+    t = await POOL.fetchrow("SELECT start_mode, start_ts FROM tests WHERE id=$1", test_id)
+    if not t or not is_scheduled_not_started(t["start_mode"], t["start_ts"])[0]:
+        await _update_button(callback, remove_row=True)
+        return await callback.answer("Bu test allaqachon boshlangan.", show_alert=True)
+    on = not await POOL.fetchval("SELECT 1 FROM test_reminders WHERE user_id=$1 AND test_id=$2", user_db_id, test_id)
+    await _set_reminder(user_db_id, test_id, on)
+    await _update_button(callback, _reminder_btn(test_id, on).text)
+    await callback.answer("🔔 Eslatma qo'yildi: boshlanishidan 30 va 5 daqiqa oldin hamda boshlanganda xabar "
+                          "yuboraman." if on else "🔕 Eslatma bekor qilindi.", show_alert=True)
+
+
+REMINDER_STEPS = (("sent30", 30 * 60, 5 * 60), ("sent5", 5 * 60, 0))
+
+
+async def _reminder_kb(t) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    if int(t["is_free"] or 0) == 1:
+        kb.inline_keyboard.append([InlineKeyboardButton(text="🚀 Testni ochish", callback_data=f"fstart_{t['id']}")])
+    else:
+        kb.inline_keyboard.append([InlineKeyboardButton(text="📦 Pullik testlarim", callback_data="open_mytests")])
+    if WEBAPP_URL:
+        kb.inline_keyboard.append([InlineKeyboardButton(
+            text="📱 Mini App'da ochish", web_app=WebAppInfo(url=f"{WEBAPP_URL}/webapp?code={t['code']}"))])
+    return kb
+
+
+async def process_test_reminders(bot: Bot) -> int:
+    """Navbatdagi eslatmalarni yuboradi; yuborilganlar sonini qaytaradi."""
+    now = now_ts()
+    rows = await POOL.fetch("""
+        SELECT r.user_id, r.test_id, r.sent30, r.sent5, r.sent0, u.telegram_id,
+               t.id, t.code, t.title, t.start_ts, t.start_at, t.duration, t.is_free,
+               COALESCE(t.is_closed,0) AS is_closed, COALESCE(t.is_hidden,0) AS is_hidden
+        FROM test_reminders r JOIN tests t ON t.id=r.test_id JOIN users u ON u.id=r.user_id
+        WHERE t.start_mode='scheduled' AND (r.sent0=0) AND t.start_ts > $1
+    """, now - 15 * 60)
+    sent = 0
+    for r in rows:
+        left = int(r["start_ts"]) - now
+        if r["is_closed"] or r["is_hidden"] or await POOL.fetchval(
+                "SELECT 1 FROM results WHERE user_id=$1 AND test_id=$2", r["user_id"], r["test_id"]):
+            await POOL.execute("UPDATE test_reminders SET sent30=1, sent5=1, sent0=1 WHERE user_id=$1 AND test_id=$2",
+                               r["user_id"], r["test_id"])
+            continue
+        col, text = None, None
+        if left <= 0:
+            col = "sent0"
+            text = (f"🚀 <b>Test boshlandi!</b>\n\n📚 {_h(r['title'])} (<code>{r['code']}</code>)\n"
+                    f"⏳ Vaqt: {r['duration']} daqiqa — hoziroq boshlang.")
+        else:
+            for c, upper, lower in REMINDER_STEPS:
+                if not r[c] and lower < left <= upper:
+                    col = c
+                    text = (f"🔔 <b>Eslatma:</b> test <b>{max(1, round(left / 60))} daqiqadan</b> keyin boshlanadi.\n\n"
+                            f"📚 {_h(r['title'])} (<code>{r['code']}</code>)\n📅 Boshlanish: <b>{r['start_at']}</b>")
+                    break
+        if not col:
+            continue
+        # avval belgilaymiz — bot qayta ishga tushsa ham ikki marta yuborilmaydi
+        upd = "sent30=1, sent5=1, sent0=1" if col == "sent0" else ("sent30=1, sent5=1" if col == "sent5" else "sent30=1")
+        await POOL.execute(f"UPDATE test_reminders SET {upd} WHERE user_id=$1 AND test_id=$2",
+                           r["user_id"], r["test_id"])
+        try:
+            await bot.send_message(r["telegram_id"], text, parse_mode=ParseMode.HTML, reply_markup=await _reminder_kb(r))
+            sent += 1
+        except (TelegramForbiddenError, TelegramBadRequest):
+            pass
+    return sent
+
+
+async def reminder_daemon(bot: Bot):
+    while True:
+        try:
+            await process_test_reminders(bot)
+        except Exception:
+            logging.exception("reminder_daemon iteration failed")
+        await asyncio.sleep(30)
+
+
+async def _send_test_card(message: Message, user_db_id: int, t, scope: str) -> None:
     (test_id, code, title, is_free, price, duration, qcount, file_id, answers,
      start_mode, start_ts_val, start_at) = (
         t["id"], t["code"], t["title"], t["is_free"], t["price"], t["duration"], t["questions_count"],
@@ -3080,13 +3380,18 @@ async def handle_code_search(message: Message, state: FSMContext):
         else:
             text += "\nℹ️ Bu test tekin — pastdagi «🆓 Tekin testlar» bo‘limidan boshlang."
 
+    # ✅ Rejalashtirilgan test hali boshlanmagan bo'lsa — eslatma tugmasi
+    if scheduled_blocked and not has_result:
+        on = await POOL.fetchval("SELECT 1 FROM test_reminders WHERE user_id=$1 AND test_id=$2",
+                                 user_db_id, test_id)
+        kb.inline_keyboard.append([_reminder_btn(test_id, bool(on))])
+
     # ✅ Mini App sozlangan bo'lsa — testni interaktiv oynada ochish tugmasi
     if WEBAPP_URL:
         kb.inline_keyboard.append([InlineKeyboardButton(
             text="📱 Mini App'da ochish", web_app=WebAppInfo(url=f"{WEBAPP_URL}/webapp?code={code}"))])
 
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb if kb.inline_keyboard else None)
-    await state.clear()
 
 
 @router.callback_query(F.data == "noop")
@@ -3343,17 +3648,19 @@ async def free_test_start(callback: CallbackQuery, state: FSMContext, bot: Bot):
         return await callback.message.answer("❌ Bu test vaqti tugab bo‘lgan.")
 
     await upsert_session(user_db_id, test_id, "free", start_ts_, duration_sec)
+    file_id, answer_key, protect, var_note = await _variant_for_start(user_db_id, test_id, file_id, answer_key)
 
     await bot.send_document(
         chat_id=callback.from_user.id,
         document=file_id,
         caption=(
             f"📄 <b>{title}</b>\n"
-            f"🔑 Kod: <code>{code}</code>\n"
+            f"🔑 Kod: <code>{code}</code>{var_note}\n"
             f"🧮 Savollar: <b>{qcount}</b>\n\n"
             f"🆓 Tekin test. Vaqt ketdi ✅"
         ),
-        parse_mode=ParseMode.HTML
+        parse_mode=ParseMode.HTML,
+        protect_content=protect
     )
 
     timer_msg = await bot.send_message(
@@ -3947,11 +4254,13 @@ async def send_paid_pdf(callback: CallbackQuery, bot: Bot):
     if not started_at:
         return await callback.message.answer("⚠️ PDFni ko‘rish uchun avval testni 'Boshlash' tugmasi orqali boshlang.")
 
+    file_id, _key, protect, var_note = await _variant_for_start(user_db_id, test_id, file_id, "")
     await bot.send_document(
         chat_id=callback.from_user.id,
         document=file_id,
-        caption=f"📄 <b>{title}</b>\n🔑 Kod: <code>{code}</code>",
-        parse_mode=ParseMode.HTML
+        caption=f"📄 <b>{title}</b>\n🔑 Kod: <code>{code}</code>{var_note}",
+        parse_mode=ParseMode.HTML,
+        protect_content=protect
     )
 
 
@@ -4167,7 +4476,8 @@ async def view_mistakes(callback: CallbackQuery):
 
     row = await POOL.fetchrow("""
         SELECT r.user_answers, r.open_text_answers, r.open_grades, r.details, t.answers, t.questions_count,
-               t.exam_type, t.open_ref_answers, t.skills_cfg, COALESCE(t.show_review,1) AS show_review
+               t.exam_type, t.open_ref_answers, t.skills_cfg, COALESCE(t.show_review,1) AS show_review,
+               COALESCE(r.variant,'a') AS variant, t.b_answers, t.b_open_ref_answers
         FROM results r JOIN tests t ON t.id=r.test_id
         WHERE r.user_id=$1 AND r.test_id=$2
         ORDER BY r.id ASC LIMIT 1
@@ -4198,8 +4508,9 @@ async def view_mistakes(callback: CallbackQuery):
                 parse_mode=ParseMode.HTML
             )
 
+    key_raw, refs_raw, _fid = _variant_fields(row, row["variant"])
     user_ans = normalize_answers(row["user_answers"])
-    correct_key = normalize_answers(row["answers"])
+    correct_key = normalize_answers(key_raw)
     qcount = min(int(row["questions_count"] or 0), len(correct_key), len(user_ans))
 
     open_answers = {}
@@ -4209,12 +4520,7 @@ async def view_mistakes(callback: CallbackQuery):
         except json.JSONDecodeError:
             open_answers = {}
 
-    open_refs = {}
-    if row["open_ref_answers"]:
-        try:
-            open_refs = json.loads(row["open_ref_answers"])
-        except json.JSONDecodeError:
-            open_refs = {}
+    open_refs = _load_json_dict(refs_raw)
 
     open_grades = _load_json_dict(row["open_grades"])
     mistakes = []
@@ -4252,9 +4558,142 @@ async def view_mistakes(callback: CallbackQuery):
     if open_lines:
         text += ("\n\n" if text else "") + "✍️ <b>Ochiq savol javoblaringiz:</b>\n\n" + "\n".join(open_lines[:20])
 
-    await callback.message.answer(text, parse_mode=ParseMode.HTML)
+    kb = None
+    if mistakes:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text="🔁 Xatolar ustida ishlash", callback_data=f"practice_{test_id}")]])
+    await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
     for qnum, photo_id in open_photos[:20]:
         await callback.message.answer_photo(photo_id, caption=f"{qnum}-savol javobi (rasm)")
+
+
+# ===================== XATOLAR USTIDA ISHLASH (mashq) =====================
+async def _practice_questions(user_db_id: int, test_id: int) -> tuple[dict | None, str]:
+    """(mashq ma'lumoti, xato sababi). Faqat variantli (A-F) xato savollar olinadi."""
+    row = await POOL.fetchrow("""
+        SELECT r.user_answers, COALESCE(r.variant,'a') AS variant, t.answers, t.open_ref_answers, t.file_id,
+               t.b_answers, t.b_open_ref_answers, t.b_file_id, t.exam_type, t.questions_count, t.code, t.title,
+               COALESCE(t.show_review,1) AS show_review, COALESCE(t.protect_files,0) AS protect_files
+        FROM results r JOIN tests t ON t.id=r.test_id WHERE r.user_id=$1 AND r.test_id=$2
+    """, user_db_id, test_id)
+    if not row or not row["user_answers"] or (row["exam_type"] or "") in STAGED_EXAM_TYPES:
+        return None, "Bu test bo'yicha mashq qilib bo'lmaydi."
+    if int(row["show_review"]) == 0:
+        return None, REVIEW_HIDDEN_NOTE
+    if (row["exam_type"] or "") == "rasch":
+        end_ts = await get_test_end_ts(test_id)
+        if end_ts <= 0 or now_ts() < end_ts:
+            return None, "⏳ Mashq test vaqti tugagach ochiladi."
+    key_raw, _refs, file_id = _variant_fields(row, row["variant"])
+    key = normalize_answers(key_raw or "")
+    ua = normalize_answers(row["user_answers"])
+    qs = [i + 1 for i in range(min(len(key), len(ua), int(row["questions_count"] or 0)))
+          if key[i] != "x" and ua[i] != key[i]]
+    if not qs:
+        return None, "🎉 Variantli savollarda xatoyingiz yo'q — mashq kerak emas!"
+    return {"test_id": test_id, "qs": qs, "key": {str(q): key[q - 1] for q in qs}, "idx": 0, "fixed": 0,
+            "tries": 0, "file_id": file_id, "protect": int(row["protect_files"]) == 1,
+            "code": row["code"], "title": row["title"]}, ""
+
+
+def _practice_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=l, callback_data=f"pr_ans_{l.lower()}") for l in "ABC"],
+        [InlineKeyboardButton(text=l, callback_data=f"pr_ans_{l.lower()}") for l in "DEF"],
+        [InlineKeyboardButton(text="⏭ O'tkazib yuborish", callback_data="pr_skip"),
+         InlineKeyboardButton(text="⏹ Tugatish", callback_data="pr_stop")],
+    ])
+
+
+def _practice_prompt(pr: dict, note: str = "") -> str:
+    q = pr["qs"][pr["idx"]]
+    return (f"{note}🔁 <b>Xatolar ustida ishlash</b> ({pr['idx'] + 1}/{len(pr['qs'])})\n"
+            f"📚 {_h(pr['title'])}\n\n"
+            f"📝 <b>{q}-savol</b> — to'g'ri javobni tanlang:\n"
+            f"<i>Mashq natijangizga ta'sir qilmaydi.</i>")
+
+
+@router.callback_query(F.data.startswith("practice_"))
+async def practice_start(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    test_id = int(callback.data.split("_")[1])
+    user_db_id = await get_user_db_id(callback.from_user.id)
+    if not user_db_id:
+        return await callback.answer("Avval /start orqali ro'yxatdan o'ting.", show_alert=True)
+    pr, why = await _practice_questions(user_db_id, test_id)
+    if not pr:
+        return await callback.answer(why[:200], show_alert=True)
+    await callback.answer()
+    await _stash_test_progress(state, callback.from_user.id)
+    await state.clear()
+    await state.set_state(PracticeState.solving)
+    if pr["file_id"]:
+        try:
+            await bot.send_document(callback.from_user.id, pr["file_id"], protect_content=pr["protect"],
+                                    caption=f"📄 {pr['title']} — savollar (mashq uchun)")
+        except Exception:
+            logging.exception(f"Mashq uchun faylni yuborib bo'lmadi (test={test_id})")
+    msg = await callback.message.answer(
+        f"Siz <b>{len(pr['qs'])} ta</b> savolda xato qilgansiz. Har birini qaytadan yechib ko'ring — "
+        f"noto'g'ri bo'lsa yana bir imkoniyat beriladi.\n\n" + _practice_prompt(pr),
+        parse_mode=ParseMode.HTML, reply_markup=_practice_kb())
+    pr["mid"] = msg.message_id
+    await state.update_data(pr=pr)
+
+
+async def _practice_advance(callback: CallbackQuery, state: FSMContext, pr: dict, note: str) -> None:
+    pr["idx"] += 1
+    pr["tries"] = 0
+    if pr["idx"] >= len(pr["qs"]):
+        await state.clear()
+        total, fixed = len(pr["qs"]), pr["fixed"]
+        verdict = ("🎉 Ajoyib — hammasini tuzatdingiz!" if fixed == total else
+                   "💪 Yaxshi harakat! Qolganlarini yana bir bor ko'rib chiqing." if fixed else
+                   "📖 Mavzuni yana takrorlab, keyinroq qayta urinib ko'ring.")
+        await callback.message.edit_text(
+            f"{note}🏁 <b>Mashq yakunlandi</b>\n\n✅ Tuzatildi: <b>{fixed}/{total}</b>\n{verdict}\n\n"
+            f"<i>Bu mashq — rasmiy natijangiz o'zgarmaydi.</i>", parse_mode=ParseMode.HTML, reply_markup=None)
+        admin_flag = await is_admin_user(callback.from_user.id)
+        await callback.message.answer("🏠 Bosh menyu", reply_markup=main_menu_kb(admin_flag))
+        return
+    await state.update_data(pr=pr)
+    await callback.message.edit_text(_practice_prompt(pr, note), parse_mode=ParseMode.HTML,
+                                     reply_markup=_practice_kb())
+
+
+@router.callback_query(PracticeState.solving, F.data.startswith("pr_"))
+async def practice_answer(callback: CallbackQuery, state: FSMContext):
+    pr = (await state.get_data()).get("pr")
+    if not pr or (callback.message and pr.get("mid") and callback.message.message_id != pr["mid"]):
+        await _close_buttons(callback)
+        return await callback.answer("Bu mashq eskirgan.", show_alert=False)
+    q = pr["qs"][pr["idx"]]
+    right = pr["key"][str(q)]
+    if callback.data == "pr_stop":
+        pr["idx"] = len(pr["qs"]) - 1
+        await callback.answer()
+        return await _practice_advance(callback, state, pr, "")
+    if callback.data == "pr_skip":
+        await callback.answer()
+        return await _practice_advance(callback, state, pr, f"⏭ {q}-savol o'tkazib yuborildi "
+                                                            f"(to'g'ri javob: <b>{right.upper()}</b>).\n\n")
+    chosen = callback.data.rsplit("_", 1)[1]
+    if chosen == right:
+        pr["fixed"] += 1
+        await callback.answer("✅ To'g'ri!")
+        return await _practice_advance(callback, state, pr, f"✅ {q}-savol: to'g'ri — <b>{right.upper()}</b>.\n\n")
+    pr["tries"] += 1
+    if pr["tries"] < 2:
+        await state.update_data(pr=pr)
+        await callback.answer("❌ Noto'g'ri — yana bir urinib ko'ring.", show_alert=False)
+        try:
+            await callback.message.edit_text(
+                _practice_prompt(pr, f"❌ <b>{chosen.upper()}</b> — noto'g'ri, yana bir urinib ko'ring.\n\n"),
+                parse_mode=ParseMode.HTML, reply_markup=_practice_kb())
+        except TelegramBadRequest:
+            pass
+        return
+    await callback.answer("❌ Noto'g'ri")
+    await _practice_advance(callback, state, pr, f"❌ {q}-savol: to'g'ri javob — <b>{right.upper()}</b>.\n\n")
 
 
 async def _send_staged_mistakes(answerable, row) -> None:
@@ -4310,7 +4749,7 @@ async def share_result(callback: CallbackQuery, bot: Bot):
         return await callback.message.answer("Avval /start orqali ro‘yxatdan o‘ting.")
 
     row = await POOL.fetchrow("""
-        SELECT t.title, r.score, r.total_questions, r.percent
+        SELECT t.title, t.code, r.score, r.total_questions, r.percent
         FROM results r JOIN tests t ON t.id=r.test_id
         WHERE r.user_id=$1 AND r.test_id=$2
         ORDER BY r.id ASC LIMIT 1
@@ -4318,8 +4757,8 @@ async def share_result(callback: CallbackQuery, bot: Bot):
     if not row:
         return await callback.message.answer("Natija topilmadi.")
 
-    me = await bot.get_me()
-    bot_link = f"https://t.me/{me.username}" if me.username else ""
+    # ✅ Havola to'g'ridan-to'g'ri shu testni ochadi
+    bot_link = await _test_deep_link(bot, row["code"])
 
     share_text = (
         f"🏆 Men \"{row['title']}\" testida {row['score']}/{row['total_questions']} "
@@ -4425,17 +4864,19 @@ async def begin_test(callback: CallbackQuery, state: FSMContext, bot: Bot):
                             now_str_local(), exam_start_ts, payment_id)
 
     await upsert_session(user_db_id, test_id, "paid", exam_start_ts, duration_sec)
+    file_id, answer_key, protect, var_note = await _variant_for_start(user_db_id, test_id, file_id, answer_key)
 
     await bot.send_document(
         chat_id=callback.from_user.id,
         document=file_id,
         caption=(
             f"📄 <b>{title}</b>\n"
-            f"🔑 Kod: <code>{code}</code>\n"
+            f"🔑 Kod: <code>{code}</code>{var_note}\n"
             f"🧮 Savollar: <b>{qcount}</b>\n\n"
             f"✅ Test boshlandi. Vaqt ketdi!"
         ),
-        parse_mode=ParseMode.HTML
+        parse_mode=ParseMode.HTML,
+        protect_content=protect
     )
 
     timer_msg = await bot.send_message(
@@ -5169,8 +5610,9 @@ async def _finalize_staged_test(answerable, state: FSMContext) -> None:
     )
     kind_label = {"dtm_staged": "DTM (5 bosqich)", "ielts4": "IELTS (4 ko'nikma)",
                   "cefr4": "CEFR (4 ko'nikma)", "sat_staged": "SAT (2 bosqich)"}.get(kind, kind)
+    link = await _test_deep_link(answerable, data.get("code"))
     await answerable.answer(
-        f"✅ <b>{kind_label}</b> testi qo'shildi!\n🔑 Kod: <code>{data.get('code')}</code>\n\n"
+        f"✅ <b>{kind_label}</b> testi qo'shildi!\n🔑 Kod: <code>{data.get('code')}</code>\n🔗 Havola: {link}\n\n"
         f"<b>Bosqichlar:</b>\n{section_lines}"
         + ("\n\n🔒 Javoblar tahlili: <b>yopiq</b> (o'quvchi faqat sonlarni ko'radi)"
            if int(data.get("show_review", 1)) == 0 else ""),
@@ -5428,16 +5870,19 @@ async def _send_stage_section(user_tg_id: int, bot: Bot, state: FSMContext) -> N
             await state.update_data(stage_current_qcount=qcount, stage_mcq_q=1, stage_mcq_answers={},
                                     stage_mcq_open_answers={})
 
+            protect = bool(await POOL.fetchval(
+                "SELECT COALESCE(protect_files,0) FROM tests WHERE id=$1", test_id))
             if section.get("file_id"):
                 caption = f"{label} — {qcount} ta savol"
                 fk = section.get("file_kind")
                 try:
                     if fk == "audio":
-                        await bot.send_audio(user_tg_id, section["file_id"], caption=caption)
+                        await bot.send_audio(user_tg_id, section["file_id"], caption=caption, protect_content=protect)
                     elif fk == "video":
-                        await bot.send_video(user_tg_id, section["file_id"], caption=caption)
+                        await bot.send_video(user_tg_id, section["file_id"], caption=caption, protect_content=protect)
                     else:
-                        await bot.send_document(user_tg_id, section["file_id"], caption=caption)
+                        await bot.send_document(user_tg_id, section["file_id"], caption=caption,
+                                                protect_content=protect)
                 except Exception:
                     logging.exception(f"Bosqich faylini yuborib bo'lmadi (test={test_id}, key={key})")
 
@@ -5445,7 +5890,7 @@ async def _send_stage_section(user_tg_id: int, bot: Bot, state: FSMContext) -> N
                 try:
                     await bot.send_document(
                         user_tg_id, section["question_file_id"],
-                        caption=f"{label} — savollar"
+                        caption=f"{label} — savollar", protect_content=protect
                     )
                 except Exception:
                     logging.exception(f"Bosqich savollar faylini yuborib bo'lmadi (test={test_id}, key={key})")
@@ -6700,7 +7145,8 @@ async def _send_open_answers_for_review(bot: Bot, chat_id: int, result_id: int, 
     """Bitta natijadagi ochiq javoblarni ✅/❌ tugmalari bilan ustozga yuboradi.
     only_pending=True — faqat avtomatik tekshirib bo'lmaganlari (rasm/kalitsiz)."""
     row = await POOL.fetchrow("""
-        SELECT r.open_text_answers, r.open_grades, u.full_name, t.title, t.code, t.answers, t.open_ref_answers
+        SELECT r.open_text_answers, r.open_grades, u.full_name, t.title, t.code, t.answers, t.open_ref_answers,
+               COALESCE(r.variant,'a') AS variant, t.b_answers, t.b_open_ref_answers
         FROM results r JOIN users u ON u.id=r.user_id JOIN tests t ON t.id=r.test_id
         WHERE r.id=$1
     """, result_id)
@@ -6708,8 +7154,9 @@ async def _send_open_answers_for_review(bot: Bot, chat_id: int, result_id: int, 
         return 0
     answers = _load_json_dict(row["open_text_answers"])
     grades = _load_json_dict(row["open_grades"])
-    refs = _load_json_dict(row["open_ref_answers"])
-    key = normalize_answers(row["answers"] or "")
+    key_raw, refs_raw, _fid = _variant_fields(row, row["variant"])
+    refs = _load_json_dict(refs_raw)
+    key = normalize_answers(key_raw or "")
     qnums = [str(i + 1) for i, c in enumerate(key) if c == "x"]
     to_send = [q for q in qnums
                if open_answer_has_content(answers.get(q)) and (not only_pending or grades.get(q) is None)]
@@ -6747,12 +7194,13 @@ async def _recompute_result_scores(result_id: int, grades: dict | None = None) -
     hisoblaydi va bazaga yozadi."""
     row = await POOL.fetchrow("""
         SELECT r.id, r.user_id, r.test_id, r.user_answers, r.open_grades, r.details, r.grade,
-               t.answers, t.questions_count, t.exam_type, t.dtm_cfg
+               t.answers, t.questions_count, t.exam_type, t.dtm_cfg, t.open_ref_answers,
+               COALESCE(r.variant,'a') AS variant, t.b_answers, t.b_open_ref_answers
         FROM results r JOIN tests t ON t.id=r.test_id WHERE r.id=$1
     """, result_id)
     if not row:
         return None
-    key = normalize_answers(row["answers"] or "")
+    key = normalize_answers(_variant_fields(row, row["variant"])[0] or "")
     ua = normalize_answers(row["user_answers"] or "")
     qcount = min(int(row["questions_count"] or 0), len(key))
     if grades is None:
@@ -6797,16 +7245,18 @@ async def _regrade_test_results(test_id: int) -> int:
     yangi kalit bo'yicha qayta hisoblanadi. Avval kalit o'zgartirilsa ham
     avvalgi (xato kalit bilan hisoblangan) ballar o'zgarishsiz qolardi."""
     t = await POOL.fetchrow(
-        "SELECT answers, open_ref_answers, questions_count, exam_type FROM tests WHERE id=$1", test_id)
+        "SELECT answers, open_ref_answers, questions_count, exam_type, b_answers, b_open_ref_answers "
+        "FROM tests WHERE id=$1", test_id)
     if not t:
         return 0
-    key = normalize_answers(t["answers"] or "")
-    qcount = min(int(t["questions_count"] or 0), len(key))
-    refs = _load_json_dict(t["open_ref_answers"])
     rows = await POOL.fetch(
-        "SELECT id, open_text_answers, open_grades FROM results WHERE test_id=$1 AND user_answers IS NOT NULL",
-        test_id)
+        "SELECT id, open_text_answers, open_grades, COALESCE(variant,'a') AS variant FROM results "
+        "WHERE test_id=$1 AND user_answers IS NOT NULL", test_id)
     for r in rows:
+        key_raw, refs_raw, _fid = _variant_fields(t, r["variant"])
+        key = normalize_answers(key_raw or "")
+        qcount = min(int(t["questions_count"] or 0), len(key))
+        refs = _load_json_dict(refs_raw)
         grades = _merge_regraded_open(key[:qcount], _load_json_dict(r["open_text_answers"]), refs,
                                       _load_json_dict(r["open_grades"]))
         await _recompute_result_scores(r["id"], grades)
@@ -7017,6 +7467,51 @@ async def _after_open_grading_complete(bot: Bot, result_id: int, info: dict) -> 
                 logging.exception(f"Ochiq javoblardan keyin sertifikat yuborilmadi (result={result_id})")
 
 
+# ===================== SHUBHALI FAOLLIK =====================
+# Juda tez yechish: kamida shuncha savolli testda, savolga o'rtacha shundan kam
+# vaqt sarflab, shundan yuqori natija olinsa (masalan 30 savol 2 daqiqada, 80%).
+SUSPICIOUS_MIN_QCOUNT = 10
+SUSPICIOUS_SEC_PER_Q = 5
+SUSPICIOUS_MIN_PERCENT = 50.0
+
+
+def _is_suspiciously_fast(qcount: int, elapsed_sec: int, percent: float) -> bool:
+    return (int(qcount) >= SUSPICIOUS_MIN_QCOUNT and int(elapsed_sec) < int(qcount) * SUSPICIOUS_SEC_PER_Q
+            and float(percent) >= SUSPICIOUS_MIN_PERCENT)
+
+
+def _phone_digits(phone: str | None) -> str:
+    d = re.sub(r"\D", "", phone or "")
+    return d[-9:] if len(d) >= 9 else ""
+
+
+async def _report_suspicious(bot: Bot, kind: str, user_db_id: int | None, test_id: int | None, details: str) -> None:
+    """Hodisani saqlaydi (Mini App admin paneli uchun) va adminlarga xabar beradi."""
+    try:
+        await POOL.execute(
+            "INSERT INTO suspicious_events (kind, user_id, test_id, details, created_ts) VALUES ($1,$2,$3,$4,$5)",
+            kind, user_db_id, test_id, details, now_ts())
+        u = await POOL.fetchrow("SELECT full_name, phone, telegram_id FROM users WHERE id=$1", user_db_id) \
+            if user_db_id else None
+        t = await POOL.fetchrow("SELECT code, title FROM tests WHERE id=$1", test_id) if test_id else None
+        title = {"fast": "⚡ Juda tez yechildi", "phone": "📱 Bir telefonda bir nechta akkaunt"}.get(kind, kind)
+        text = f"🚨 <b>Shubhali faollik: {title}</b>\n\n"
+        if u:
+            text += (f"👤 {_h(u['full_name'] or '-')} (ID: <code>{u['telegram_id']}</code>)\n"
+                     f"📞 {_h(u['phone'] or '-')}\n")
+        if t:
+            text += f"📚 {_h(t['title'])} (<code>{t['code']}</code>)\n"
+        text += f"\n{_h(details)}"
+        rows = await POOL.fetch("SELECT telegram_id FROM users WHERE role='admin'")
+        for tg_id in {ADMIN_ID} | {r["telegram_id"] for r in rows}:
+            try:
+                await bot.send_message(tg_id, text, parse_mode=ParseMode.HTML)
+            except (TelegramForbiddenError, TelegramBadRequest):
+                pass
+    except Exception:
+        logging.exception("Shubhali faollik haqida xabar berib bo'lmadi")
+
+
 async def process_test_submission(
     user_tg_id: int, bot: Bot, state: FSMContext, user_ans: str, open_answers: dict | None = None
 ):
@@ -7057,7 +7552,7 @@ async def process_test_submission(
     t = await POOL.fetchrow("""
         SELECT code, title, subject, questions_count, answers, exam_type, dtm_cfg, start_mode, start_ts, duration,
                cert_academy_name, cert_signee_name, cert_template, creator_id, open_ref_answers,
-               COALESCE(show_review,1) AS show_review
+               COALESCE(show_review,1) AS show_review, b_answers, b_open_ref_answers
         FROM tests
         WHERE id=$1
     """, test_id)
@@ -7069,8 +7564,10 @@ async def process_test_submission(
         await state.clear()
         return
 
-    code, title, subject, qcount, answer_key_raw, exam_type, dtm_cfg, start_mode, start_ts_val, duration_min = (
-        t["code"], t["title"], t["subject"], t["questions_count"], t["answers"], t["exam_type"], t["dtm_cfg"],
+    variant = sess["variant"] if (t["b_answers"] or "") else "a"
+    answer_key_raw, open_refs_raw, _fid = _variant_fields(t, variant)
+    code, title, subject, qcount, exam_type, dtm_cfg, start_mode, start_ts_val, duration_min = (
+        t["code"], t["title"], t["subject"], t["questions_count"], t["exam_type"], t["dtm_cfg"],
         t["start_mode"], t["start_ts"], t["duration"]
     )
     qcount = int(qcount)
@@ -7089,7 +7586,7 @@ async def process_test_submission(
     # ✅ Ochiq (x) savollar: kalit bilan avtomatik solishtiriladi; avtomatik
     # tekshirib bo'lmaydiganlari (rasm/kalitsiz) ustoz tekshiruviga qoladi.
     open_answers = open_answers or {}
-    open_refs = _load_json_dict(t["open_ref_answers"])
+    open_refs = _load_json_dict(open_refs_raw)
     open_grades = initial_open_grades(correct_key[:qcount], open_answers, open_refs)
     score, scored_qcount, open_pending = score_with_open(user_ans, correct_key, qcount, open_grades)
     open_count = sum(1 for c in correct_key[:qcount] if c == "x")
@@ -7131,9 +7628,9 @@ async def process_test_submission(
                 user_answers, open_text_answers,
                 earned_points, max_points, details,
                 rasch_ball, rasch_percent, grade,
-                finished_ts, date, open_grades, open_pending
+                finished_ts, date, open_grades, open_pending, variant
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL, $11, $12, $13, $14, $15)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL, $11, $12, $13, $14, $15, $16)
             RETURNING id
         """,
             user_db_id, test_id,
@@ -7144,7 +7641,7 @@ async def process_test_submission(
             grade_value,
             now_ts(),
             now_str_local(),
-            json.dumps(open_grades, ensure_ascii=False), int(open_pending)
+            json.dumps(open_grades, ensure_ascii=False), int(open_pending), variant
         )
     except asyncpg.UniqueViolationError:
         # Ikkita so'rov bir vaqtda kelib, ikkalasi ham shu yergacha yetib kelgan —
@@ -7187,6 +7684,14 @@ async def process_test_submission(
     if open_pending:
         creator_id = t["creator_id"] or ADMIN_ID
         asyncio.create_task(_send_open_answers_for_review(bot, creator_id, result_id))
+
+    # ✅ Shubhali faollik: savollar soniga nisbatan juda tez va yuqori natija
+    elapsed = max(0, now_ts() - int(start_ts_))
+    if _is_suspiciously_fast(qcount, elapsed, percent_points):
+        asyncio.create_task(_report_suspicious(
+            bot, "fast", user_db_id, test_id,
+            f"{qcount} savolli test {fmt_seconds(elapsed)} ichida yechildi — natija {percent_points:.1f}% "
+            f"(savolga o'rtacha {elapsed / max(qcount, 1):.1f} soniya)"))
 
     exam_type = (exam_type or "simple")
 
@@ -7648,12 +8153,16 @@ async def my_results(message: Message):
         "<b>📊 Mening statistikam</b>\n"
         f"🧮 Jami topshirilgan: <b>{summary['cnt']}</b> ta\n"
         f"📈 O'rtacha natija: <b>{float(summary['avgp'] or 0):.1f}%</b>\n"
-        f"🏅 Eng yaxshi natija: <b>{float(summary['maxp'] or 0):.1f}%</b>\n\n"
+        f"🏅 Eng yaxshi natija: <b>{float(summary['maxp'] or 0):.1f}%</b>\n"
+        f"{_progress_text([float(r['percent'] or 0) for r in reversed(rows)])}\n"
         "<b>📄 So'nggi natijalar (oxirgi 10)</b>\n\n"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📜 Sertifikatlarim", callback_data="my_certs")]
     ])
+    if WEBAPP_URL and len(rows) >= 2:
+        kb.inline_keyboard.append([InlineKeyboardButton(
+            text="📈 O'sish grafigi", web_app=WebAppInfo(url=f"{WEBAPP_URL}/webapp?view=profile"))])
 
     for r in rows:
         test_id, code, title, score, total, pct, dt = (
@@ -7668,6 +8177,25 @@ async def my_results(message: Message):
         ])
 
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+def _progress_text(percents: list[float]) -> str:
+    """Natijalar dinamikasi (eskidan yangiga): oxirgi natijalar zanjiri va o'zgarish."""
+    if len(percents) < 2:
+        return ""
+    last = percents[-8:]
+    chain = " → ".join(f"{p:.0f}%" for p in last)
+    half = max(1, len(percents) // 2)
+    old_avg = sum(percents[:half]) / half
+    new_avg = sum(percents[half:]) / max(1, len(percents) - half)
+    diff = new_avg - old_avg
+    if diff >= 3:
+        trend = f"📈 O'sish: <b>+{diff:.1f}%</b> — zo'r, shunday davom eting!"
+    elif diff <= -3:
+        trend = f"📉 Pasayish: <b>{diff:.1f}%</b> — xatolar ustida ishlab ko'ring."
+    else:
+        trend = "➡️ Natijalar barqaror."
+    return f"\n<b>📈 Dinamika:</b> {chain}\n{trend}\n"
 
 
 @router.callback_query(F.data == "my_certs")
@@ -7999,6 +8527,12 @@ async def approve_payment(callback: CallbackQuery, bot: Bot):
     extra = ""
     if (start_mode or "normal") == "scheduled":
         extra = f"\n📅 Boshlanish: <b>{start_at}</b>\n⚠️ PDF faqat vaqt yetganda beriladi."
+        if is_scheduled_not_started(start_mode, start_ts_val)[0]:
+            # ✅ Sotib olgan o'quvchiga boshlanish eslatmasi avtomatik qo'yiladi
+            pay_user = await POOL.fetchrow("SELECT user_id, test_id FROM payments WHERE id=$1", payment_id)
+            if pay_user:
+                await _set_reminder(pay_user["user_id"], pay_user["test_id"], True)
+                extra += "\n🔔 Boshlanishidan 30 va 5 daqiqa oldin eslatma yuboriladi."
 
     try:
         await bot.send_message(
@@ -8275,7 +8809,7 @@ async def xl_export(callback: CallbackQuery, bot: Bot):
 
     t = await POOL.fetchrow("""
         SELECT code, title, is_free, price, duration, questions_count, start_mode, start_at, exam_type,
-               open_ref_answers
+               open_ref_answers, b_answers, b_open_ref_answers
         FROM tests WHERE id=$1
     """, test_id)
 
@@ -8291,12 +8825,13 @@ async def xl_export(callback: CallbackQuery, bot: Bot):
         SELECT u.full_name, u.phone, u.telegram_id,
                r.score, r.total_questions, r.percent,
                r.rasch_ball, r.rasch_percent, r.grade,
-               r.open_text_answers, r.date
+               r.open_text_answers, r.date, COALESCE(r.variant,'a') AS variant
         FROM results r
         JOIN users u ON u.id=r.user_id
         WHERE r.test_id=$1
         ORDER BY r.percent DESC, r.id ASC
     """, test_id)
+    has_b = bool(t["b_answers"] or "")
 
     pays = await POOL.fetch("""
         SELECT u.full_name, u.phone, u.telegram_id,
@@ -8326,16 +8861,10 @@ async def xl_export(callback: CallbackQuery, bot: Bot):
     ws_res.append([
         "FullName", "Phone", "TelegramID", "Score", "Total", "Percent", "RaschBall", "RaschPercent", "Grade",
         "OpenAnswers", "Date"
-    ])
-
-    test_open_refs = {}
-    if t["open_ref_answers"]:
-        try:
-            test_open_refs = json.loads(t["open_ref_answers"])
-        except json.JSONDecodeError:
-            test_open_refs = {}
+    ] + (["Variant"] if has_b else []))
 
     for r in results:
+        test_open_refs = _load_json_dict(_variant_fields(t, r["variant"])[1])
         open_txt = ""
         if r["open_text_answers"]:
             try:
@@ -8350,7 +8879,7 @@ async def xl_export(callback: CallbackQuery, bot: Bot):
                 open_txt = ""
         ws_res.append([_xlsx_safe(r["full_name"]), _xlsx_safe(r["phone"]), r["telegram_id"], r["score"],
                         r["total_questions"], r["percent"], r["rasch_ball"], r["rasch_percent"], r["grade"],
-                        _xlsx_safe(open_txt), r["date"]])
+                        _xlsx_safe(open_txt), r["date"]] + ([r["variant"].upper()] if has_b else []))
 
     ws_pay = wb.create_sheet("Payments")
     ws_pay.append(["FullName", "Phone", "TelegramID", "Status", "CreatedAt", "RejectReason", "StartedAt"])
@@ -8965,6 +9494,8 @@ async def _send_edit_field_picker(answerable, state: FSMContext, t):
         kb.inline_keyboard.append(
             [InlineKeyboardButton(text="🔑 Javob kaliti", callback_data="edtf_answers")])
     kb.inline_keyboard.append([_review_toggle_btn(t["id"], int(t["show_review"]))])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🛡 Ko'chirishga qarshi", callback_data=f"acmenu_{t['id']}")])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="📑 Testdan nusxa olish", callback_data=f"dupe_{t['id']}")])
 
     await answerable.answer(
         f"✏️ <b>{t['title']}</b> (<code>{t['code']}</code>)\nQaysi maydonni o'zgartirmoqchisiz?\n\n"
@@ -8994,6 +9525,192 @@ async def review_toggle(callback: CallbackQuery):
     await callback.answer(
         "✅ Endi o'quvchilar javoblar tahlilini ko'radi." if new_val else
         "🔒 Javoblar tahlili yopildi — o'quvchilar faqat to'g'ri/xato sonini ko'radi.", show_alert=True)
+
+
+# ----- Ko'chirishga qarshi: fayl himoyasi va B variant -----
+_ON_OFF = {True: "yoqilgan", False: "o'chiq"}
+_ON_OFF_ICON = {True: "✅ yoqilgan", False: "❌ o'chiq"}
+_YES_NO = {True: "bor", False: "yo'q"}
+
+
+async def _render_anticheat_menu(answerable, test_id: int) -> None:
+    t = await POOL.fetchrow(
+        "SELECT id, code, title, exam_type, b_answers, COALESCE(protect_files,0) AS protect_files "
+        "FROM tests WHERE id=$1", test_id)
+    if not t:
+        await answerable.answer("Test topilmadi.")
+        return
+    et = t["exam_type"] or "simple"
+    has_b = bool(t["b_answers"] or "")
+    prot = int(t["protect_files"]) == 1
+    text = (
+        f"🛡 <b>Ko'chirishga qarshi</b> — <b>{_h(t['title'])}</b> (<code>{t['code']}</code>)\n\n"
+        f"🔒 <b>Fayl himoyasi:</b> {_ON_OFF[prot]}\n"
+        f"<i>Yoqilsa, test fayllarini forward qilish, saqlash va skrinshot olish Telegram tomonidan "
+        f"taqiqlanadi (o'quvchi faylni faqat bot ichida ko'radi).</i>\n\n"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text=f"🔒 Fayl himoyasi: {_ON_OFF_ICON[prot]}",
+        callback_data=f"acprot_{test_id}")]])
+    if et in B_VARIANT_EXAM_TYPES:
+        text += (
+            f"📑 <b>B variant:</b> {_YES_NO[has_b]}\n"
+            f"<i>Ikkinchi PDF va javob kaliti qo'shsangiz, o'quvchilar navbatma-navbat A yoki B variantni "
+            f"oladi — yonma-yon o'tirganlar bir-biridan ko'chira olmaydi. Savollar soni va ochiq (x) "
+            f"savollar o'rni A bilan bir xil bo'lishi kerak.</i>"
+        )
+        if has_b:
+            kb.inline_keyboard.append([InlineKeyboardButton(text="♻️ B variantni yangilash",
+                                                            callback_data=f"acbadd_{test_id}")])
+            kb.inline_keyboard.append([InlineKeyboardButton(text="🗑 B variantni o'chirish",
+                                                            callback_data=f"acbdel_{test_id}")])
+        else:
+            kb.inline_keyboard.append([InlineKeyboardButton(text="➕ B variant qo'shish",
+                                                            callback_data=f"acbadd_{test_id}")])
+    else:
+        text += "<i>📑 B variant faqat oddiy, DTM (1 sessiya), CEFR, IELTS va SAT (tezkor) testlarda mavjud.</i>"
+    await answerable.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("acmenu_"))
+async def anticheat_menu(callback: CallbackQuery, state: FSMContext):
+    test_id = int(callback.data.split("_")[1])
+    if not await _is_admin_or_creator(callback.from_user.id, test_id):
+        return await callback.answer("Bu testga huquqingiz yo'q!", show_alert=True)
+    await state.clear()
+    await callback.answer()
+    await _render_anticheat_menu(callback.message, test_id)
+
+
+@router.callback_query(F.data.startswith("acprot_"))
+async def anticheat_protect_toggle(callback: CallbackQuery):
+    test_id = int(callback.data.split("_")[1])
+    if not await _is_admin_or_creator(callback.from_user.id, test_id):
+        return await callback.answer("Bu testga huquqingiz yo'q!", show_alert=True)
+    new_val = await POOL.fetchval(
+        "UPDATE tests SET protect_files = 1 - COALESCE(protect_files,0) WHERE id=$1 RETURNING protect_files",
+        test_id)
+    if new_val is None:
+        return await callback.answer("Test topilmadi.", show_alert=True)
+    await _update_button(callback, f"🔒 Fayl himoyasi: {_ON_OFF_ICON[bool(new_val)]}")
+    await callback.answer("🔒 Fayl himoyasi yoqildi." if new_val else "Fayl himoyasi o'chirildi.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("acbadd_"))
+async def anticheat_b_add(callback: CallbackQuery, state: FSMContext):
+    test_id = int(callback.data.split("_")[1])
+    if not await _is_admin_or_creator(callback.from_user.id, test_id):
+        return await callback.answer("Bu testga huquqingiz yo'q!", show_alert=True)
+    et = await POOL.fetchval("SELECT exam_type FROM tests WHERE id=$1", test_id)
+    if (et or "simple") not in B_VARIANT_EXAM_TYPES:
+        return await callback.answer("Bu turdagi testga B variant qo'shib bo'lmaydi.", show_alert=True)
+    await callback.answer()
+    await _update_button(callback, remove_row=True)
+    await state.clear()
+    await state.update_data(ac_test_id=test_id)
+    await state.set_state(AntiCheatState.b_file)
+    await callback.message.answer("📑 <b>B variant</b> — 1/2: B variant savollari bo'lgan <b>PDF</b> faylni yuboring:",
+                                  parse_mode=ParseMode.HTML, reply_markup=nav_kb(include_back=False))
+
+
+@router.message(AntiCheatState.b_file, F.document)
+async def anticheat_b_file(message: Message, state: FSMContext):
+    data = await state.get_data()
+    test_id = data.get("ac_test_id")
+    qcount, a_key = 0, ""
+    t = await POOL.fetchrow("SELECT questions_count, answers FROM tests WHERE id=$1", test_id)
+    if t:
+        qcount, a_key = int(t["questions_count"] or 0), normalize_answers(t["answers"] or "")
+    await state.update_data(ac_b_file=message.document.file_id)
+    await state.set_state(AntiCheatState.b_answers)
+    xs = open_question_positions(a_key)
+    note = (f"\nOchiq (x) savollar A variantdagi kabi aynan shu o'rinlarda bo'lsin: <b>{', '.join(map(str, xs))}</b>."
+            if xs else "")
+    await message.answer(
+        f"✅ Fayl qabul qilindi.\n\n📑 2/2: B variant <b>javob kalitini</b> yuboring — aynan <b>{qcount} ta</b> harf "
+        f"(A-F), bo'shliqsiz.{note}", parse_mode=ParseMode.HTML)
+
+
+@router.message(AntiCheatState.b_file)
+async def anticheat_b_file_wrong(message: Message):
+    if (message.text or "") in TOP_MENU_BTNS:
+        return
+    await message.answer("⚠️ B variant savollari bo'lgan PDF faylni (hujjat ko'rinishida) yuboring:")
+
+
+@router.message(AntiCheatState.b_answers)
+async def anticheat_b_answers(message: Message, state: FSMContext):
+    if (message.text or "") in TOP_MENU_BTNS:
+        return
+    data = await state.get_data()
+    test_id = data.get("ac_test_id")
+    t = await POOL.fetchrow("SELECT questions_count, answers FROM tests WHERE id=$1", test_id)
+    if not t:
+        await state.clear()
+        return await message.answer("Test topilmadi.")
+    qcount, a_key = int(t["questions_count"] or 0), normalize_answers(t["answers"] or "")
+    val = normalize_answers(message.text or "")
+    if not is_answer_string_valid(val):
+        return await message.answer("⚠️ Kalit faqat A-F harflaridan (ochiq savol uchun x) iborat bo'lsin. Qayta yuboring:")
+    if len(val) != qcount:
+        return await message.answer(f"⚠️ Javoblar soni {qcount} ta bo'lishi kerak, siz {len(val)} ta yubordingiz:")
+    xs = open_question_positions(val)
+    if xs != open_question_positions(a_key):
+        return await message.answer(
+            "⚠️ Ochiq (x) savollar o'rni A variant bilan bir xil bo'lishi kerak. Qayta yuboring:")
+    if xs:
+        await state.update_data(ac_b_answers=val, ac_b_positions=xs)
+        await state.set_state(AntiCheatState.b_refs)
+        return await message.answer(_open_ref_prompt_text(xs), parse_mode=ParseMode.HTML)
+    await _save_b_variant(message, state, test_id, data.get("ac_b_file"), val, None)
+
+
+@router.message(AntiCheatState.b_refs)
+async def anticheat_b_refs(message: Message, state: FSMContext):
+    if (message.text or "") in TOP_MENU_BTNS:
+        return
+    data = await state.get_data()
+    positions = data.get("ac_b_positions") or []
+    ref_map = parse_open_ref_answers(message.text or "", positions)
+    if ref_map is None:
+        return await message.answer(f"⚠️ Aynan <b>{len(positions)} qator</b> yuboring (har birida bitta javob):",
+                                    parse_mode=ParseMode.HTML)
+    await _save_b_variant(message, state, data.get("ac_test_id"), data.get("ac_b_file"), data.get("ac_b_answers"),
+                          json.dumps(ref_map, ensure_ascii=False))
+
+
+async def _save_b_variant(message: Message, state: FSMContext, test_id, file_id, answers, refs_json) -> None:
+    if not await _is_admin_or_creator(message.from_user.id, test_id):
+        await state.clear()
+        return await message.answer("⚠️ Bu testni tahrirlashga ruxsatingiz yo'q.")
+    await POOL.execute("UPDATE tests SET b_file_id=$1, b_answers=$2, b_open_ref_answers=$3 WHERE id=$4",
+                       file_id, answers, refs_json, test_id)
+    regraded = 0
+    if await POOL.fetchval("SELECT 1 FROM results WHERE test_id=$1 AND variant='b' LIMIT 1", test_id):
+        regraded = await _regrade_test_results(test_id)
+    await state.clear()
+    admin_flag = await is_admin_user(message.from_user.id)
+    extra = f"\n♻️ {regraded} ta natija yangi B kalit bo'yicha qayta hisoblandi." if regraded else ""
+    await message.answer(
+        "✅ <b>B variant saqlandi.</b> Endi testni boshlagan o'quvchilar navbatma-navbat A yoki B variantni oladi "
+        f"(chatda ham, Mini App'da ham).{extra}", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(admin_flag))
+
+
+@router.callback_query(F.data.startswith("acbdel_"))
+async def anticheat_b_delete(callback: CallbackQuery):
+    test_id = int(callback.data.split("_")[1])
+    if not await _is_admin_or_creator(callback.from_user.id, test_id):
+        return await callback.answer("Bu testga huquqingiz yo'q!", show_alert=True)
+    used = await POOL.fetchval("SELECT COUNT(*) FROM results WHERE test_id=$1 AND variant='b'", test_id)
+    used += await POOL.fetchval("SELECT COUNT(*) FROM sessions WHERE test_id=$1 AND variant='b'", test_id)
+    if used:
+        return await callback.answer(
+            f"B variantni {used} ta o'quvchi yechgan yoki yechyapti — ularning natijasi buzilmasligi uchun "
+            f"o'chirib bo'lmaydi. Kerak bo'lsa «♻️ B variantni yangilash»dan foydalaning.", show_alert=True)
+    await POOL.execute("UPDATE tests SET b_file_id=NULL, b_answers=NULL, b_open_ref_answers=NULL WHERE id=$1",
+                       test_id)
+    await _close_buttons(callback, "🗑 B variant o'chirildi — endi hamma A variantni oladi.")
+    await callback.answer("B variant o'chirildi.")
 
 
 _EDIT_FIELD_LABELS = {
@@ -9119,6 +9836,18 @@ async def edittest_save(message: Message, state: FSMContext):
             return await message.answer(
                 f"⚠️ Javoblar soni <b>{current_q}</b> ta bo'lishi kerak, siz {len(val)} ta yubordingiz. "
                 f"Qayta kiriting:", parse_mode=ParseMode.HTML)
+        b_key = normalize_answers(await POOL.fetchval("SELECT b_answers FROM tests WHERE id=$1", test_id) or "")
+        if b_key and (len(b_key) != len(val) or open_question_positions(b_key) != open_question_positions(val)):
+            if await POOL.fetchval("SELECT 1 FROM results WHERE test_id=$1 AND variant='b' UNION ALL "
+                                   "SELECT 1 FROM sessions WHERE test_id=$1 AND variant='b' LIMIT 1", test_id):
+                return await message.answer(
+                    "⚠️ Bu testda B variant bor: savollar soni va ochiq (x) savollar o'rni B variant bilan bir xil "
+                    "bo'lishi kerak. Qayta kiriting yoki avval «🛡 Ko'chirishga qarshi» orqali B variantni yangilang:")
+            # B variantni hali hech kim yechmagan — mos kelmay qolgani uchun olib tashlaymiz
+            await POOL.execute(
+                "UPDATE tests SET b_file_id=NULL, b_answers=NULL, b_open_ref_answers=NULL WHERE id=$1", test_id)
+            await message.answer("ℹ️ B variant yangi kalitga mos kelmagani uchun o'chirildi — kerak bo'lsa "
+                                 "«🛡 Ko'chirishga qarshi» orqali qaytadan qo'shing.")
 
         open_positions = open_question_positions(val)
         if open_positions:
@@ -9182,6 +9911,8 @@ async def _send_staged_edit_picker(answerable, state: FSMContext, t) -> None:
             [InlineKeyboardButton(text=f"🧩 {sec.get('name', key)}", callback_data=f"edtstage_sec_{t['id']}_{key}")]
         )
     kb.inline_keyboard.append([_review_toggle_btn(t["id"], int(t["show_review"]))])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🛡 Ko'chirishga qarshi", callback_data=f"acmenu_{t['id']}")])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="📑 Testdan nusxa olish", callback_data=f"dupe_{t['id']}")])
 
     await answerable.answer(
         f"✏️ <b>{t['title']}</b> (<code>{t['code']}</code>) — bosqichli test.\n"
@@ -9942,20 +10673,103 @@ async def _nav_show_subject(answerable, state: FSMContext) -> None:
 
 @router.message(F.text == BTN_ADD_TEST)
 async def admin_add_test(message: Message, state: FSMContext):
-    is_admin = await is_admin_user(message.from_user.id)
-
-    if not is_admin:
-        today_start = int(datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-        count = await POOL.fetchval(
-            "SELECT COUNT(*) FROM tests WHERE creator_id=$1 AND created_ts>=$2",
-            message.from_user.id, today_start
-        )
-        if count >= 10:
-            return await message.answer(
-                "⚠️ Bugungi kunlik limitingiz (10 ta test) tugadi.\nErtaga yana test yaratishingiz mumkin bo'ladi.")
+    if await _daily_test_limit_reached(message.from_user.id):
+        return await message.answer(
+            "⚠️ Bugungi kunlik limitingiz (10 ta test) tugadi.\nErtaga yana test yaratishingiz mumkin bo'ladi.")
 
     await state.update_data(nav_stack=[])
     await _nav_show_subject(message, state)
+
+
+async def _daily_test_limit_reached(tg_id: int) -> bool:
+    if await is_admin_user(tg_id):
+        return False
+    today_start = int(datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    count = await POOL.fetchval(
+        "SELECT COUNT(*) FROM tests WHERE creator_id=$1 AND created_ts>=$2", tg_id, today_start)
+    return count >= 10
+
+
+# ----- Testdan nusxa olish -----
+async def _duplicate_test(src_id: int, creator_tg_id: int, start_mode: str, start_ts_val: int, start_at):
+    code = await generate_unique_code()
+    new_id = await POOL.fetchval("""
+        INSERT INTO tests (
+            code, title, subject, price, duration, questions_count, file_id, answers, is_free,
+            start_mode, start_ts, start_at, exam_type, dtm_cfg, skills_cfg, creator_id, created_ts,
+            open_ref_answers, cert_academy_name, cert_signee_name, cert_template, show_review,
+            b_file_id, b_answers, b_open_ref_answers, protect_files
+        )
+        SELECT $1, LEFT(title || ' (nusxa)', 150), subject, price, duration, questions_count, file_id, answers,
+               is_free, $2, $3, $4, exam_type, dtm_cfg, skills_cfg, $5, $6,
+               open_ref_answers, cert_academy_name, cert_signee_name, cert_template, COALESCE(show_review,1),
+               b_file_id, b_answers, b_open_ref_answers, COALESCE(protect_files,0)
+        FROM tests WHERE id=$7
+        RETURNING id
+    """, code, start_mode, int(start_ts_val or 0), start_at, creator_tg_id, now_ts(), src_id)
+    return new_id, code
+
+
+async def _send_duplicate_done(answerable, bot: Bot, new_id: int, code: str, creator_tg_id: int) -> None:
+    link = await _test_deep_link(bot, code)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Nusxani tahrirlash", callback_data=f"admedit_pick_{new_id}")],
+    ])
+    await answerable.answer(
+        f"✅ <b>Nusxa yaratildi!</b>\n🔑 Yangi kod: <code>{code}</code>\n🔗 Havola: {link}\n\n"
+        f"<i>Fayl, javob kaliti va barcha sozlamalar ko'chirildi; natijalar esa yangi testda noldan "
+        f"boshlanadi. Kerak bo'lsa nomini, faylini yoki kalitini tahrirlang.</i>",
+        parse_mode=ParseMode.HTML, reply_markup=kb,
+    )
+    await answerable.answer("🏠 Bosh menyu", reply_markup=main_menu_kb(await is_admin_user(creator_tg_id)))
+
+
+@router.callback_query(F.data.startswith("dupe_"))
+async def duplicate_test_cb(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    test_id = int(callback.data.split("_")[1])
+    if not await _is_admin_or_creator(callback.from_user.id, test_id):
+        return await callback.answer("Bu testga huquqingiz yo'q!", show_alert=True)
+    if await _daily_test_limit_reached(callback.from_user.id):
+        return await callback.answer("Bugungi kunlik limitingiz (10 ta test) tugadi.", show_alert=True)
+    t = await POOL.fetchrow("SELECT code, title, start_mode, exam_type FROM tests WHERE id=$1", test_id)
+    if not t:
+        return await callback.answer("Test topilmadi.", show_alert=True)
+    await callback.answer()
+    if (t["start_mode"] or "normal") == "scheduled" or (t["exam_type"] or "") == "rasch":
+        # rejalashtirilgan testning eski vaqti o'tib ketgan — yangisini so'raymiz
+        await state.clear()
+        await state.update_data(dupe_src=test_id)
+        await state.set_state(DuplicateTestState.waiting_start)
+        return await callback.message.answer(
+            f"📑 <b>{_h(t['title'])}</b> nusxasi uchun yangi <b>boshlanish sanasi va vaqtini</b> kiriting.\n"
+            f"Format: <code>YYYY-MM-DD HH:MM</code>, masalan: <code>2026-02-15 16:00</code>",
+            parse_mode=ParseMode.HTML, reply_markup=nav_kb(include_back=False))
+    new_id, code = await _duplicate_test(test_id, callback.from_user.id, "normal", 0, None)
+    await _send_duplicate_done(callback.message, bot, new_id, code, callback.from_user.id)
+
+
+@router.message(DuplicateTestState.waiting_start)
+async def duplicate_test_start_time(message: Message, state: FSMContext, bot: Bot):
+    if (message.text or "") in TOP_MENU_BTNS:
+        return
+    parts = (message.text or "").strip().split(maxsplit=1)
+    res = to_start_ts(parts[0], parts[1]) if len(parts) == 2 else None
+    if not res:
+        return await message.answer("⚠️ Format noto'g'ri. Masalan: <code>2026-02-15 16:00</code>",
+                                    parse_mode=ParseMode.HTML)
+    data = await state.get_data()
+    src = data.get("dupe_src")
+    dur = await POOL.fetchval("SELECT duration FROM tests WHERE id=$1", src)
+    problem = schedule_window_problem(res[0], dur)
+    if problem:
+        return await message.answer(problem)
+    if not await _is_admin_or_creator(message.from_user.id, src):
+        await state.clear()
+        return await message.answer("⚠️ Bu testga huquqingiz yo'q.")
+    await state.clear()
+    new_id, code = await _duplicate_test(src, message.from_user.id, "scheduled", res[0], res[1])
+    await message.answer(f"📅 Boshlanish: <b>{res[1]}</b>", parse_mode=ParseMode.HTML)
+    await _send_duplicate_done(message, bot, new_id, code, message.from_user.id)
 
 
 async def generate_unique_code():
@@ -10387,7 +11201,7 @@ async def set_file(message: Message, state: FSMContext):
 
 
 @router.message(AdminAddTestState.answers)
-async def save_test(message: Message, state: FSMContext):
+async def save_test(message: Message, state: FSMContext, bot: Bot):
     if (message.text or "") in TOP_MENU_BTNS:
         return
 
@@ -10419,11 +11233,11 @@ async def save_test(message: Message, state: FSMContext):
         await state.set_state(AdminAddTestState.open_ref_answers)
         return
 
-    await _finish_base_test_creation(message, state, answers, None)
+    await _finish_base_test_creation(message, state, answers, None, bot)
 
 
 @router.message(AdminAddTestState.open_ref_answers)
-async def save_test_open_refs(message: Message, state: FSMContext):
+async def save_test_open_refs(message: Message, state: FSMContext, bot: Bot):
     if (message.text or "") in TOP_MENU_BTNS:
         return
 
@@ -10438,11 +11252,12 @@ async def save_test_open_refs(message: Message, state: FSMContext):
         )
         return
 
-    await _finish_base_test_creation(message, state, data.get("pending_answers"), json.dumps(ref_map, ensure_ascii=False))
+    await _finish_base_test_creation(message, state, data.get("pending_answers"), json.dumps(ref_map, ensure_ascii=False),
+                                     bot)
 
 
 async def _finish_base_test_creation(
-    message: Message, state: FSMContext, answers: str, open_ref_json: str | None
+    message: Message, state: FSMContext, answers: str, open_ref_json: str | None, bot: Bot | None = None
 ) -> None:
     data = await state.get_data()
     qcount = int(data.get("questions_count") or 30)
@@ -10495,8 +11310,10 @@ async def _finish_base_test_creation(
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎓 Sertifikat sozlamalari (ixtiyoriy)", callback_data=f"certcfg_start_{new_test_id}")]
     ])
+    link = await _test_deep_link(bot or message, data.get("code"))
     await message.answer(
-        f"✅ Test qo‘shildi!\n🔑 Kod: <code>{data.get('code')}</code>\n🧮 Savollar: <b>{qcount}</b>{extra}\n\n"
+        f"✅ Test qo‘shildi!\n🔑 Kod: <code>{data.get('code')}</code>\n🧮 Savollar: <b>{qcount}</b>{extra}\n"
+        f"🔗 Havola: {link}\n<i>(havolani o'quvchilarga yuboring — bosishi bilan test ochiladi)</i>\n\n"
         f"<i>Xohlasangiz, bu test uchun sertifikat ko'rinishini (o'quv markazi nomi, mas'ul shaxs, rangi) "
         f"sozlashingiz mumkin — aks holda standart sozlamalar ishlatiladi.</i>",
         parse_mode=ParseMode.HTML,
@@ -10774,6 +11591,13 @@ async def creator_test_stat_cb(callback: CallbackQuery):
     ])
     kb.inline_keyboard.append([
         InlineKeyboardButton(text="🎓 Sertifikat sozlamalari", callback_data=f"certcfg_start_{test_id}"),
+    ])
+    kb.inline_keyboard.append([
+        InlineKeyboardButton(text="📑 Nusxa olish", callback_data=f"dupe_{test_id}"),
+        InlineKeyboardButton(text="🛡 Ko'chirishga qarshi", callback_data=f"acmenu_{test_id}"),
+    ])
+    kb.inline_keyboard.append([
+        InlineKeyboardButton(text="🔗 Test havolasi", callback_data=f"tlink_{test_id}"),
     ])
 
     await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -11337,7 +12161,10 @@ async def help_menu(message: Message):
         "(agar o'qituvchi javoblar tahlilini yopgan bo'lsa, faqat to'g'ri/xato soni ko'rsatiladi).\n"
         "• <b>🏅 Reytingdagi o'rningiz</b> — shu testni yechganlar orasida qaysi o'rindasiz.\n"
         "• <b>📤 Natijani ulashish</b> — do'stlaringizga yuborish uchun tayyor matn.\n"
-        "• <b>📜 Sertifikatlarim</b> («📄 Natijalarim» ichida) — oldin olgan sertifikatlaringizni qayta yuklab olish.\n\n"
+        "• <b>📜 Sertifikatlarim</b> («📄 Natijalarim» ichida) — oldin olgan sertifikatlaringizni qayta yuklab olish.\n"
+        "• <b>🔁 Xatolar ustida ishlash</b> — xato qilgan savollaringizni qayta yechib mashq qilish "
+        "(natija o'zgarmaydi); «📄 Natijalarim»da esa o'sish dinamikasi va grafigi.\n"
+        "• Rejalashtirilgan testda <b>🔔 eslatma</b> qo'ysangiz, boshlanishidan oldin xabar keladi.\n\n"
 
         "<b>4. Pullik test uchun to'lov</b>\n"
         "1️⃣ Testni tanlab «Sotib olish»ni bosing.\n"
@@ -11354,7 +12181,9 @@ async def help_menu(message: Message):
         "<b>✏️ tahrirlash</b>dagi «👁 Javoblar tahlili» tugmasi bilan istalgan vaqt o'zgartirasiz.\n"
         "• <b>🛠 Yaratgan testlarim</b> — har bir testingiz uchun bitta joyda: statistikasi, "
         "<b>✏️ tahrirlash</b>, <b>🛑 vaqtincha yakunlash/qayta ochish</b>, <b>🎓 sertifikat ko'rinishini "
-        "sozlash</b> (o'quv markazi nomi, mas'ul shaxs, rangi) va kerak bo'lsa <b>🗑 o'chirish</b>.\n\n"
+        "sozlash</b> (o'quv markazi nomi, mas'ul shaxs, rangi) va kerak bo'lsa <b>🗑 o'chirish</b>.\n"
+        "• Shu yerda: <b>🔗 test havolasi</b> (bosilsa test darhol ochiladi), <b>📑 nusxa olish</b> va "
+        "<b>🛡 ko'chirishga qarshi</b> (fayl himoyasi, A/B variant).\n\n"
 
         "<b>6. Reyting va profil</b>\n"
         "• <b>📄 Natijalarim</b> — shaxsiy statistikangiz va topshirgan testlaringiz tarixi.\n"
@@ -11370,9 +12199,9 @@ async def help_menu(message: Message):
         f"📞 {PAYMENT_PHONE}"
     )
 
+    admin_text = ""
     if is_admin:
-        help_text += (
-            "\n\n➖➖➖➖➖➖➖➖\n"
+        admin_text = (
             "👮 <b>Admin uchun qo'shimcha bo'limlar:</b>\n"
             "• <b>🟡 Pending to'lovlar</b> — tasdiq kutayotgan to'lovlarni ko'rish/tasdiqlash.\n"
             "• <b>📊 Statistika</b> — bitta panelda: vaqt oralig'ida natijalar, hozir faol "
@@ -11384,7 +12213,10 @@ async def help_menu(message: Message):
             "• <b>🗑 Testni o'chirish</b> — ro'yxatdan tanlab, ogohlantirish bilan o'chirish "
             "(hozir kimdir yechayotgan bo'lsa alohida ogohlantiriladi).\n"
             "• <b>👮 Adminlarni boshqarish</b> — ID, @username yoki telefon raqami orqali "
-            "admin tayinlash/olib tashlash.\n\n"
+            "admin tayinlash/olib tashlash.\n"
+            "• <b>📱 Mini App → Admin panel</b> — grafiklar, tushum, faol testlar/o'qituvchilar.\n"
+            "• <b>🚨 Shubhali faollik</b> — bir telefonda bir nechta akkaunt yoki test juda tez "
+            "(yuqori natija bilan) yechilsa, avtomatik xabar keladi.\n\n"
             "💾 <i>Ma'lumotlar bazasi zaxirasi har "
             f"{DB_BACKUP_INTERVAL_HOURS} soatda avtomatik shu chatga yuboriladi.</i>"
         )
@@ -11392,7 +12224,12 @@ async def help_menu(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✉️ Admin bilan bog'lanish", callback_data="ask_admin_start")]
     ])
-    await message.answer(help_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    # ✅ Admin qismi alohida xabar — birga yuborilsa Telegram'ning 4096 belgi chegarasidan oshardi
+    if admin_text:
+        await message.answer(help_text, parse_mode=ParseMode.HTML)
+        await message.answer(admin_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    else:
+        await message.answer(help_text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 @router.callback_query(F.data == "ask_admin_start")
@@ -11514,10 +12351,10 @@ async def certificate_daemon(bot: Bot):
 # ===================== MA'LUMOTLAR BAZASI ZAXIRA NUSXASI (BACKUP) =====================
 BACKUP_TABLES = [
     "users", "tests", "payments", "results", "sessions", "required_channels", "user_limits",
-    "staged_attempts", "retake_grants",
+    "staged_attempts", "retake_grants", "test_reminders", "suspicious_events",
 ]
 # Eski zaxira fayllarida bo'lmagan jadvallar (ular bo'lmasa ham tiklash ishlaydi)
-BACKUP_OPTIONAL_TABLES = {"retake_grants"}
+BACKUP_OPTIONAL_TABLES = {"retake_grants", "test_reminders", "suspicious_events"}
 
 
 async def _run_db_backup(bot: Bot, requester_tg_id: int | None = None):
@@ -11588,6 +12425,7 @@ async def backup_now(callback: CallbackQuery, bot: Bot):
 # amal bo'lgani uchun har doim aniq tasdiqlash bosqichidan o'tadi.
 _TABLES_WITH_SERIAL_ID = [
     "users", "tests", "payments", "results", "sessions", "required_channels", "staged_attempts",
+    "suspicious_events",
 ]
 
 
@@ -12746,7 +13584,8 @@ async def _web_test_row(code: str | None = None, test_id: int | None = None):
                start_mode, start_ts, start_at, exam_type, dtm_cfg, skills_cfg,
                COALESCE(is_hidden,0) AS is_hidden, COALESCE(is_closed,0) AS is_closed,
                COALESCE(rush_finalized,0) AS rush_finalized, open_ref_answers,
-               COALESCE(show_review,1) AS show_review
+               COALESCE(show_review,1) AS show_review, b_answers, b_open_ref_answers, b_file_id,
+               COALESCE(protect_files,0) AS protect_files
         FROM tests WHERE """
     if test_id is not None:
         return await POOL.fetchrow(q + "id=$1", test_id)
@@ -12982,12 +13821,15 @@ async def _web_start_single(bot: Bot, ctx: dict, t, access: dict) -> dict:
     saved = await _web_load_saved(user_db_id, test_id, mode)
     _web_schedule_deadline(bot, tg_id, test_id, end_ts_)
 
-    key = normalize_answers(t["answers"] or "")
+    variant = (await get_session(user_db_id, test_id, mode) or {"variant": "a"})["variant"]
+    key_raw, _refs, file_id = _variant_fields(t, variant)
+    key = normalize_answers(key_raw or "")
     qcount = int(t["questions_count"] or 0)
     et = t["exam_type"] or "simple"
-    files = [{"slot": "main", "kind": "document", "name": "Savollar"}] if t["file_id"] else []
+    files = [{"slot": "main", "kind": "document", "name": "Savollar"}] if file_id else []
     return {
         "kind": "single", "test": _web_test_info(t), "mode": mode, "end_ts": end_ts_, "server_now": now_ts(),
+        "variant": variant.upper() if (t["b_answers"] or "") else None,
         "layout": _web_layout(et, t["dtm_cfg"], qcount), "tools": _web_tools(et), "files": files,
         **_web_question_payload(key, qcount, saved),
     }
@@ -13027,12 +13869,13 @@ async def _web_result_view(user_db_id: int, test_id: int) -> dict:
     r = await POOL.fetchrow("""
         SELECT id, score, total_questions, percent, earned_points, max_points, details, grade, rasch_ball,
                rasch_percent, user_answers, open_text_answers, open_grades, COALESCE(open_pending,0) AS open_pending,
-               COALESCE(certificate_sent,0) AS certificate_sent
+               COALESCE(certificate_sent,0) AS certificate_sent, COALESCE(variant,'a') AS variant
         FROM results WHERE user_id=$1 AND test_id=$2
     """, user_db_id, test_id)
     if not r:
         return {**base, "state": "none"}
-    key = normalize_answers(t["answers"] or "")
+    key_raw, refs_raw, _fid = _variant_fields(t, r["variant"])
+    key = normalize_answers(key_raw or "")
     view = {
         **base, "state": "single", "result_id": r["id"], "score": r["score"], "total": r["total_questions"],
         "percent": float(r["percent"] or 0), "earned": r["earned_points"], "max": r["max_points"],
@@ -13059,7 +13902,7 @@ async def _web_result_view(user_db_id: int, test_id: int) -> dict:
     if review_allowed and r["user_answers"]:
         user_ans = normalize_answers(r["user_answers"])
         open_answers = _load_json_dict(r["open_text_answers"])
-        refs = _load_json_dict(t["open_ref_answers"])
+        refs = _load_json_dict(refs_raw)
         items = []
         for i in range(min(len(key), len(user_ans))):
             n = str(i + 1)
@@ -13255,7 +14098,8 @@ async def webapp_api_me(request: web.Request):
     ctx = await _web_auth(request, need_registered=False)
     bot: Bot = request.app["bot"]
     out = {"ok": True, "registered": ctx["registered"], "full_name": ctx["full_name"],
-           "bot_username": await _web_bot_username(bot), "academy": ACADEMY_NAME}
+           "bot_username": await _web_bot_username(bot), "academy": ACADEMY_NAME,
+           "is_admin": await is_admin_user(ctx["tg_id"])}
     if ctx["registered"]:
         try:
             await _web_require_subscribed(bot, ctx["tg_id"])
@@ -13306,8 +14150,108 @@ async def webapp_api_lookup(request: web.Request):
     msg = WEB_STATE_MESSAGES.get(access["state"], "")
     if access["state"] == "payment_rejected" and access.get("reason"):
         msg += f" Sabab: {access['reason']}"
+    if access["state"] == "not_started":
+        access["reminder"] = bool(await POOL.fetchval(
+            "SELECT 1 FROM test_reminders WHERE user_id=$1 AND test_id=$2", ctx["user_db_id"], t["id"]))
     return web.json_response({"ok": True, "test": _web_test_info(t), "access": access, "message": msg,
                               "bot_username": await _web_bot_username(bot), "server_now": now_ts()})
+
+
+@_web_handler
+async def webapp_api_remind(request: web.Request):
+    ctx = await _web_auth(request)
+    body = await _web_body(request)
+    test_id = _web_int(body.get("test_id"), "test")
+    t = await POOL.fetchrow("SELECT start_mode, start_ts FROM tests WHERE id=$1", test_id)
+    if not t or not is_scheduled_not_started(t["start_mode"], t["start_ts"])[0]:
+        raise WebError("started", "Bu test allaqachon boshlangan.", 409)
+    on = bool(body.get("on"))
+    await _set_reminder(ctx["user_db_id"], test_id, on)
+    return web.json_response({"ok": True, "reminder": on})
+
+
+@_web_handler
+async def webapp_api_admin_stats(request: web.Request):
+    """Mini App admin paneli — faqat adminlar uchun."""
+    ctx = await _web_auth(request)
+    if not await is_admin_user(ctx["tg_id"]):
+        raise WebError("forbidden", "Bu bo'lim faqat adminlar uchun.", 403)
+    return web.json_response({"ok": True, **await _admin_stats()})
+
+
+async def _admin_stats(days: int = 14) -> dict:
+    now = datetime.now(TZ)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_str = today.strftime("%Y-%m-%d")
+    start_day = today - timedelta(days=days - 1)
+    start_ts = int(start_day.timestamp())
+    start_str = start_day.strftime("%Y-%m-%d")
+    month_str = today.replace(day=1).strftime("%Y-%m-%d")
+
+    rev_expr = "COALESCE(SUM(COALESCE(p.amount, t.price)),0)"
+    totals = {
+        "users": await POOL.fetchval("SELECT COUNT(*) FROM users WHERE COALESCE(full_name,'')<>''"),
+        "tests": await POOL.fetchval("SELECT COUNT(*) FROM tests"),
+        "results": await POOL.fetchval("SELECT COUNT(*) FROM results"),
+        "teachers": await POOL.fetchval("SELECT COUNT(DISTINCT creator_id) FROM tests WHERE creator_id IS NOT NULL"),
+        "revenue_month": int(await POOL.fetchval(f"""
+            SELECT {rev_expr} FROM payments p JOIN tests t ON t.id=p.test_id
+            WHERE p.status='approved' AND COALESCE(p.approved_at, p.created_at) >= $1""", month_str) or 0),
+        "revenue_total": int(await POOL.fetchval(f"""
+            SELECT {rev_expr} FROM payments p JOIN tests t ON t.id=p.test_id WHERE p.status='approved'""") or 0),
+    }
+    today_s = {
+        "users": await POOL.fetchval("SELECT COUNT(*) FROM users WHERE created_ts >= $1", int(today.timestamp())),
+        "results": await POOL.fetchval("SELECT COUNT(*) FROM results WHERE date >= $1", today_str),
+        "revenue": int(await POOL.fetchval(f"""
+            SELECT {rev_expr} FROM payments p JOIN tests t ON t.id=p.test_id
+            WHERE p.status='approved' AND COALESCE(p.approved_at, p.created_at) >= $1""", today_str) or 0),
+    }
+    pending = {
+        "payments": await POOL.fetchval("SELECT COUNT(*) FROM payments WHERE status='pending'"),
+        "open_answers": await POOL.fetchval("SELECT COUNT(*) FROM results WHERE COALESCE(open_pending,0)>0"),
+        "staged": await POOL.fetchval("SELECT COUNT(*) FROM staged_attempts WHERE status='pending_review'"),
+    }
+
+    labels = [(start_day + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
+    u_rows = await POOL.fetch("""
+        SELECT to_char(to_timestamp(created_ts + $2) AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS d, COUNT(*) AS n
+        FROM users WHERE created_ts >= $1 GROUP BY 1""", start_ts, int(TZ.utcoffset(None).total_seconds()))
+    r_rows = await POOL.fetch("SELECT LEFT(date, 10) AS d, COUNT(*) AS n, AVG(percent) AS p FROM results "
+                              "WHERE date >= $1 GROUP BY 1", start_str)
+    p_rows = await POOL.fetch(f"""
+        SELECT LEFT(COALESCE(p.approved_at, p.created_at), 10) AS d, {rev_expr} AS s
+        FROM payments p JOIN tests t ON t.id=p.test_id
+        WHERE p.status='approved' AND COALESCE(p.approved_at, p.created_at) >= $1 GROUP BY 1""", start_str)
+    um = {r["d"]: int(r["n"]) for r in u_rows}
+    rm = {r["d"]: (int(r["n"]), float(r["p"] or 0)) for r in r_rows}
+    pm = {r["d"]: int(r["s"] or 0) for r in p_rows}
+    daily = [{"d": d, "users": um.get(d, 0), "results": rm.get(d, (0, 0))[0],
+              "avg": round(rm.get(d, (0, 0))[1], 1), "revenue": pm.get(d, 0)} for d in labels]
+
+    top_tests = await POOL.fetch("""
+        SELECT t.code, t.title, COUNT(r.id) AS n, AVG(r.percent) AS p
+        FROM results r JOIN tests t ON t.id=r.test_id
+        WHERE r.date >= $1 GROUP BY t.id, t.code, t.title ORDER BY n DESC LIMIT 5""", start_str)
+    top_teachers = await POOL.fetch("""
+        SELECT t.creator_id, COALESCE(MAX(u.full_name), t.creator_id::text) AS name,
+               COUNT(DISTINCT t.id) AS tests, COUNT(r.id) AS results
+        FROM tests t LEFT JOIN users u ON u.telegram_id=t.creator_id
+        LEFT JOIN results r ON r.test_id=t.id
+        WHERE t.creator_id IS NOT NULL GROUP BY t.creator_id ORDER BY results DESC, tests DESC LIMIT 5""")
+    events = await POOL.fetch("""
+        SELECT e.kind, e.details, e.created_ts, u.full_name, t.code
+        FROM suspicious_events e LEFT JOIN users u ON u.id=e.user_id LEFT JOIN tests t ON t.id=e.test_id
+        ORDER BY e.id DESC LIMIT 15""")
+    return {
+        "totals": totals, "today": today_s, "pending": pending, "daily": daily,
+        "top_tests": [{"code": r["code"], "title": r["title"], "n": int(r["n"]), "avg": round(float(r["p"] or 0), 1)}
+                      for r in top_tests],
+        "top_teachers": [{"name": r["name"], "tests": int(r["tests"]), "results": int(r["results"])}
+                         for r in top_teachers],
+        "events": [{"kind": e["kind"], "details": e["details"], "ts": int(e["created_ts"] or 0),
+                    "user": e["full_name"], "code": e["code"]} for e in events],
+    }
 
 
 @_web_handler
@@ -13382,7 +14326,9 @@ async def _web_resolve_mode(ctx: dict, t, section_key: str | None) -> tuple[str,
         sec = cfg["sections"][section_key]
         return f"stage_{section_key}", normalize_answers(sec.get("answers") or ""), int(sec.get("qcount") or 0)
     mode = "free" if int(t["is_free"] or 0) == 1 else "paid"
-    return mode, normalize_answers(t["answers"] or ""), int(t["questions_count"] or 0)
+    sess = await get_session(ctx["user_db_id"], t["id"], mode)
+    key_raw = _variant_fields(t, sess["variant"] if sess else "a")[0]
+    return mode, normalize_answers(key_raw or ""), int(t["questions_count"] or 0)
 
 
 @_web_handler
@@ -13566,7 +14512,7 @@ async def webapp_api_file(request: web.Request):
                                          ctx["user_db_id"], test_id)
         if not (has_session or has_result):
             raise WebError("forbidden", "Fayl faqat test boshlangandan keyin ochiladi.", 403)
-        file_id = t["file_id"]
+        file_id = _variant_fields(t, await _user_variant(ctx["user_db_id"], test_id))[2]
     elif slot.startswith(("s_", "sq_")):
         key = slot.split("_", 1)[1]
         cfg = _load_skills_cfg(t["skills_cfg"])
@@ -13648,7 +14594,7 @@ async def webapp_api_profile(request: web.Request):
     )
     results = await POOL.fetch("""
         SELECT r.id, r.test_id, t.code, t.title, t.exam_type, r.score, r.total_questions, r.percent, r.grade, r.date,
-               r.certificate_sent
+               r.certificate_sent, t.subject
         FROM results r JOIN tests t ON t.id=r.test_id
         WHERE r.user_id=$1
         ORDER BY r.id DESC
@@ -13669,6 +14615,7 @@ async def webapp_api_profile(request: web.Request):
                 "score": r["score"], "total": r["total_questions"],
                 "percent": float(r["percent"] or 0), "grade": r["grade"],
                 "date": r["date"], "has_certificate": int(r["certificate_sent"] or 0) == 1,
+                "subject": r["subject"] or "",
             }
             for r in results
         ],
@@ -13748,6 +14695,8 @@ def build_webapp_application(bot: Bot | None = None) -> web.Application:
     app.router.add_post("/api/upload_photo", webapp_api_upload_photo)
     app.router.add_get("/api/file/{test_id}/{slot}", webapp_api_file)
     app.router.add_get("/api/result/{test_id}", webapp_api_result)
+    app.router.add_post("/api/test/remind", webapp_api_remind)
+    app.router.add_get("/api/admin/stats", webapp_api_admin_stats)
     return app
 
 
@@ -13882,6 +14831,17 @@ h2{font-family:var(--fh);font-size:16px;font-weight:700;margin:0 0 10px}
 .list-item{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 0;border-bottom:1px solid var(--line)}
 .list-item:last-child{border-bottom:0}
 .badge{background:var(--accent);color:var(--accent-text);border-radius:8px;padding:4px 9px;font-size:13px;font-weight:700;font-family:var(--fh);white-space:nowrap}
+.prgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.prbtn{height:56px;border-radius:14px;border:1.5px solid var(--line);background:var(--soft2);font-family:var(--fh);font-weight:800;font-size:20px;color:var(--ink)}
+.prbtn:active{background:var(--gold);color:#14213d;border-color:var(--gold)}
+.hbar{display:flex;align-items:center;gap:8px;font-size:13px;margin:6px 0}
+.hbar .hb-l{flex:0 0 34%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hbar .hb-t{flex:1;height:8px;border-radius:4px;background:var(--soft);overflow:hidden}
+.hbar .hb-t i{display:block;height:100%;background:var(--gold);border-radius:4px}
+.hbar b{font-family:var(--fh);min-width:38px;text-align:right}
+.admin-entry{display:flex;align-items:center;gap:12px;width:100%;border:0;text-align:left;background:var(--card);color:var(--text);border-radius:var(--radius);padding:14px 16px;margin:12px 0;box-shadow:var(--shadow);font:inherit}
+.admin-entry b{display:block;font-family:var(--fh)}
+.admin-entry .go{margin-left:auto;color:var(--hint)}
 .stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
 .stat{background:var(--soft2);border:1px solid var(--line);border-radius:12px;padding:10px 6px;text-align:center}
 .stat b{display:block;font-size:20px;font-family:var(--fh);font-weight:800;color:var(--ink)}
@@ -14305,13 +15265,15 @@ async function boot() {
   let hashStart = "";
   try { hashStart = new URLSearchParams(location.hash.slice(1)).get("tgWebAppStartParam") || ""; } catch (e) {}
   const code = params.get("code") || (tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param) || hashStart;
+  const view = params.get("view");
+  const afterHome = () => { if (code) lookup(code); else if (view === "profile") renderProfile(); };
   // Avval kirgan foydalanuvchiga bosh sahifa DARHOL (keshdan) ko'rsatiladi,
   // ma'lumot esa fonda yangilanadi — sekin internetda kutib o'tirmaydi.
   const cached = lsGet("me:" + S.uid);
   if (cached && cached.registered && cached.subscribed && Date.now() - (cached._ts || 0) < 3 * 86400e3) {
     S.me = cached; S.meTs = 0;
     renderHome();
-    if (code) lookup(code);
+    afterHome();
     return;
   }
   mount(el("div", {class: "center"}, el("div", {class: "spin dark"}), el("div", {class: "muted"}, "Yuklanmoqda...")));
@@ -14325,7 +15287,7 @@ async function boot() {
   if (!me.registered) return renderGate("reg");
   if (!me.subscribed) return renderGate("sub", me.channels);
   renderHome();
-  if (code) lookup(code);
+  afterHome();
 }
 function gotMe(me) {
   S.me = Object.assign(S.me || {}, me); S.meTs = Date.now();
@@ -14377,6 +15339,11 @@ function renderHome() {
         el("span", {class: "go"}, ic("chev"))))));
   };
   drawActive(S.me && S.me.active);
+  const adminBox = el("div", {});
+  const drawAdmin = () => adminBox.replaceChildren(...(S.me && S.me.is_admin ? [el("button", {class: "admin-entry", onclick: renderAdmin},
+    el("div", {class: "ico"}, ic("chart")), el("div", {}, el("b", {}, "Admin panel"), el("div", {class: "muted small"}, "Statistika, grafiklar, shubhali faollik")),
+    el("span", {class: "go"}, ic("chev")))] : []));
+  drawAdmin();
   if (!S.meTs || Date.now() - S.meTs > 3000) {
     S.meTs = Date.now();
     api("/api/me").then(me => {
@@ -14384,6 +15351,7 @@ function renderHome() {
       if (!me.registered) return renderGate("reg");
       if (!me.subscribed) return renderGate("sub", me.channels);
       if (activeBox.isConnected) drawActive(me.active);
+      if (adminBox.isConnected) drawAdmin();
     }).catch(() => {});
   }
   const tile = (icon, text) => el("div", {}, ic(icon), text);
@@ -14394,7 +15362,7 @@ function renderHome() {
     el("div", {class: "card lift"},
       el("label", {class: "lbl", for: "code"}, "Test kodi"), inp,
       el("div", {style: "height:12px"}), el("button", {class: "btn block cta", onclick: go}, ic("search"), "Testni ochish")),
-    activeBox,
+    activeBox, adminBox,
     el("div", {class: "sect"}, "Imkoniyatlar"),
     el("div", {class: "feat"},
       tile("bubbles", "DTM javoblar varaqasi"), tile("calc", "SAT kalkulyator va grafik"),
@@ -14445,6 +15413,7 @@ function renderInfo(r) {
   if (st === "done" || st === "staged_done" || st === "pending_review") btns.push(el("button", {class: "btn block", onclick: () => showResult(t.id)}, ic("chart"), "Natijani ko'rish"));
   if (st === "staged_done" && a.can_retake) btns.push(el("button", {class: "btn block ghost", onclick: () => start(true)}, ic("refresh"), "Qaytadan yechish"));
   if (st === "need_payment" || st === "payment_rejected" || st === "payment_pending") btns.push(el("button", {class: "btn block", onclick: openBot}, ic("chat"), "Botga o'tish"));
+  if (st === "not_started") btns.push(reminderBtn(t, !!a.reminder));
   btns.push(el("button", {class: "btn block ghost", onclick: renderHome}, ic("left"), "Boshqa kod"));
   if (st === "not_started" && a.left) {
     const cd = el("b", {}, fmtTime(a.left));
@@ -14474,6 +15443,7 @@ async function startTest(t, retake) {
   catch (e) { done(); return handleErr(e); }
   done();
   if (p.kind === "staged") renderOverview(p); else renderSolve(p, null);
+  if (p.variant) toast(`Sizga ${p.variant} variant tushdi`, 3000);
 }
 
 /* ------------ bosqichli imtihon xaritasi ------------ */
@@ -15188,7 +16158,8 @@ function renderResult(v) {
       }}, it.n)));
       kids.push(el("div", {class: "sect"}, "Javoblar tahlili"), el("div", {class: "card", style: "margin-top:0"}, el("div", {class: "muted small"}, "Raqamni bosing — javobingiz va to'g'ri javob ko'rinadi."), grid,
         el("div", {class: "legend"}, el("span", {}, el("i", {style: "background:var(--ok-soft);border-color:var(--ok)"}), "to'g'ri"),
-          el("span", {}, el("i", {style: "background:var(--bad);border-color:var(--bad)"}), "xato"), el("span", {}, el("i", {style: "border-style:dashed"}), "tekshirilmoqda"))));
+          el("span", {}, el("i", {style: "background:var(--bad);border-color:var(--bad)"}), "xato"), el("span", {}, el("i", {style: "border-style:dashed"}), "tekshirilmoqda")),
+        practiceItems(v).length ? el("button", {class: "btn block cta", style: "margin-top:14px", onclick: () => renderPractice(v)}, ic("refresh"), "Xatolar ustida ishlash") : null));
     } else if (v.review_hidden) kids.push(statusBox("", "O'qituvchi bu test uchun javoblar tahlilini yopgan — faqat to'g'ri va xato javoblar soni ko'rsatiladi."));
     else if (v.review_allowed === false) kids.push(statusBox("", "Guruh xavfsizligi uchun batafsil tahlil test vaqti tugagach ochiladi."));
   }
@@ -15234,7 +16205,191 @@ async function renderProfile() {
       el("div", {class: "stat"}, el("b", {}, d.summary.count), el("span", {}, "jami test")),
       el("div", {class: "stat"}, el("b", {}, d.summary.avg_percent.toFixed(1) + "%"), el("span", {}, "o'rtacha")),
       el("div", {class: "stat"}, el("b", {}, d.summary.best_percent.toFixed(1) + "%"), el("span", {}, "eng yaxshi")))),
+    progressCard(d.results),
     el("div", {class: "sect"}, "So'nggi natijalar"), el("div", {class: "card", style: "margin-top:0;padding-top:4px;padding-bottom:4px"}, list)));
+}
+
+/* ------------ rejalashtirilgan test eslatmasi ------------ */
+function reminderBtn(t, on) {
+  const b = el("button", {class: "btn block ghost"});
+  const draw = v => { b.replaceChildren(ic(v ? "x" : "clock"), v ? "Eslatmani bekor qilish" : "Boshlanishidan oldin eslatish"); };
+  draw(on);
+  b.addEventListener("click", async () => {
+    b.disabled = true;
+    try { const r = await api("/api/test/remind", {body: {test_id: t.id, on: !on}, idem: true}); on = r.reminder; draw(on);
+      toast(on ? "Eslatma qo'yildi: 30 va 5 daqiqa oldin hamda boshlanganda botga xabar keladi." : "Eslatma bekor qilindi.", 3500); haptic("ok"); }
+    catch (e) { handleErr(e); }
+    b.disabled = false;
+  });
+  return b;
+}
+
+/* ------------ xatolar ustida ishlash (mashq) ------------ */
+function practiceItems(v) { return (v.review || []).filter(it => !it.open && it.ok === false); }
+function renderPractice(v) {
+  stopTick(); showTabs(false);
+  const items = practiceItems(v);
+  if (!items.length) return toast("Variantli savollarda xatoyingiz yo'q!");
+  const testId = v.test.id;
+  const st = {testId, files: [{slot: "main", kind: "document", name: "Savollar"}], filesLoaded: false};
+  const P = {i: 0, fixed: 0, tries: 0, log: []};
+  setBack(() => showResult(testId));
+  const head = el("div", {class: "prog"}, el("div", {class: "t"}), el("div", {class: "bar"}, el("i")));
+  const bar = el("div", {class: "sbar"}, el("div", {class: "timer", style: "background:var(--accent-soft);color:var(--ink)"}, ic("refresh"), "Mashq"), head);
+  const ansPane = el("div", {class: "pane anspane active"});
+  const pdfPane = el("div", {class: "pane pdfpane"});
+  const seg = el("div", {class: "seg"});
+  const segBtn = (key, icon, txt) => el("button", {class: key === "ans" ? "on" : "", onclick: (ev) => {
+    seg.querySelectorAll("button").forEach(b => b.classList.toggle("on", b === ev.currentTarget));
+    ansPane.classList.toggle("active", key === "ans"); pdfPane.classList.toggle("active", key === "pdf");
+    if (key === "pdf") ensureFiles(st, pdfPane);
+  }}, ic(icon), txt);
+  seg.append(segBtn("pdf", "file", "Savollar"), segBtn("ans", "pen", "Mashq"));
+  const foot = el("div", {class: "sfoot"}, el("button", {class: "btn ghost", style: "flex:1", onclick: () => next("skip")}, "O'tkazib yuborish"),
+    el("button", {class: "btn", style: "flex:1", onclick: () => finish()}, "Tugatish"));
+  mount(el("div", {class: "solve"}, bar, seg, el("div", {class: "panes"}, pdfPane, ansPane), foot));
+  ensureFiles(st, pdfPane);
+  const progress = () => {
+    head.querySelector(".t").textContent = `${Math.min(P.i + 1, items.length)}/${items.length} · tuzatildi: ${P.fixed}`;
+    head.querySelector("i").style.width = Math.round(P.i / items.length * 100) + "%";
+  };
+  const draw = (note, kind) => {
+    progress();
+    const it = items[P.i];
+    const letters = el("div", {class: "prgrid"});
+    LETTERS.slice(0, 6).split("").forEach(L => letters.append(el("button", {class: "prbtn", onclick: () => pick(L)}, L)));
+    ansPane.replaceChildren(el("div", {class: "screen", style: "padding-top:8px"},
+      note ? statusBox(kind || "", note) : null,
+      el("div", {class: "card"}, el("div", {class: "eyebrow", style: "color:var(--hint)"}, "Xato qilgan savolingiz"),
+        el("h2", {style: "margin:4px 0 2px"}, `${it.n}-savol`),
+        el("p", {class: "muted small", style: "margin:0 0 12px"}, `Avval: ${it.you || "javobsiz"}. Savolni «Savollar» bo'limida ko'rib, to'g'ri javobni tanlang.`),
+        letters),
+      el("p", {class: "muted small", style: "text-align:center"}, "Mashq rasmiy natijangizga ta'sir qilmaydi.")));
+  };
+  const pick = (L) => {
+    const it = items[P.i];
+    if (L === it.key) { P.fixed++; haptic("ok"); return next("ok", `${it.n}-savol: to'g'ri — ${it.key}.`); }
+    P.tries++; haptic("error");
+    if (P.tries < 2) return draw(`${L} — noto'g'ri, yana bir urinib ko'ring.`, "bad");
+    next("bad", `${it.n}-savol: to'g'ri javob — ${it.key}.`);
+  };
+  const next = (how, note) => {
+    const it = items[P.i];
+    if (how === "skip") note = `${it.n}-savol o'tkazib yuborildi (to'g'ri javob: ${it.key}).`;
+    P.i++; P.tries = 0;
+    if (P.i >= items.length) return finish(note);
+    draw(note, how === "ok" ? "ok" : how === "bad" ? "bad" : "");
+  };
+  const finish = (note) => {
+    const total = items.length;
+    const verdict = P.fixed === total ? "Ajoyib — hammasini tuzatdingiz!" : P.fixed ? "Yaxshi harakat! Qolganlarini yana bir bor ko'rib chiqing." : "Mavzuni takrorlab, keyinroq yana urinib ko'ring.";
+    setBack(() => showResult(testId));
+    mount(el("div", {class: "screen"},
+      band(el("div", {class: "eyebrow"}, "Xatolar ustida ishlash"), el("h1", {}, "Mashq yakunlandi")),
+      el("div", {class: "card lift"}, note ? statusBox("", note) : null, ring(P.fixed / total * 100, `${P.fixed}/${total}`),
+        el("p", {style: "text-align:center"}, verdict),
+        el("p", {class: "muted small", style: "text-align:center"}, "Bu mashq — rasmiy natijangiz o'zgarmaydi."),
+        el("button", {class: "btn block cta", onclick: () => renderPractice(v)}, ic("refresh"), "Qaytadan mashq qilish"),
+        el("button", {class: "btn block ghost", onclick: () => showResult(testId)}, ic("chart"), "Natijaga qaytish"))));
+  };
+  draw();
+}
+
+/* ------------ o'sish grafigi ------------ */
+function progressCard(results) {
+  const pts = results.slice(0, 20).reverse();   // eskidan yangiga
+  if (pts.length < 2) return null;
+  const W = 320, H = 150, L = 30, R = 10, T = 12, B = 22;
+  const x = i => L + (W - L - R) * (pts.length === 1 ? 0 : i / (pts.length - 1));
+  const y = p => T + (H - T - B) * (1 - Math.max(0, Math.min(100, p)) / 100);
+  let grid = "";
+  [0, 50, 100].forEach(g => { grid += `<line x1="${L}" x2="${W - R}" y1="${y(g)}" y2="${y(g)}" stroke="var(--line)" stroke-width="1"/><text x="${L - 6}" y="${y(g) + 4}" text-anchor="end" font-size="10" fill="var(--hint)">${g}%</text>`; });
+  const line = pts.map((p, i) => `${x(i).toFixed(1)},${y(p.percent).toFixed(1)}`).join(" ");
+  const area = `${x(0).toFixed(1)},${y(0)} ${line} ${x(pts.length - 1).toFixed(1)},${y(0)}`;
+  const dots = pts.map((p, i) => `<circle cx="${x(i).toFixed(1)}" cy="${y(p.percent).toFixed(1)}" r="${i === pts.length - 1 ? 4.5 : 3}" fill="${i === pts.length - 1 ? "var(--gold)" : "var(--card)"}" stroke="var(--ink)" stroke-width="2"><title>${(p.code || "").replace(/[<&"]/g, "")}: ${p.percent.toFixed(1)}%</title></circle>`).join("");
+  const svg = `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="Natijalar o'sish grafigi">${grid}
+    <polygon points="${area}" fill="var(--accent-soft)"/><polyline points="${line}" fill="none" stroke="var(--ink)" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>${dots}
+    <text x="${L}" y="${H - 6}" font-size="10" fill="var(--hint)">eski</text><text x="${W - R}" y="${H - 6}" text-anchor="end" font-size="10" fill="var(--hint)">yangi</text></svg>`;
+  const half = Math.max(1, Math.floor(pts.length / 2));
+  const avg = a => a.reduce((s, p) => s + p.percent, 0) / Math.max(1, a.length);
+  const diff = avg(pts.slice(half)) - avg(pts.slice(0, half));
+  const trend = diff >= 3 ? statusBox("ok", `O'sish: +${diff.toFixed(1)}% — zo'r, shunday davom eting!`)
+    : diff <= -3 ? statusBox("bad", `Pasayish: ${diff.toFixed(1)}% — xatolar ustida ishlab ko'ring.`)
+    : statusBox("", "Natijalar barqaror.");
+  // fanlar bo'yicha o'rtacha
+  const bySub = {};
+  results.forEach(r => { const k = r.subject || "Boshqa"; (bySub[k] = bySub[k] || []).push(r.percent); });
+  const subs = Object.entries(bySub).map(([k, a]) => [k, a.reduce((s, v) => s + v, 0) / a.length, a.length]).sort((a, b) => b[1] - a[1]).slice(0, 6);
+  const subBox = subs.length > 1 ? el("div", {style: "margin-top:12px"}, el("div", {class: "lbl"}, "Fanlar bo'yicha o'rtacha"),
+    ...subs.map(([k, p, n]) => el("div", {class: "hbar"}, el("span", {class: "hb-l"}, k), el("span", {class: "hb-t"}, el("i", {style: `width:${p.toFixed(0)}%`})), el("b", {}, p.toFixed(0) + "%"), el("span", {class: "muted small"}, `(${n})`)))) : null;
+  return [el("div", {class: "sect"}, "O'sish grafigi"), el("div", {class: "card", style: "margin-top:0"}, el("div", {html: svg}), trend, subBox)];
+}
+
+/* ------------ admin panel ------------ */
+const fmtSum = n => (+n || 0).toLocaleString("ru-RU") + " so'm";
+function barChart(series, key, color) {
+  const W = 320, H = 120, L = 6, R = 6, T = 14, B = 18, n = series.length;
+  const max = Math.max(1, ...series.map(s => s[key]));
+  const bw = (W - L - R) / n;
+  let bars = "";
+  series.forEach((s, i) => {
+    const h = (H - T - B) * s[key] / max, x0 = L + i * bw + bw * 0.15, y0 = H - B - h;
+    bars += `<rect x="${x0.toFixed(1)}" y="${y0.toFixed(1)}" width="${(bw * 0.7).toFixed(1)}" height="${Math.max(h, s[key] ? 2 : 0).toFixed(1)}" rx="3" fill="${color}"><title>${s.d}: ${s[key]}</title></rect>`;
+    if (s[key] && n <= 14) bars += `<text x="${(x0 + bw * 0.35).toFixed(1)}" y="${(y0 - 3).toFixed(1)}" text-anchor="middle" font-size="9" fill="var(--hint)">${key === "revenue" ? Math.round(s[key] / 1000) + "k" : s[key]}</text>`;
+  });
+  const lbl = i => series[i].d.slice(5).replace("-", ".");
+  bars += `<text x="${L}" y="${H - 4}" font-size="9" fill="var(--hint)">${lbl(0)}</text><text x="${W - R}" y="${H - 4}" text-anchor="end" font-size="9" fill="var(--hint)">${lbl(n - 1)}</text>`;
+  return el("div", {html: `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img">${bars}</svg>`});
+}
+async function renderAdmin() {
+  stopTick(); showTabs(false); setBack(renderHome);
+  mount(el("div", {class: "center"}, el("div", {class: "spin dark"}), el("div", {class: "muted"}, "Statistika yuklanmoqda...")));
+  let d;
+  try { d = await api("/api/admin/stats", {timeout: 30000}); }
+  catch (e) { if (e && e.network) return renderNetError(renderAdmin); handleErr(e); return renderHome(); }
+  const T = d.totals, D = d.today, P = d.pending;
+  const stat = (v, l) => el("div", {class: "stat"}, el("b", {}, v), el("span", {}, l));
+  const tabsBox = el("div", {});
+  const chartSeg = el("div", {class: "seg", style: "margin:0 0 10px;display:flex"});
+  const charts = {results: ["Yechilgan testlar", "var(--ink)"], users: ["Yangi foydalanuvchilar", "var(--gold)"], revenue: ["Tushum", "var(--ok)"]};
+  const showChart = (k) => {
+    chartSeg.querySelectorAll("button").forEach(b => b.classList.toggle("on", b.dataset.k === k));
+    const sum = d.daily.reduce((s, x) => s + x[k], 0);
+    tabsBox.replaceChildren(el("div", {class: "muted small", style: "margin-bottom:4px"}, `${charts[k][0]} — 14 kun: `, el("b", {}, k === "revenue" ? fmtSum(sum) : sum)),
+      barChart(d.daily, k, charts[k][1]));
+  };
+  Object.keys(charts).forEach(k => chartSeg.append(el("button", {"data-k": k, onclick: () => showChart(k)}, charts[k][0].split(" ")[0])));
+  const pend = [];
+  if (P.payments) pend.push(statusBox("warn", `${P.payments} ta to'lov tasdiqlanishini kutmoqda`));
+  if (P.open_answers) pend.push(statusBox("warn", `${P.open_answers} ta natijada ochiq javob tekshirilmagan`));
+  if (P.staged) pend.push(statusBox("warn", `${P.staged} ta bosqichli imtihon baholanishini kutmoqda`));
+  if (!pend.length) pend.push(statusBox("ok", "Kutilayotgan ish yo'q"));
+  const list = (rows, fn) => rows.length ? rows.map(fn) : [el("div", {class: "muted", style: "padding:12px 0"}, "Ma'lumot yo'q")];
+  const evName = {fast: "Juda tez yechildi", phone: "Bir telefonda bir nechta akkaunt"};
+  const ago = ts => { const m = Math.round((Date.now() / 1000 - ts) / 60); return m < 60 ? `${m} daq oldin` : m < 1440 ? `${Math.round(m / 60)} soat oldin` : `${Math.round(m / 1440)} kun oldin`; };
+  mount(el("div", {class: "screen"},
+    band(el("div", {class: "eyebrow"}, "Faqat adminlar uchun"), el("h1", {}, "Admin panel"),
+      el("p", {}, "Bot statistikasi va kutilayotgan ishlar")),
+    el("div", {class: "card lift"}, el("div", {class: "lbl"}, "Bugun"), el("div", {class: "stats"},
+      stat(D.users, "yangi a'zo"), stat(D.results, "yechilgan test"),
+      stat(D.revenue >= 1000 ? Math.round(D.revenue / 1000) + "k" : D.revenue, "tushum (so'm)"))),
+    el("div", {class: "card"}, el("div", {class: "stats"},
+      stat(T.users, "foydalanuvchi"), stat(T.tests, "test"), stat(T.results, "natija")),
+      el("div", {class: "kv", style: "margin-top:12px"}, el("span", {}, "Shu oy tushumi"), el("b", {}, fmtSum(T.revenue_month))),
+      el("div", {class: "kv"}, el("span", {}, "Jami tushum"), el("b", {}, fmtSum(T.revenue_total))),
+      el("div", {class: "kv"}, el("span", {}, "Test yaratuvchilar"), el("b", {}, T.teachers))),
+    el("div", {class: "sect"}, "Kutilayotgan ishlar"), el("div", {class: "card", style: "margin-top:0"}, ...pend),
+    el("div", {class: "sect"}, "So'nggi 14 kun"), el("div", {class: "card", style: "margin-top:0"}, chartSeg, tabsBox),
+    el("div", {class: "sect"}, "Eng faol testlar (14 kun)"), el("div", {class: "card", style: "margin-top:0;padding-top:4px;padding-bottom:4px"},
+      ...list(d.top_tests, t => el("div", {class: "list-item"}, el("div", {style: "min-width:0"}, el("b", {}, t.title), el("div", {class: "muted small"}, `${t.code} · o'rtacha ${t.avg}%`)), el("span", {class: "badge"}, t.n)))),
+    el("div", {class: "sect"}, "Faol o'qituvchilar"), el("div", {class: "card", style: "margin-top:0;padding-top:4px;padding-bottom:4px"},
+      ...list(d.top_teachers, t => el("div", {class: "list-item"}, el("div", {style: "min-width:0"}, el("b", {}, t.name), el("div", {class: "muted small"}, `${t.tests} ta test`)), el("span", {class: "badge"}, t.results)))),
+    el("div", {class: "sect"}, "Shubhali faollik"), el("div", {class: "card", style: "margin-top:0;padding-top:4px;padding-bottom:4px"},
+      ...list(d.events, e => el("div", {class: "list-item", style: "align-items:flex-start"}, el("div", {style: "min-width:0"},
+        el("b", {style: "color:var(--bad)"}, evName[e.kind] || e.kind), el("div", {class: "small"}, [e.user, e.code].filter(Boolean).join(" · ")),
+        el("div", {class: "muted small"}, e.details)), el("span", {class: "muted small", style: "white-space:nowrap"}, ago(e.ts))))),
+    el("button", {class: "btn block ghost", style: "margin-top:12px", onclick: renderAdmin}, ic("refresh"), "Yangilash")));
+  showChart("results");
 }
 
 /* ------------ SAT: kalkulyator ------------ */
@@ -15532,6 +16687,7 @@ async def main():
 
     asyncio.create_task(certificate_daemon(bot))
     asyncio.create_task(db_backup_daemon(bot))
+    asyncio.create_task(reminder_daemon(bot))
     # ✅ WEBAPP_URL bo'sh bo'lsa tugma ko'rinmaydi — portni ham ochib qo'yish shart emas.
     if WEBAPP_URL:
         asyncio.create_task(run_webapp_server(bot))
