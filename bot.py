@@ -195,6 +195,7 @@ class AdminAddTestState(StatesGroup):
     title = State()
     is_free = State()
     price = State()
+    show_review = State()
     duration = State()
     questions_count = State()
     exam_type = State()
@@ -2031,6 +2032,10 @@ async def init_db(db):
     await _ensure_column(db, "results", "open_grades", "TEXT")
     await _ensure_column(db, "results", "open_pending", "INTEGER DEFAULT 0")
     await _ensure_column(db, "tests", "open_grade_reminded_ts", "BIGINT DEFAULT 0")
+    # ✅ O'qituvchi tanlovi: test tugagach o'quvchiga qaysi savolda to'g'ri/xato
+    # qilgani va to'g'ri javoblar ko'rsatilsinmi (1) yoki faqat soni (0).
+    # Mavjud testlar avvalgidek ko'rsatishda davom etadi (DEFAULT 1).
+    await _ensure_column(db, "tests", "show_review", "INTEGER DEFAULT 1")
 
     # ✅ O'quvchi testdan menyuga chiqib ketsa, belgilagan javoblari shu yerda
     # saqlanadi — testga qaytganda (vaqt qolgan bo'lsa) davom ettiradi.
@@ -2669,7 +2674,7 @@ async def _update_button(callback: CallbackQuery, new_text: str | None = None, r
 # Bir martalik tanlov tugmalari (test yaratish sehrgari va h.k.): handler
 # muvaffaqiyatli bajarilgach o'sha xabardagi tugmalar avtomatik yopiladi.
 _CLOSE_AFTER_CHOICE = ("setfree_", "qdq_", "etype_", "sch_normal", "sch_scheduled", "stg_on", "stg_off",
-                       "stg_grader_", "edtg_grader_", "edtf_", "profregion_")
+                       "stg_grader_", "edtg_grader_", "edtf_", "profregion_", "rvset_")
 
 
 class CloseUsedButtonsMiddleware(BaseMiddleware):
@@ -3986,6 +3991,10 @@ def _render_staged_result_text(row) -> str:
     )
 
 
+REVIEW_HIDDEN_NOTE = ("🔒 O'qituvchi bu test uchun javoblar tahlilini yopgan — faqat to'g'ri va "
+                      "xato javoblar soni ko'rsatiladi.")
+
+
 @router.callback_query(F.data.startswith("viewres_"))
 async def view_result(callback: CallbackQuery, bot: Bot):
     test_id = int(callback.data.split("_")[1])
@@ -3998,7 +4007,8 @@ async def view_result(callback: CallbackQuery, bot: Bot):
                r.score, r.total_questions, r.percent,
                r.earned_points, r.max_points, r.details,
                r.rasch_ball, r.rasch_percent, r.grade, r.date,
-               r.open_grades, COALESCE(r.open_pending,0) AS open_pending
+               r.open_grades, COALESCE(r.open_pending,0) AS open_pending,
+               COALESCE(t.show_review,1) AS show_review
         FROM results r
         JOIN tests t ON t.id=r.test_id
         WHERE r.user_id=$1 AND r.test_id=$2
@@ -4007,6 +4017,7 @@ async def view_result(callback: CallbackQuery, bot: Bot):
 
     if not row:
         return await callback.message.answer("Bu test bo‘yicha natija topilmadi.")
+    show_review = int(row["show_review"]) == 1
 
     # ✅ Bosqichli testlar (IELTS/CEFR/SAT/DTM 5-bosqich) — avval bu yerda
     # ularning asosiy natijasi (band/daraja/ball) umuman ko'rsatilmasdi.
@@ -4132,13 +4143,16 @@ async def view_result(callback: CallbackQuery, bot: Bot):
     if rank_row and rank_row["total"]:
         rank_block = f"\n🏅 Reytingda: <b>{int(rank_row['better'] or 0) + 1} / {rank_row['total']}</b> o'rin\n"
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔎 Xatolarni ko'rish", callback_data=f"mistakes_{test_id}")],
-        [InlineKeyboardButton(text="📤 Natijani ulashish", callback_data=f"share_{test_id}")],
-    ])
+    rows = [[InlineKeyboardButton(text="📤 Natijani ulashish", callback_data=f"share_{test_id}")]]
+    review_line = ""
+    if show_review:
+        rows.insert(0, [InlineKeyboardButton(text="🔎 Xatolarni ko'rish", callback_data=f"mistakes_{test_id}")])
+    else:
+        review_line = f"\n{REVIEW_HIDDEN_NOTE}\n"
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
 
     await callback.message.answer(
-        base_block + dtm_block + rasch_block + intl_block + rank_block + f"\n🗓 Sana: {date_}",
+        base_block + dtm_block + rasch_block + intl_block + rank_block + review_line + f"\n🗓 Sana: {date_}",
         parse_mode=ParseMode.HTML,
         reply_markup=kb
     )
@@ -4153,7 +4167,7 @@ async def view_mistakes(callback: CallbackQuery):
 
     row = await POOL.fetchrow("""
         SELECT r.user_answers, r.open_text_answers, r.open_grades, r.details, t.answers, t.questions_count,
-               t.exam_type, t.open_ref_answers, t.skills_cfg
+               t.exam_type, t.open_ref_answers, t.skills_cfg, COALESCE(t.show_review,1) AS show_review
         FROM results r JOIN tests t ON t.id=r.test_id
         WHERE r.user_id=$1 AND r.test_id=$2
         ORDER BY r.id ASC LIMIT 1
@@ -4164,6 +4178,11 @@ async def view_mistakes(callback: CallbackQuery):
 
     if not row or not row["user_answers"]:
         return await callback.message.answer("❌ Bu test bo'yicha javoblaringiz topilmadi.")
+
+    # ✅ O'qituvchi tahlilni yopgan bo'lsa (eski xabardagi tugma bosilsa ham)
+    if int(row["show_review"]) == 0:
+        await _update_button(callback, remove_row=True)
+        return await callback.message.answer(REVIEW_HIDDEN_NOTE)
 
     # ✅ Rasch — guruh testi tugamaguncha xato tahlilini ko'rsatmaymiz,
     # aks holda erta tugatgan o'quvchi hali yechayotganlarga javob "sizib
@@ -4243,11 +4262,18 @@ async def _send_staged_mistakes(answerable, row) -> None:
     xatolar va Writing/Speaking fikr-mulohazasi."""
     cfg = _load_skills_cfg(row["skills_cfg"])
     sections = (_load_json_dict(row["details"]).get("stages") or {})
+    show_review = int(row["show_review"]) == 1
     parts = []
     for k in cfg.get("order", []):
         sec = cfg["sections"].get(k, {})
         v = sections.get(k) or {}
         name = _h(sec.get("name", k))
+        if sec.get("type") in (STAGE_TYPE_MCQ, STAGE_TYPE_MCQ_BAND) and not show_review:
+            # ✅ O'qituvchi tahlilni yopgan — qaysi savol xato ekani emas, faqat soni
+            if v:
+                sc, tot = int(v.get("score") or 0), int(v.get("total") or 0)
+                parts.append(f"📖 <b>{name}</b>\n✅ To'g'ri: {sc}/{tot} | ❌ Xato: {max(0, tot - sc)}")
+            continue
         if sec.get("type") in (STAGE_TYPE_MCQ, STAGE_TYPE_MCQ_BAND):
             ck = normalize_answers(sec.get("answers") or "")
             ua = normalize_answers(v.get("user_answers") or "")
@@ -4271,6 +4297,8 @@ async def _send_staged_mistakes(answerable, row) -> None:
             fb = _h(v.get("feedback") or "-")
             parts.append(f"✍️ <b>{name}</b>: {v.get('band', '-')}\n💬 {fb}")
     text = "\n\n".join(parts) if parts else "Ma'lumot topilmadi."
+    if not show_review:
+        text += f"\n\n{REVIEW_HIDDEN_NOTE}"
     await answerable.answer(text[:4000], parse_mode=ParseMode.HTML)
 
 
@@ -5124,13 +5152,14 @@ async def _finalize_staged_test(answerable, state: FSMContext) -> None:
         INSERT INTO tests (
             code, title, subject, price, duration, questions_count, is_free,
             start_mode, start_ts, start_at,
-            exam_type, skills_cfg, creator_id, created_ts
+            exam_type, skills_cfg, creator_id, created_ts, show_review
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'normal', 0, NULL, $8, $9, $10, $11)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'normal', 0, NULL, $8, $9, $10, $11, $12)
         RETURNING id
     """,
         data.get("code"), data.get("title"), data.get("subject"), price,
-        total_duration, total_qcount, is_free, kind, skills_cfg_json, creator_tg_id, now_ts()
+        total_duration, total_qcount, is_free, kind, skills_cfg_json, creator_tg_id, now_ts(),
+        0 if int(data.get("show_review", 1)) == 0 else 1
     )
 
     section_lines = "\n".join(
@@ -5142,7 +5171,9 @@ async def _finalize_staged_test(answerable, state: FSMContext) -> None:
                   "cefr4": "CEFR (4 ko'nikma)", "sat_staged": "SAT (2 bosqich)"}.get(kind, kind)
     await answerable.answer(
         f"✅ <b>{kind_label}</b> testi qo'shildi!\n🔑 Kod: <code>{data.get('code')}</code>\n\n"
-        f"<b>Bosqichlar:</b>\n{section_lines}",
+        f"<b>Bosqichlar:</b>\n{section_lines}"
+        + ("\n\n🔒 Javoblar tahlili: <b>yopiq</b> (o'quvchi faqat sonlarni ko'radi)"
+           if int(data.get("show_review", 1)) == 0 else ""),
         parse_mode=ParseMode.HTML,
         reply_markup=main_menu_kb(await is_admin_user(creator_tg_id))
     )
@@ -6927,7 +6958,7 @@ async def _send_result_certificate(bot: Bot, result_id: int) -> bool:
 async def _notify_student_open_graded(bot: Bot, result_id: int) -> None:
     row = await POOL.fetchrow("""
         SELECT r.open_grades, r.score, r.total_questions, r.percent, r.grade, r.earned_points, r.max_points,
-               u.telegram_id, t.title, t.code, t.exam_type, t.answers
+               u.telegram_id, t.title, t.code, t.exam_type, t.answers, COALESCE(t.show_review,1) AS show_review
         FROM results r JOIN users u ON u.id=r.user_id JOIN tests t ON t.id=r.test_id WHERE r.id=$1
     """, result_id)
     if not row:
@@ -6935,13 +6966,19 @@ async def _notify_student_open_graded(bot: Bot, result_id: int) -> None:
     grades = _load_json_dict(row["open_grades"])
     key = normalize_answers(row["answers"] or "")
     lines = []
+    n_ok = n_all = 0
     for i, c in enumerate(key):
         if c != "x":
             continue
         g = grades.get(str(i + 1))
         if g is None:
             continue
+        n_all += 1
+        n_ok += int(g) == 1
         lines.append(f"{'✅' if int(g) == 1 else '❌'} {i + 1}-savol: {'to‘g‘ri' if int(g) == 1 else 'noto‘g‘ri'}")
+    if int(row["show_review"]) == 0:
+        # ✅ O'qituvchi tahlilni yopgan — qaysi savol to'g'ri/xato ekani aytilmaydi
+        lines = [f"✅ To'g'ri: {n_ok} | ❌ Xato: {n_all - n_ok}"]
     et = row["exam_type"] or "simple"
     text = (
         f"✍️ <b>Ochiq savollaringiz tekshirildi</b>\n"
@@ -7019,7 +7056,8 @@ async def process_test_submission(
 
     t = await POOL.fetchrow("""
         SELECT code, title, subject, questions_count, answers, exam_type, dtm_cfg, start_mode, start_ts, duration,
-               cert_academy_name, cert_signee_name, cert_template, creator_id, open_ref_answers
+               cert_academy_name, cert_signee_name, cert_template, creator_id, open_ref_answers,
+               COALESCE(show_review,1) AS show_review
         FROM tests
         WHERE id=$1
     """, test_id)
@@ -7158,8 +7196,12 @@ async def process_test_submission(
     # to'g'ri javoblarni "sizib chiqarishi" mumkin edi. Shu sabab bu turda
     # batafsil xato tahlili test VAQTI tugagunicha yashiriladi; boshqa barcha
     # turlarda (simple/dtm/cefr/ielts/sat) xatolar avvalgidek darhol chiqadi.
+    show_review = int(t["show_review"]) == 1
     if exam_type == "rasch":
         remain_text = await remaining_time_text(test_id)
+    if not show_review:
+        mistakes_text = ""
+    elif exam_type == "rasch":
         mistakes_text = (
             f"⏳ Guruh xavfsizligi uchun batafsil xato tahlili test vaqti "
             f"tugagach ko'rsatiladi (\"🔎 Xatolarni ko'rish\" tugmasi orqali).\n"
@@ -7226,6 +7268,8 @@ async def process_test_submission(
             f"📊 Foiz: <b>{percent:.1f}%</b>\n"
         )
 
+    review_block = (f"🔎 <b>Xatolar:</b>\n{mistakes_text}\n\n" if show_review
+                    else f"{REVIEW_HIDDEN_NOTE}\n\n")
     result_text = (
         f"🏁 <b>Test yakunlandi!</b>\n\n"
         f"🔑 Kod: <code>{code}</code>\n"
@@ -7236,8 +7280,7 @@ async def process_test_submission(
         f"{extra_points_line}"
         f"{rasch_pending_block}"
         f"{intl_block}\n"
-        f"🔎 <b>Xatolar:</b>\n"
-        f"{mistakes_text}\n\n"
+        f"{review_block}"
         f"ℹ️ Bu test bo‘yicha natija faqat <b>1-urinish</b> hisoblanadi."
     )
     # ✅ Har bir topshiruv uchun adminga alohida xabar YUBORILMAYDI (ko'p
@@ -8890,8 +8933,8 @@ async def admedit_pick(callback: CallbackQuery, state: FSMContext):
         return await callback.answer("Bu testga huquqingiz yo'q!", show_alert=True)
 
     t = await POOL.fetchrow(
-        "SELECT id, code, title, subject, price, duration, is_free, questions_count, exam_type, skills_cfg "
-        "FROM tests WHERE id=$1", test_id)
+        "SELECT id, code, title, subject, price, duration, is_free, questions_count, exam_type, skills_cfg, "
+        "COALESCE(show_review,1) AS show_review FROM tests WHERE id=$1", test_id)
     if not t:
         return await callback.answer("Test topilmadi.", show_alert=True)
 
@@ -8921,6 +8964,7 @@ async def _send_edit_field_picker(answerable, state: FSMContext, t):
             [InlineKeyboardButton(text=f"🧮 Savollar soni: {t['questions_count']}", callback_data="edtf_questions_count")])
         kb.inline_keyboard.append(
             [InlineKeyboardButton(text="🔑 Javob kaliti", callback_data="edtf_answers")])
+    kb.inline_keyboard.append([_review_toggle_btn(t["id"], int(t["show_review"]))])
 
     await answerable.answer(
         f"✏️ <b>{t['title']}</b> (<code>{t['code']}</code>)\nQaysi maydonni o'zgartirmoqchisiz?\n\n"
@@ -8929,6 +8973,27 @@ async def _send_edit_field_picker(answerable, state: FSMContext, t):
         parse_mode=ParseMode.HTML, reply_markup=kb
     )
     await state.set_state(AdminEditTestState.waiting_field)
+
+
+def _review_toggle_btn(test_id: int, show_review: int) -> InlineKeyboardButton:
+    label = "✅ ko'rsatiladi" if show_review else "🔒 yopiq"
+    return InlineKeyboardButton(text=f"👁 Javoblar tahlili: {label}", callback_data=f"rvtoggle_{test_id}")
+
+
+@router.callback_query(F.data.startswith("rvtoggle_"))
+async def review_toggle(callback: CallbackQuery):
+    """O'qituvchi: o'quvchilarga javoblar tahlilini ko'rsatish/yopish (darhol)."""
+    test_id = int(callback.data.split("_")[1])
+    if not await _is_admin_or_creator(callback.from_user.id, test_id):
+        return await callback.answer("Bu testga huquqingiz yo'q!", show_alert=True)
+    new_val = await POOL.fetchval(
+        "UPDATE tests SET show_review = 1 - COALESCE(show_review,1) WHERE id=$1 RETURNING show_review", test_id)
+    if new_val is None:
+        return await callback.answer("Test topilmadi.", show_alert=True)
+    await _update_button(callback, _review_toggle_btn(test_id, int(new_val)).text)
+    await callback.answer(
+        "✅ Endi o'quvchilar javoblar tahlilini ko'radi." if new_val else
+        "🔒 Javoblar tahlili yopildi — o'quvchilar faqat to'g'ri/xato sonini ko'radi.", show_alert=True)
 
 
 _EDIT_FIELD_LABELS = {
@@ -9116,6 +9181,7 @@ async def _send_staged_edit_picker(answerable, state: FSMContext, t) -> None:
         kb.inline_keyboard.append(
             [InlineKeyboardButton(text=f"🧩 {sec.get('name', key)}", callback_data=f"edtstage_sec_{t['id']}_{key}")]
         )
+    kb.inline_keyboard.append([_review_toggle_btn(t["id"], int(t["show_review"]))])
 
     await answerable.answer(
         f"✏️ <b>{t['title']}</b> (<code>{t['code']}</code>) — bosqichli test.\n"
@@ -9966,7 +10032,7 @@ async def set_is_free(callback: CallbackQuery, state: FSMContext):
 
     if is_free == 1:
         await callback.message.answer("✅ Tekin test tanlandi.")
-        await _ask_exam_type(callback.message, state)
+        await _ask_show_review(callback.message, state)
     else:
         await callback.message.answer("✅ Pullik test tanlandi.")
         await _nav_show_price(callback.message, state)
@@ -9988,7 +10054,36 @@ async def set_price(message: Message, state: FSMContext):
         )
 
     await _nav_push(state, "base", "price")
-    await _ask_exam_type(message, state)
+    await _ask_show_review(message, state)
+
+
+async def _ask_show_review(answerable, state: FSMContext) -> None:
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Ha, javoblar tahlili ko'rsatilsin", callback_data="rvset_1")],
+        [InlineKeyboardButton(text="🔒 Yo'q, faqat to'g'ri/xato soni", callback_data="rvset_0")],
+    ])
+    await answerable.answer(
+        "4-qadam: <b>test tugagach o'quvchiga javoblar tahlili ko'rsatilsinmi?</b>\n\n"
+        "✅ <b>Ha</b> — o'quvchi qaysi savolda xato qilganini va to'g'ri javoblarni ko'radi.\n"
+        "🔒 <b>Yo'q</b> — o'quvchi faqat nechta to'g'ri, nechta xato va foizni ko'radi; "
+        "qaysi savol to'g'ri yoki xato ekani ko'rsatilmaydi (botda ham, Mini App'da ham).\n\n"
+        "<i>Keyinroq testni tahrirlash bo'limida istalgan vaqt o'zgartirishingiz mumkin.</i>",
+        parse_mode=ParseMode.HTML, reply_markup=kb
+    )
+    await state.set_state(AdminAddTestState.show_review)
+
+
+@router.callback_query(AdminAddTestState.show_review, F.data.startswith("rvset_"))
+async def set_show_review(callback: CallbackQuery, state: FSMContext):
+    val = 1 if callback.data == "rvset_1" else 0
+    await state.update_data(show_review=val)
+    await _nav_push(state, "base", "show_review")
+    await callback.answer()
+    await callback.message.answer(
+        "✅ Javoblar tahlili <b>ko'rsatiladi</b>." if val else
+        "🔒 Javoblar tahlili <b>yopiq</b> — o'quvchi faqat natija sonlarini ko'radi.",
+        parse_mode=ParseMode.HTML)
+    await _ask_exam_type(callback.message, state)
 
 
 # ✅ AVTOMATLASHTIRISH: avval "davomiylik" va "savollar soni" ikkita alohida
@@ -10014,7 +10109,7 @@ def duration_qcount_kb():
 
 async def _ask_duration_and_qcount(answerable, state: FSMContext):
     await answerable.answer(
-        "5-qadam: <b>test davomiyligi va savollar soni</b>\n\n"
+        "6-qadam: <b>test davomiyligi va savollar soni</b>\n\n"
         "Tayyor variantlardan birini tanlang,\n"
         "yoki o'zingiz <b>«daqiqa savol_soni»</b> shaklida yozing.\n"
         "Masalan: <code>40 25</code> — 40 daqiqa, 25 ta savol.",
@@ -10049,7 +10144,7 @@ async def _proceed_to_schedule_step(answerable, state: FSMContext) -> None:
         [InlineKeyboardButton(text="🚀 Oddiy (o'quvchi istalgan vaqtda boshlaydi)", callback_data="sch_normal")],
         [InlineKeyboardButton(text="📅 Rejalashtirilgan (hammaga bir xil vaqt)", callback_data="sch_scheduled")]
     ])
-    await answerable.answer("6-qadam: <b>test qachon boshlanadi?</b>", parse_mode=ParseMode.HTML, reply_markup=kb)
+    await answerable.answer("7-qadam: <b>test qachon boshlanadi?</b>", parse_mode=ParseMode.HTML, reply_markup=kb)
     await state.set_state(AdminAddTestState.schedule_mode)
 
 
@@ -10101,7 +10196,7 @@ async def _ask_exam_type(answerable, state: FSMContext):
         [InlineKeyboardButton(text="🧮 SAT (2 bosqich: R&W + Math)", callback_data="etype_satstaged")],
     ])
     await answerable.answer(
-        "4-qadam: <b>baholash rejimini tanlang</b>\n\n"
+        "5-qadam: <b>baholash rejimini tanlang</b>\n\n"
         "📝 <b>Oddiy</b> — har savol 1 ball, natija oddiy foizda.\n"
         "⚡ <b>Rasch (MS)</b> — natija guruhga nisbatan statistik baholanadi "
         "(milliy sertifikat uslubiga yaqin); istalgan guruh kattaligida (1 kishidan "
@@ -10196,7 +10291,7 @@ async def set_exam_type(callback: CallbackQuery, state: FSMContext):
 
 async def _nav_show_file(answerable, state: FSMContext) -> None:
     await answerable.answer(
-        "7-qadam: test faylini (PDF) yuboring:",
+        "8-qadam: test faylini (PDF) yuboring:",
         parse_mode=ParseMode.HTML,
         reply_markup=nav_kb(include_back=True)
     )
@@ -10271,7 +10366,7 @@ async def _nav_show_answers(answerable, state: FSMContext) -> None:
     data = await state.get_data()
     qcount = int(data.get("questions_count") or 30)
     await answerable.answer(
-        f"8-qadam (oxirgi): <b>javoblar kalitini kiriting.</b>\n"
+        f"9-qadam (oxirgi): <b>javoblar kalitini kiriting.</b>\n"
         f"Aynan <b>{qcount} ta</b> harf, bo'shliqsiz, savollar tartibida.\n"
         f"Faqat <b>A, B, C, D, E, F</b> harflaridan foydalaning (masalan: <code>abcdabcd...</code>)\n\n"
         f"<i>Variantsiz (ochiq) savol bo'lsa, o'sha o'rniga <code>x</code> harfini qo'ying — "
@@ -10365,9 +10460,9 @@ async def _finish_base_test_creation(
         INSERT INTO tests (
             code, title, subject, price, duration, questions_count, file_id, answers, is_free,
             start_mode, start_ts, start_at,
-            exam_type, dtm_cfg, creator_id, created_ts, open_ref_answers
+            exam_type, dtm_cfg, creator_id, created_ts, open_ref_answers, show_review
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
         RETURNING id
     """,
         data.get("code"),
@@ -10387,11 +10482,14 @@ async def _finish_base_test_creation(
         message.from_user.id,
         now_ts(),
         open_ref_json,
+        0 if int(data.get("show_review", 1)) == 0 else 1,
     )
 
     extra = ""
     if start_mode == "scheduled":
         extra = f"\n📅 Boshlanish: <b>{start_at}</b>"
+    if int(data.get("show_review", 1)) == 0:
+        extra += "\n🔒 Javoblar tahlili: <b>yopiq</b> (o'quvchi faqat sonlarni ko'radi)"
 
     admin_flag = await is_admin_user(message.from_user.id)
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -10417,6 +10515,7 @@ BASE_NAV_HANDLERS = {
     "title": _nav_show_title,
     "is_free": _nav_show_is_free,
     "price": _nav_show_price,
+    "show_review": _ask_show_review,
     "exam_type": _ask_exam_type,
     "duration": _ask_duration_and_qcount,
     "schedule_mode": _proceed_to_schedule_step,
@@ -11234,7 +11333,8 @@ async def help_menu(message: Message):
         "• 50% va undan yuqori natija bilan avtomatik <b>Sertifikat (PDF)</b> beriladi 🎁.\n\n"
 
         "<b>3. Natijadan keyin nima qilsa bo'ladi</b>\n"
-        "• <b>🔎 Xatolarni ko'rish</b> — qaysi savolda xato qilganingizni istalgan vaqt qayta ko'rish.\n"
+        "• <b>🔎 Xatolarni ko'rish</b> — qaysi savolda xato qilganingizni istalgan vaqt qayta ko'rish "
+        "(agar o'qituvchi javoblar tahlilini yopgan bo'lsa, faqat to'g'ri/xato soni ko'rsatiladi).\n"
         "• <b>🏅 Reytingdagi o'rningiz</b> — shu testni yechganlar orasida qaysi o'rindasiz.\n"
         "• <b>📤 Natijani ulashish</b> — do'stlaringizga yuborish uchun tayyor matn.\n"
         "• <b>📜 Sertifikatlarim</b> («📄 Natijalarim» ichida) — oldin olgan sertifikatlaringizni qayta yuklab olish.\n\n"
@@ -11249,6 +11349,9 @@ async def help_menu(message: Message):
         "• <b>➕ Test yaratish</b> — o'zingiz test tuzib ulashishingiz mumkin, kuniga 10 tagacha "
         "(tekin yoki pullik — pullik bo'lsa to'lov admin kartasiga tushadi, u sizga tegishli "
         "ulushni o'zi o'tkazib beradi).\n"
+        "• Test yaratishda o'quvchiga <b>javoblar tahlili</b> (qaysi savol to'g'ri/xato va to'g'ri javoblar) "
+        "ko'rsatilsinmi yoki faqat to'g'ri/xato soni chiqsinmi — o'zingiz tanlaysiz. Keyin "
+        "<b>✏️ tahrirlash</b>dagi «👁 Javoblar tahlili» tugmasi bilan istalgan vaqt o'zgartirasiz.\n"
         "• <b>🛠 Yaratgan testlarim</b> — har bir testingiz uchun bitta joyda: statistikasi, "
         "<b>✏️ tahrirlash</b>, <b>🛑 vaqtincha yakunlash/qayta ochish</b>, <b>🎓 sertifikat ko'rinishini "
         "sozlash</b> (o'quv markazi nomi, mas'ul shaxs, rangi) va kerak bo'lsa <b>🗑 o'chirish</b>.\n\n"
@@ -12642,7 +12745,8 @@ async def _web_test_row(code: str | None = None, test_id: int | None = None):
         SELECT id, code, title, subject, is_free, price, duration, questions_count, file_id, answers,
                start_mode, start_ts, start_at, exam_type, dtm_cfg, skills_cfg,
                COALESCE(is_hidden,0) AS is_hidden, COALESCE(is_closed,0) AS is_closed,
-               COALESCE(rush_finalized,0) AS rush_finalized, open_ref_answers
+               COALESCE(rush_finalized,0) AS rush_finalized, open_ref_answers,
+               COALESCE(show_review,1) AS show_review
         FROM tests WHERE """
     if test_id is not None:
         return await POOL.fetchrow(q + "id=$1", test_id)
@@ -12947,6 +13051,10 @@ async def _web_result_view(user_db_id: int, test_id: int) -> dict:
                          "grade": r["grade"], "remain_text": None if finalized else await remaining_time_text(test_id)}
         end_ts = await get_test_end_ts(test_id)
         review_allowed = end_ts > 0 and now_ts() >= end_ts
+    # ✅ O'qituvchi javoblar tahlilini yopgan bo'lsa — faqat sonlar ko'rinadi
+    view["review_hidden"] = int(t["show_review"]) == 0
+    if view["review_hidden"]:
+        review_allowed = False
     view["review_allowed"] = review_allowed
     if review_allowed and r["user_answers"]:
         user_ans = normalize_answers(r["user_answers"])
@@ -15081,7 +15189,8 @@ function renderResult(v) {
       kids.push(el("div", {class: "sect"}, "Javoblar tahlili"), el("div", {class: "card", style: "margin-top:0"}, el("div", {class: "muted small"}, "Raqamni bosing — javobingiz va to'g'ri javob ko'rinadi."), grid,
         el("div", {class: "legend"}, el("span", {}, el("i", {style: "background:var(--ok-soft);border-color:var(--ok)"}), "to'g'ri"),
           el("span", {}, el("i", {style: "background:var(--bad);border-color:var(--bad)"}), "xato"), el("span", {}, el("i", {style: "border-style:dashed"}), "tekshirilmoqda"))));
-    } else if (v.review_allowed === false) kids.push(statusBox("", "Guruh xavfsizligi uchun batafsil tahlil test vaqti tugagach ochiladi."));
+    } else if (v.review_hidden) kids.push(statusBox("", "O'qituvchi bu test uchun javoblar tahlilini yopgan — faqat to'g'ri va xato javoblar soni ko'rsatiladi."));
+    else if (v.review_allowed === false) kids.push(statusBox("", "Guruh xavfsizligi uchun batafsil tahlil test vaqti tugagach ochiladi."));
   }
   if (v.certificate && v.result_id) kids.push(el("div", {class: "card"}, el("div", {style: "display:flex;gap:12px;align-items:center;margin-bottom:12px"},
       el("div", {class: "ico gold"}, ic("award")), el("div", {}, el("b", {}, "Sertifikat"), el("div", {class: "muted small"}, "Sertifikatingiz botga ham yuborilgan."))),
