@@ -108,9 +108,9 @@ WEBAPP_PORT = int(_env("WEBAPP_PORT", "8080") or "8080")
 # va hammasi avvalgidek qo'lda tekshiriladi.
 GEMINI_API_KEY = _env("GEMINI_API_KEY", "")
 GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-3.6-flash")
-# ✅ Asosiy AI — Claude (aniqroq baholaydi, rasmdagi qo'lyozmani ham o'qiydi).
-# Claude ishlamasa (kalit yo'q, limit, xato) — avtomatik Gemini'ga o'tiladi.
-# Speaking (ovoz) faqat Gemini'da: Claude audio qabul qilmaydi.
+# ✅ Asosiy AI — Gemini. Claude ixtiyoriy: ANTHROPIC_API_KEY qo'yilsagina u
+# birinchi bo'lib ishlaydi, ishlamasa (limit, xato) yana Gemini'ga o'tiladi.
+# Kalit bo'sh bo'lsa Claude umuman chaqirilmaydi. Speaking (ovoz) faqat Gemini'da.
 ANTHROPIC_API_KEY = _env("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL = _env("CLAUDE_MODEL", "claude-opus-5-5")
 
@@ -14072,7 +14072,7 @@ async def help_menu(message: Message):
         "• Shu yerda: <b>🔗 test havolasi</b> (bosilsa test darhol ochiladi), <b>📑 nusxa olish</b> va "
         "<b>🛡 ko'chirishga qarshi</b> (fayl himoyasi, A/B variant).\n"
         "• <b>Milliy sertifikat</b>: barcha fanlar uchun Rasch (75 ball, A+…C); <b>Ona tili</b> uchun test + "
-        "<b>esse</b>, alohida <b>Esse</b> turi ham bor — esseni AI (Claude) yoki ustoz 24 ballik mezonda baholaydi.\n\n"
+        "<b>esse</b>, alohida <b>Esse</b> turi ham bor — esseni AI yoki ustoz 24 ballik mezonda baholaydi.\n\n"
 
         "<b>6. Reyting va profil</b>\n"
         "• <b>📄 Natijalarim</b> — shaxsiy statistikangiz va topshirgan testlaringiz tarixi.\n"
