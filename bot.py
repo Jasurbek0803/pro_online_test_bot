@@ -15300,6 +15300,7 @@ class WebError(Exception):
 
 def _web_handler(fn):
     async def wrapper(request: web.Request):
+        t0 = time.monotonic()
         try:
             return await fn(request)
         except WebError as e:
@@ -15310,8 +15311,45 @@ def _web_handler(fn):
             return web.json_response(
                 {"ok": False, "error": "server", "message": "Serverda kutilmagan xatolik. Qayta urinib ko'ring."},
                 status=500)
+        finally:
+            # ✅ Sekin javoblar logga yoziladi — ilova "sekin" desa sababi server
+            # tomonidami (masalan Telegram API kechikishi) yoki internetdami, ko'rinadi
+            dt = time.monotonic() - t0
+            if dt > 3:
+                logging.warning(f"Mini App sekin javob: {request.method} {request.path} — {dt:.1f} s")
     wrapper.__name__ = fn.__name__
     return wrapper
+
+
+async def webapp_api_ping(request: web.Request):
+    """Aloqani tekshirish uchun eng yengil so'rov (imzo talab qilinmaydi)."""
+    return web.json_response({"ok": True, "t": now_ts()}, headers={"Cache-Control": "no-store"})
+
+
+_WEB_CLIENTLOG_HITS: dict[str, deque] = defaultdict(deque)
+
+
+async def webapp_api_clientlog(request: web.Request):
+    """Ilova "aloqa uzildi" holatini qayd etadi (qaysi so'rov, qancha kutdi,
+    qurilma onlaynmi) — muammoni foydalanuvchi so'zidan emas, logdan topish uchun."""
+    ip = request.headers.get("CF-Connecting-IP") or request.remote or "?"
+    dq = _WEB_CLIENTLOG_HITS[ip]
+    now_ = time.time()
+    while dq and now_ - dq[0] > 60:
+        dq.popleft()
+    if len(dq) >= 10:
+        return web.json_response({"ok": True})
+    dq.append(now_)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    user = validate_webapp_init_data(request.headers.get("X-Telegram-Init-Data", ""), BOT_TOKEN) or {}
+    clean = {k: str(body.get(k))[:120] for k in ("kind", "path", "ms", "online", "status", "msg")}
+    logging.warning(f"Mini App mijoz: user={user.get('id', '?')} {clean} ua={request.headers.get('User-Agent', '')[:90]}")
+    return web.json_response({"ok": True})
 
 
 def _web_rate_ok(tg_id: int) -> bool:
@@ -17024,6 +17062,8 @@ def build_webapp_application(bot: Bot | None = None) -> web.Application:
     app.router.add_post("/api/test/remind", webapp_api_remind)
     app.router.add_get("/api/admin/stats", webapp_api_admin_stats)
     app.router.add_post("/api/register", webapp_api_register)
+    app.router.add_get("/api/ping", webapp_api_ping)
+    app.router.add_post("/api/clientlog", webapp_api_clientlog)
     app.router.add_get("/api/wallet", webapp_api_wallet)
     app.router.add_post("/api/wallet/topup", webapp_api_wallet_topup)
     app.router.add_post("/api/test/buy", webapp_api_test_buy)
@@ -17429,7 +17469,7 @@ function haptic(kind) {
 }
 // Kutish oynasi; internet sekin bo'lsa 6 soniyadan keyin izoh qo'shiladi.
 function overlay(text) {
-  const slow = el("div", {class: "slow hidden"}, "Internet sekin ko'rinadi — biroz kuting, so'rov avtomatik qayta yuboriladi.");
+  const slow = el("div", {class: "slow hidden"}, "Javob kutilmoqda — biroz kuting. Aloqa uzilsa, so'rov o'zi qayta yuboriladi.");
   const o = el("div", {class: "overlay"}, el("div", {class: "spin"}), el("div", {}, text), slow);
   const tm = setTimeout(() => slow.classList.remove("hidden"), 6000);
   document.body.append(o); return () => { clearTimeout(tm); o.remove(); };
@@ -17447,15 +17487,51 @@ function stopTick() { if (S.tick) { clearInterval(S.tick); S.tick = null; } }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ------------ tarmoq: timeout + avtomatik qayta urinish ------------ */
-let netOk = true;
+// "Aloqa yo'q" chizig'i faqat haqiqatan aloqa bo'lmasa chiqadi va aloqa
+// tiklanishi bilan o'zi yo'qoladi: chiqqan zahoti har 4 soniyada yengil
+// /api/ping yuboriladi (avval chiziq keyingi so'rovgacha osilib qolardi va
+// internet yaxshi bo'lsa ham "Internet yo'q" deb turaverardi).
+let netOk = true, pingTimer = null;
+function netText() {
+  return navigator.onLine === false ? "Internet yo'q — javoblar qurilmada saqlanmoqda"
+                                    : "Server bilan aloqa tiklanmoqda — javoblar qurilmada saqlanmoqda";
+}
+async function pingOnce() {
+  try {
+    const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 6000);
+    const r = await fetch("/api/ping", {cache: "no-store", signal: ctl.signal}); clearTimeout(tm);
+    return r.ok;
+  } catch (e) { return false; }
+}
+function startPing() {
+  if (pingTimer) return;
+  pingTimer = setInterval(async () => { if (await pingOnce()) netState(true); }, 4000);
+}
 function netState(ok) {
+  if (!ok) {
+    const bar = document.getElementById("netbar");
+    const t = bar.querySelector("span:last-child"); if (t) t.textContent = netText();
+    startPing();
+  } else if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
   if (ok === netOk) return;
   netOk = ok;
   document.getElementById("netbar").classList.toggle("show", !ok);
   if (ok && S.st && !S.st.submitted && !S.st.writing && S.st.ui) flushSave(S.st);
 }
-window.addEventListener("offline", () => netState(false));
+// "offline" hodisasi ba'zi WebView'larda yolg'on keladi — avval ping bilan tekshiramiz
+window.addEventListener("offline", async () => { if (!(await pingOnce())) netState(false); });
 window.addEventListener("online", () => netState(true));
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && !netOk) pingOnce().then(ok => ok && netState(true)); });
+let lastReport = 0;
+function reportNet(info) {
+  // aloqa muammosini serverga qayd etish (sababni logdan topish uchun); daqiqasiga ko'pi bilan 3 marta
+  if (Date.now() - lastReport < 20000) return;
+  lastReport = Date.now();
+  setTimeout(() => {
+    try { fetch("/api/clientlog", {method: "POST", keepalive: true, headers: {"Content-Type": "application/json", "X-Telegram-Init-Data": initData},
+      body: JSON.stringify(Object.assign({online: navigator.onLine}, info))}).catch(() => {}); } catch (e) {}
+  }, 1500);
+}
 
 // retries: tarmoq uzilsa yoki server vaqtincha band bo'lsa (502-504) necha
 // marta qayta yuborilsin. GET va bir xil natija beradigan ("idem") so'rovlar
@@ -17472,18 +17548,20 @@ async function api(path, opts) {
     if (opts.body !== undefined) { o.headers["Content-Type"] = "application/json"; o.body = JSON.stringify(opts.body); }
     if (opts.form) o.body = opts.form;
     if (opts.keepalive) o.keepalive = true;
-    let res, data = {}, netErr = false;
+    let res, data = {}, netErr = false, errName = "";
+    const t0 = Date.now();
     try {
       res = await fetch(path, o);
-      try { data = await res.json(); } catch (e) { if (e && e.name === "AbortError") netErr = true; }
-    } catch (e) { netErr = true; }
+      try { data = await res.json(); } catch (e) { if (e && e.name === "AbortError") { netErr = true; errName = "timeout"; } }
+    } catch (e) { netErr = true; errName = (e && e.name) || "fetch"; }
     clearTimeout(tm);
     if (netErr) {
       if (i < tries) { await sleep(700 * Math.pow(2, i)); continue; }
-      netState(false);
+      reportNet({kind: errName, path: path.split("?")[0], ms: Date.now() - t0});
+      if (!opts.quiet) netState(false);
       throw {network: true, message: navigator.onLine === false
         ? "Internet aloqasi yo'q. Ulanib, qayta urinib ko'ring."
-        : "Internet sekin yoki uzildi. Qayta urinib ko'ring."};
+        : "Server javob bermadi (aloqa uzildi). Bir necha soniyadan keyin qayta urinib ko'ring."};
     }
     netState(true);
     if (res.status >= 502 && res.status <= 504 && i < tries) { await sleep(1000 * (i + 1)); continue; }
@@ -17587,8 +17665,9 @@ function initOnce() {
 }
 function renderNetError(retry) {
   stopTick(); showTabs(false);
-  mount(centerMsg("wifioff", "Internet aloqasi sekin yoki uzilgan",
-    "Aloqa tiklanishi bilan qayta urinib ko'ring — javoblaringiz yo'qolmaydi.",
+  mount(centerMsg("wifioff", navigator.onLine === false ? "Internet aloqasi yo'q" : "Server bilan aloqa o'rnatilmadi",
+    navigator.onLine === false ? "Internetga ulanib, qayta urinib ko'ring — javoblaringiz yo'qolmaydi."
+      : "Internetingiz ishlayotgan bo'lsa, bir necha soniyadan keyin qayta urinib ko'ring — javoblaringiz yo'qolmaydi.",
     el("button", {class: "btn cta", onclick: retry}, ic("refresh"), "Qayta urinish")));
 }
 async function boot() {
@@ -17677,7 +17756,7 @@ function renderHome() {
   const walletBox = el("div", {}, walletEntry());
   if (!S.meTs || Date.now() - S.meTs > 3000) {
     S.meTs = Date.now();
-    api("/api/me").then(me => {
+    api("/api/me", {quiet: true}).then(me => {
       gotMe(me);
       if (!me.registered) return renderGate("reg");
       if (!me.subscribed) return renderGate("sub", me.channels);
@@ -18308,17 +18387,28 @@ async function submitWriting(st, auto) {
 
 /* ------------ fayllar: PDF / audio ------------ */
 // pdf.js (~1 MB) faqat PDF kerak bo'lganda yuklanadi — sahifa ochilishini sekinlashtirmaydi.
-let pdfJsP = null;
+let pdfJsP = null, pdfWorkerSrc = "";
+// Asosiy CDN ochilmasa (ba'zi provayderlarda) — zaxira CDN'dan yuklanadi
+const PDFJS_CDNS = ["https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/",
+                    "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/"];
+function loadScript(src, ms) {
+  return new Promise(res => {
+    const s = document.createElement("script"); let done = false;
+    const fin = ok => { if (done) return; done = true; clearTimeout(tm); if (!ok) s.remove(); res(ok); };
+    const tm = setTimeout(() => fin(false), ms);
+    s.src = src; s.onload = () => fin(true); s.onerror = () => fin(false);
+    document.head.append(s);
+  });
+}
 function loadPdfJs() {
   if (window.pdfjsLib) return Promise.resolve(true);
   if (pdfJsP) return pdfJsP;
-  pdfJsP = new Promise(res => {
-    const s = document.createElement("script");
-    s.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
-    s.onload = () => res(!!window.pdfjsLib);
-    s.onerror = () => { pdfJsP = null; s.remove(); res(false); };
-    document.head.append(s);
-  });
+  pdfJsP = (async () => {
+    for (const base of PDFJS_CDNS) {
+      if (await loadScript(base + "pdf.min.js", 20000) && window.pdfjsLib) { pdfWorkerSrc = base + "pdf.worker.min.js"; return true; }
+    }
+    pdfJsP = null; reportNet({kind: "pdfjs", path: "cdn"}); return false;
+  })();
   return pdfJsP;
 }
 // Fayl qismlab o'qiladi — sekin internetda yuklanish foizi ko'rinib turadi.
@@ -18352,7 +18442,8 @@ async function fetchFile(url, onProgress) {
       lastErr = e; await sleep(1500 * (i + 1));
     }
   }
-  throw new Error("Internet sekin — faylni yuklab bo'lmadi. Qayta urinib ko'ring.");
+  reportNet({kind: "file", path: url.split("?")[0], msg: String(lastErr && lastErr.message || "")});
+  throw new Error("Faylni yuklab bo'lmadi (aloqa uzildi). «Qayta yuklash»ni bosing.");
 }
 async function ensureFiles(st, pane) {
   if (st.filesLoaded) return;
@@ -18393,11 +18484,11 @@ async function renderPdf(blob, box, pane) {
   const ok = await loadPdfJs();
   if (!ok || !window.pdfjsLib) {
     // ko'ruvchi yuklanmasa ham fayl yo'qolmaydi — to'g'ridan-to'g'ri ochish mumkin
-    box.append(el("div", {style: "margin:12px"}, statusBox("warn", "PDF ko'ruvchini yuklab bo'lmadi (internet sekin)."),
+    box.append(el("div", {style: "margin:12px"}, statusBox("warn", "PDF ko'ruvchi ochilmadi — faylni to'g'ridan-to'g'ri ochishingiz mumkin."),
       el("a", {class: "btn block ghost", href: URL.createObjectURL(blob), target: "_blank", rel: "noopener"}, ic("file"), "PDF'ni ochish")));
     return;
   }
-  pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerSrc || (PDFJS_CDNS[0] + "pdf.worker.min.js");
   const pdf = await pdfjsLib.getDocument({data: await blob.arrayBuffer()}).promise;
   let zoom = 1;
   const pages = el("div", {class: "pdfwrap"});
