@@ -1234,7 +1234,8 @@ async def _ai_check_rasch_sanity(
                 "reason": sanitize_plain_text(str(obj.get("reason") or ""), max_len=500)}
 
     try:
-        res = await _ai_json(prompt, schema, validate=validate, effort="medium")
+        # o'quvchi "Natija"ni bosganda ishlaydi — tez bo'lsin
+        res = await _ai_json(prompt, schema, validate=validate, effort="low", max_tokens=4000, timeout=45)
     except Exception:
         logging.exception("AI Rasch sanity tekshiruvida xatolik")
         return default
@@ -2552,6 +2553,14 @@ async def _auto_submit_on_timeout(bot: "Bot", user_tg_id: int, test_id: int, end
 
 
 async def _auto_submit_on_timeout_unlocked(bot: "Bot", user_tg_id: int, test_id: int, end_ts: int) -> None:
+    token = _SOFT_SEND.set(True)
+    try:
+        await _auto_submit_on_timeout_core(bot, user_tg_id, test_id, end_ts)
+    finally:
+        _SOFT_SEND.reset(token)
+
+
+async def _auto_submit_on_timeout_core(bot: "Bot", user_tg_id: int, test_id: int, end_ts: int) -> None:
     """✅ Vaqt tugaganda o'quvchi belgilagan javoblarni AVTOMATIK topshiradi.
     Avval vaqt tugasa, "Yakunlash"ni o'zi 60 soniya ichida bosmagan o'quvchining
     butun ishi yo'qolardi ("Vaqt tugadi! Javoblar qabul qilinmadi"). Bosqichli
@@ -2781,7 +2790,33 @@ class EditTrackerMiddleware(BaseRequestMiddleware):
         return await make_request(bot, method)
 
 
+# ✅ Fon jarayonlari (vaqt tugaganda avto-topshirish, Mini App muddati, AI
+# baholash) ichida o'quvchi botni bloklagan bo'lsa, xabar yuborish xatosi
+# butun jarayonni to'xtatib qo'yardi — masalan "Vaqt tugadi" xabari xato
+# bergani uchun javoblar umuman topshirilmay, natija yo'qolardi. Shu kontekst
+# yoqilganda bloklangan/yo'q chatga yuborish jim o'tkazib yuboriladi.
+_SOFT_SEND: contextvars.ContextVar = contextvars.ContextVar("_SOFT_SEND", default=False)
+
+
+class SoftSendMiddleware(BaseRequestMiddleware):
+    async def __call__(self, make_request, bot, method):
+        try:
+            return await make_request(bot, method)
+        except TelegramForbiddenError:
+            if _SOFT_SEND.get() and type(method).__name__.startswith(("Send", "Copy", "Forward")):
+                logging.warning(f"Xabar yetkazilmadi (bot bloklangan): chat={getattr(method, 'chat_id', '?')}")
+                return None
+            raise
+        except TelegramBadRequest as e:
+            if _SOFT_SEND.get() and "chat not found" in str(e).lower() \
+                    and type(method).__name__.startswith(("Send", "Copy", "Forward")):
+                logging.warning(f"Xabar yetkazilmadi (chat topilmadi): chat={getattr(method, 'chat_id', '?')}")
+                return None
+            raise
+
+
 def _install_bot_session_middlewares(bot: Bot) -> None:
+    bot.session.middleware(SoftSendMiddleware())
     bot.session.middleware(CallbackAnswerDedupMiddleware())
     bot.session.middleware(NavRequestMiddleware())
     bot.session.middleware(EditTrackerMiddleware())
@@ -6936,12 +6971,12 @@ _CLAUDE_CLIENT = None
 def _claude_client():
     global _CLAUDE_CLIENT
     if _CLAUDE_CLIENT is None:
-        _CLAUDE_CLIENT = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY, timeout=150.0, max_retries=2)
+        _CLAUDE_CLIENT = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY, timeout=300.0, max_retries=2)
     return _CLAUDE_CLIENT
 
 
 async def _claude_json(prompt: str, schema: dict, *, images: list | None = None,
-                       effort: str = "medium", max_tokens: int = 12000) -> dict:
+                       effort: str = "medium", max_tokens: int = 12000, timeout: float | None = None) -> dict:
     """Claude'dan sxemaga mos JSON oladi. {"ok": True, "data": {...}} yoki
     {"ok": False, "reason": "<AI_FAIL_REASON_LABELS kaliti>"}.
     images — [(mime, bytes), ...] (qo'lyozma/rasm javoblar uchun)."""
@@ -6959,6 +6994,7 @@ async def _claude_json(prompt: str, schema: dict, *, images: list | None = None,
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": content}],
             output_config={"effort": effort, "format": {"type": "json_schema", "schema": schema}},
+            **({"timeout": timeout} if timeout else {}),
         )
     except anthropic.RateLimitError:
         logging.error("Claude API limiti (429)")
@@ -7031,7 +7067,8 @@ async def _gemini_json(prompt: str, *, extra_parts: list | None = None, timeout:
 
 async def _ai_json(prompt: str, schema: dict, *, images: list | None = None,
                    gemini_parts: list | None = None, validate=None, bot: Bot | None = None,
-                   effort: str = "medium", claude_ok: bool = True, max_tokens: int = 12000) -> dict:
+                   effort: str = "medium", claude_ok: bool = True, max_tokens: int = 12000,
+                   timeout: float | None = None) -> dict:
     """Avval Claude, u ishlamasa (yoki javobi yaroqsiz bo'lsa) — Gemini.
     validate(data) -> dict|None: javobni tekshirib normallashtiradi; None
     bo'lsa javob yaroqsiz (parse_error) deb keyingi AI'ga o'tiladi.
@@ -7040,11 +7077,12 @@ async def _ai_json(prompt: str, schema: dict, *, images: list | None = None,
     attempts = []
     if claude_ok:
         attempts.append(("claude", lambda: _claude_json(prompt, schema, images=images, effort=effort,
-                                                        max_tokens=max_tokens)))
+                                                        max_tokens=max_tokens, timeout=timeout)))
     g_parts = list(gemini_parts or [])
     for mime, data in (images or []):
         g_parts.append({"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode("ascii")}})
-    attempts.append(("gemini", lambda: _gemini_json(prompt, extra_parts=g_parts)))
+    attempts.append(("gemini", lambda: _gemini_json(prompt, extra_parts=g_parts,
+                                                    timeout=int(min(timeout, 90)) if timeout else 90)))
 
     reasons = []
     quota_hit = []
@@ -9159,16 +9197,30 @@ async def _essay_open_writing(bot: Bot, user_tg_id: int, test_id: int, state: FS
     deadline = await _essay_deadline(test_id)
     if int(r["is_closed"]) == 1 or (deadline and now_ts() > deadline):
         return "⏰ Esse topshirish muddati tugagan."
-    await state.set_state(EssayState.writing)
-    await state.update_data(essay_test_id=test_id, essay_result_id=r["id"], essay_parts=[], essay_photos=[])
+    kb = None
+    if isinstance(state, _DetachedState):
+        # Mini App yoki avto-topshirish: chat holati faqat bo'sh bo'lsa ochiladi,
+        # aks holda (chatda boshqa ish ketayotgan bo'lsa) tugma orqali ochiladi
+        real = FSMContext(storage=FSM_STORAGE, key=StorageKey(bot_id=bot.id, chat_id=user_tg_id, user_id=user_tg_id)) \
+            if FSM_STORAGE is not None else None
+        if real is not None and await real.get_state() is None:
+            state = real
+        else:
+            state = None
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✍️ Chatda esse yozish", callback_data=f"essay_{test_id}")]])
+    if state is not None:
+        await state.set_state(EssayState.writing)
+        await state.update_data(essay_test_id=test_id, essay_result_id=r["id"], essay_parts=[], essay_photos=[])
     remain = fmt_seconds(deadline - now_ts()) if deadline else "-"
     await bot.send_message(
         user_tg_id,
         f"✍️ <b>Esse (2-qism)</b>\n\n📌 Mavzu: <b>{_h(cfg['prompt'])}</b>\n\n<i>{MS_ESSAY_RULES}</i>\n\n"
         f"🕒 Qolgan vaqt: <b>{remain}</b> (test va esse uchun umumiy vaqt)\n\n"
         f"Esseni shu yerga <b>matn</b> qilib yozing (bir necha xabarda bo'lsa ham bo'ladi) yoki qo'lda yozilgan "
-        f"varaqlarni <b>rasmga olib</b> yuboring ({ESSAY_MAX_PHOTOS} tagacha). Tugatgach «✅ Esseni topshirish»ni bosing.",
-        parse_mode=ParseMode.HTML)
+        f"varaqlarni <b>rasmga olib</b> yuboring ({ESSAY_MAX_PHOTOS} tagacha). Tugatgach «✅ Esseni topshirish»ni bosing."
+        + ("\n\n📱 Mini App'da ham shu testning natija oynasidan esse yozishingiz mumkin." if WEBAPP_URL else ""),
+        parse_mode=ParseMode.HTML, reply_markup=kb)
     return None
 
 
@@ -9205,6 +9257,7 @@ async def essay_submit(bot: Bot, result_id: int, text: str | None, photos: list 
 
 
 async def _essay_grade_job(bot: Bot, result_id: int) -> None:
+    _SOFT_SEND.set(True)   # fon vazifasi: o'quvchi/ustoz botni bloklagan bo'lsa ham baho saqlanadi
     try:
         r = await POOL.fetchrow("""
             SELECT r.essay_text, r.essay_photos, t.essay_cfg FROM results r JOIN tests t ON t.id=r.test_id
@@ -14990,6 +15043,10 @@ async def global_error_handler(event: ErrorEvent, bot: Bot):
     holatda ham foydalanuvchiga tushunarli xabar chiqadi, ham to'liq xato
     server logiga yoziladi (diagnostika uchun).
     """
+    if isinstance(event.exception, TelegramForbiddenError):
+        # foydalanuvchi tugmani bosib, darhol botni bloklagan — bu bot xatosi emas
+        logging.warning(f"Foydalanuvchi botni bloklagan: {event.exception}")
+        return
     logging.exception(f"Ushlanmagan xatolik: {event.exception}")
 
     chat_id = None
@@ -15583,6 +15640,7 @@ async def _web_deadline(bot: Bot, tg_id: int, test_id: int, end_ts: int) -> None
         await asyncio.sleep(max(0, end_ts - now_ts()) + WEB_DEADLINE_GRACE_SEC)
         if WEB_DEADLINE_TASKS.get(key) is asyncio.current_task():
             WEB_DEADLINE_TASKS.pop(key, None)
+        _SOFT_SEND.set(True)   # shu fon vazifasi uchun (o'z konteksti)
         async with _web_lock(bot, tg_id):
             et = await POOL.fetchval("SELECT exam_type FROM tests WHERE id=$1", test_id)
             if (et or "") in STAGED_EXAM_TYPES:
