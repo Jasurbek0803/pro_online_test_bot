@@ -52,8 +52,15 @@ from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, Teleg
 from aiogram.utils.callback_answer import CallbackAnswerMiddleware
 from aiogram.client.session.middlewares.base import BaseRequestMiddleware
 from aiogram.methods import (AnswerCallbackQuery, EditMessageText, EditMessageCaption, EditMessageReplyMarkup,
-                             EditMessageMedia, DeleteMessage)
+                             EditMessageMedia, DeleteMessage, SendMessage)
 import contextvars
+
+# ✅ Claude (Anthropic) SDK ixtiyoriy: serverda o'rnatilmagan bo'lsa ham bot
+# ishlayveradi — AI baholash shunchaki zaxira (Gemini)ga yoki ustozga o'tadi.
+try:
+    import anthropic
+except ImportError:  # pragma: no cover
+    anthropic = None
 
 # ===================== CONFIG =====================
 load_dotenv()
@@ -95,12 +102,17 @@ WEBAPP_URL = _env("WEBAPP_URL", "").rstrip("/")
 WEBAPP_HOST = _env("WEBAPP_HOST", "0.0.0.0")
 WEBAPP_PORT = int(_env("WEBAPP_PORT", "8080") or "8080")
 
-# ✅ IELTS Writing/Speaking'ni test yaratuvchi xohlasa AI (Gemini) avtomatik
+# ✅ IELTS Writing/Speaking'ni test yaratuvchi xohlasa AI avtomatik
 # baholaydi, xohlamasa qo'lda (ustoz) tekshiradi — buni har bir bo'lim uchun
 # alohida tanlash mumkin. Kalit bo'sh bo'lsa, AI tanlovi umuman ko'rsatilmaydi
 # va hammasi avvalgidek qo'lda tekshiriladi.
 GEMINI_API_KEY = _env("GEMINI_API_KEY", "")
 GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-3.6-flash")
+# ✅ Asosiy AI — Claude (aniqroq baholaydi, rasmdagi qo'lyozmani ham o'qiydi).
+# Claude ishlamasa (kalit yo'q, limit, xato) — avtomatik Gemini'ga o'tiladi.
+# Speaking (ovoz) faqat Gemini'da: Claude audio qabul qilmaydi.
+ANTHROPIC_API_KEY = _env("ANTHROPIC_API_KEY", "")
+CLAUDE_MODEL = _env("CLAUDE_MODEL", "claude-opus-5-5")
 
 TOP_N = 10
 
@@ -139,6 +151,7 @@ BTN_ADMIN_CHANNELS = "📣 Majburiy kanallar (Admin)"
 BTN_ADMIN_DEL_TEST = "🗑 Testni o'chirish (Admin)"
 BTN_ADMIN_ADD_ADMIN = "👮 Adminlarni boshqarish"
 BTN_PROFILE = "👤 Profilim"
+BTN_WALLET = "👛 Hamyonim"
 
 BTN_HOME = "🏠 Bosh menyu"
 # ✅ Bu tugma haqiqatda BIR QADAM ORQAGA emas — butun jarayonni bekor qilib
@@ -154,7 +167,7 @@ TOP_MENU_BTNS = {
     BTN_FREE, BTN_PAID, BTN_MY, BTN_RATING, BTN_RESULTS, BTN_HELP,
     BTN_ADD_TEST, BTN_MY_CREATED_TESTS,
     BTN_ADMIN_PENDING, BTN_ADMIN_STATS, BTN_ADMIN_CHANNELS,
-    BTN_ADMIN_DEL_TEST, BTN_ADMIN_ADD_ADMIN,
+    BTN_ADMIN_DEL_TEST, BTN_ADMIN_ADD_ADMIN, BTN_PROFILE, BTN_WALLET,
     BTN_HOME, BTN_BACK, BTN_CANCEL
 }
 
@@ -186,6 +199,15 @@ UZ_REGIONS = [
 ]
 
 
+class WalletState(StatesGroup):
+    amount = State()
+    receipt = State()
+
+
+class WalletAdjState(StatesGroup):
+    amount = State()
+
+
 class PaymentState(StatesGroup):
     waiting_for_screenshot = State()
 
@@ -205,6 +227,17 @@ class AdminAddTestState(StatesGroup):
     file = State()
     answers = State()
     open_ref_answers = State()
+    essay_prompt = State()
+    essay_grader = State()
+    essay_weight = State()
+
+
+class EssayState(StatesGroup):
+    writing = State()
+
+
+class EssayGradeState(StatesGroup):
+    score = State()
 
 
 class AntiCheatState(StatesGroup):
@@ -1140,7 +1173,7 @@ def weighted_max_points(p_i: float, reward_k: float = RUSH_REWARD_K) -> float:
     return 1.0 + reward_k * (1.0 - _clamp(float(p_i), 0.0, 1.0))
 
 
-async def _gemini_check_rasch_sanity(
+async def _ai_check_rasch_sanity(
     qcount: int, n_solvers: int, p_list: list[float], score_pairs: list[tuple[int, float]]
 ) -> dict:
     """Guruhning vaznli Rasch ballarini o'quvchilarga E'LON QILISHDAN OLDIN
@@ -1152,11 +1185,11 @@ async def _gemini_check_rasch_sanity(
     mumkin edi). AI faqat ikkita ALLAQACHON TEKSHIRILGAN, deterministik
     formuladan qay birini ishlatishni tanlaydi: (1) standart vaznli
     (item-difficulty) formula, yoki (2) anomaliya aniqlansa — oddiy
-    chiziqli foiz->ball formulasiga qaytish. Gemini mavjud bo'lmasa yoki
-    xato bersa, har doim standart formula ishonchli deb qabul qilinadi —
+    chiziqli foiz->ball formulasiga qaytish. AI (Claude, keyin Gemini) mavjud
+    bo'lmasa yoki xato bersa, har doim standart formula ishonchli deb qabul qilinadi —
     natija hech qachon AI mavjudligiga bog'liq bo'lib qolmaydi."""
     default = {"ok": True, "reason": ""}
-    if not GEMINI_API_KEY or not score_pairs:
+    if not _ai_enabled() or not score_pairs:
         return default
 
     if len(score_pairs) <= 40:
@@ -1191,28 +1224,21 @@ async def _gemini_check_rasch_sanity(
         '{"ok": true yoki false, "reason": "<agar ok=false bo\'lsa qisqa o\'zbekcha sabab, aks holda bo\'sh satr>"}'
     )
 
-    # ✅ Kalit URL'da emas, header'da — aiohttp xatolari (masalan JSON o'rniga
-    # HTML qaytsa) to'liq URL'ni logga yozadi, kalit server logiga tushardi.
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}, "reason": {"type": "string"}},
+              "required": ["ok", "reason"], "additionalProperties": False}
+
+    def validate(obj: dict):
+        if "ok" not in obj:
+            return None
+        return {"ok": bool(obj.get("ok", True)),
+                "reason": sanitize_plain_text(str(obj.get("reason") or ""), max_len=500)}
+
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-            async with session.post(url, json=payload, headers={"x-goog-api-key": GEMINI_API_KEY}) as resp:
-                if resp.status != 200:
-                    logging.error(f"Gemini Rasch tekshiruvi xatosi: {resp.status} {await resp.text()}")
-                    return default
-                data = await resp.json()
-        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-        obj = _extract_json_object(raw_text)
-        if not obj or "ok" not in obj:
-            return default
-        return {
-            "ok": bool(obj.get("ok", True)),
-            "reason": sanitize_plain_text(str(obj.get("reason") or ""), max_len=500),
-        }
+        res = await _ai_json(prompt, schema, validate=validate, effort="medium")
     except Exception:
-        logging.exception("Gemini Rasch sanity tekshiruvida xatolik")
+        logging.exception("AI Rasch sanity tekshiruvida xatolik")
         return default
+    return res["data"] if res.get("ok") else default
 
 
 def fallback_rasch_ball_from_raw_percent(raw_percent_0_100: float) -> float:
@@ -1265,9 +1291,10 @@ async def remaining_time_text(test_id: int) -> str:
     remain = end_ts - now_ts()
     if remain <= 0:
         pending = await POOL.fetchval(
-            "SELECT COUNT(*) FROM results WHERE test_id=$1 AND COALESCE(open_pending,0)>0", test_id)
+            "SELECT COUNT(*) FROM results WHERE test_id=$1 AND (COALESCE(open_pending,0)>0 OR essay_status='pending')",
+            test_id)
         if pending:
-            return "test vaqti tugagan — ustoz ochiq (yozma) javoblarni tekshirgach e'lon qilinadi"
+            return "test vaqti tugagan — ustoz ochiq (yozma) javoblar va esselarni tekshirgach e'lon qilinadi"
         return "tez orada (hisoblash navbatda)"
     return f"{fmt_seconds(remain)} qoldi"
 
@@ -1287,12 +1314,14 @@ async def _remind_open_grading(bot: "Bot", test_id: int, pending_n: int) -> None
         [InlineKeyboardButton(text="✍️ Javoblarni tekshirish", callback_data=f"ogl_{test_id}")],
         [InlineKeyboardButton(text="⚡ Tekshirmasdan hisoblash", callback_data=f"ogforce_{test_id}")],
     ])
+    if await POOL.fetchval("SELECT 1 FROM results WHERE test_id=$1 AND essay_status='pending' LIMIT 1", test_id):
+        kb.inline_keyboard.insert(1, [InlineKeyboardButton(text="📝 Esselarni baholash", callback_data=f"esl_{test_id}")])
     try:
         await bot.send_message(
             t["creator_id"] or ADMIN_ID,
             f"⏳ <b>{_h(t['title'])}</b> (<code>{t['code']}</code>) — test vaqti tugadi.\n\n"
             f"Rasch natijalari e'lon qilinishi uchun <b>{pending_n}</b> ta o'quvchining ochiq (yozma) "
-            f"javoblarini tekshirish kerak. Tekshirib bo'lgach, natijalar avtomatik hisoblanadi.",
+            f"javoblari/esselarini tekshirish kerak. Tekshirib bo'lgach, natijalar avtomatik hisoblanadi.",
             parse_mode=ParseMode.HTML, reply_markup=kb
         )
     except Exception:
@@ -1310,8 +1339,12 @@ async def finalize_rush_for_test_if_ready(test_id: int, bot: "Bot | None" = None
     # beriladi — hisoblash shu muhlat tugagach boshlanadi. Avval natijalar
     # rasmiy tugash lahzasidayoq hisoblanib, muhlat ichida topshirganlarning
     # Rasch bali hech qachon hisoblanmay qolardi.
-    is_closed = await POOL.fetchval("SELECT COALESCE(is_closed,0) FROM tests WHERE id=$1", test_id)
-    grace = 0 if int(is_closed or 0) == 1 else RASCH_SUBMIT_GRACE_SEC
+    trow = await POOL.fetchrow("SELECT COALESCE(is_closed,0) AS is_closed, essay_cfg FROM tests WHERE id=$1", test_id)
+    essay_cfg = _essay_cfg_of(trow["essay_cfg"]) if trow else {}
+    if trow and int(trow["is_closed"]) == 1:
+        grace = 0
+    else:
+        grace = max(RASCH_SUBMIT_GRACE_SEC, ESSAY_GRACE_SEC) if essay_cfg else RASCH_SUBMIT_GRACE_SEC
     if now_ts() < end_ts + grace:
         return False
 
@@ -1335,18 +1368,25 @@ async def finalize_rush_for_test_if_ready(test_id: int, bot: "Bot | None" = None
         # bor ekan, natijalar e'lon qilinmaydi (aks holda ochiq savollar
         # hisobsiz qolib, ballar noto'g'ri chiqardi). force=True — ustoz
         # "tekshirmasdan hisoblash"ni tanlagan: tekshirilmaganlar 0 hisoblanadi.
+        if essay_cfg:
+            # muddatida yozilmagan esse — 0 ball
+            await db.execute("UPDATE results SET essay_status='missing' WHERE test_id=$1 AND "
+                             "COALESCE(essay_status,'awaiting')='awaiting'", test_id)
         pending_n = await db.fetchval(
-            "SELECT COUNT(*) FROM results WHERE test_id=$1 AND COALESCE(open_pending,0)>0", test_id)
+            "SELECT COUNT(*) FROM results WHERE test_id=$1 AND (COALESCE(open_pending,0)>0 OR essay_status='pending')",
+            test_id)
         if pending_n and not force:
             if bot is not None:
                 await _remind_open_grading(bot, test_id, int(pending_n))
             return False
 
         rows = await db.fetch("""
-            SELECT id, user_answers, open_grades
+            SELECT id, user_answers, open_grades, essay_ball, essay_status
             FROM results
             WHERE test_id=$1 AND user_answers IS NOT NULL AND LENGTH(user_answers) >= $2
         """, test_id, qcount)
+        essay_by_row = {int(r["id"]): (float(r["essay_ball"] or 0) if r["essay_status"] == "graded" else 0.0)
+                        for r in rows}
 
         if not rows:
             return False
@@ -1421,7 +1461,7 @@ async def finalize_rush_for_test_if_ready(test_id: int, bot: "Bot | None" = None
         # qachon sonlarni o'zi o'ylab topmaydi — faqat ikkita allaqachon
         # tekshirilgan deterministik formuladan birini tanlaydi.
         score_pairs = sorted({(rc, rb) for _, rc, rb, _, _ in candidates})
-        sanity = await _gemini_check_rasch_sanity(qcount, n_solvers, p_list, score_pairs)
+        sanity = await _ai_check_rasch_sanity(qcount, n_solvers, p_list, score_pairs)
 
         if not sanity.get("ok", True):
             logging.warning(f"Rasch AI sanity: test={test_id} anomaliya -> {sanity.get('reason')}")
@@ -1448,16 +1488,24 @@ async def finalize_rush_for_test_if_ready(test_id: int, bot: "Bot | None" = None
                     logging.exception("Rasch anomaliya xabarini adminga yuborib bo'lmadi")
 
         grades_by_row = {rid: g for rid, _c, g in solver_rows}
+        essay_w = float(essay_cfg.get("weight") or 0.5) if essay_cfg else 0.0
         async with db.transaction():
             for row_id, raw, rasch_ball, rasch_percent, grade in candidates:
+                test_ball = None
+                if essay_cfg:
+                    # ✅ Ona tili: yakuniy ball = test qismi × (1−ulush) + esse × ulush
+                    test_ball = float(rasch_ball)
+                    rasch_ball = (1 - essay_w) * test_ball + essay_w * essay_by_row.get(row_id, 0.0)
+                    rasch_percent = rasch_ball / 75.0 * 100.0
+                    grade = grade_from_rasch_ball(rasch_ball)
                 await db.execute("""
                     UPDATE results
                     SET rasch_ball=$1, rasch_percent=$2, grade=$3,
-                        score=$4, percent=$5, open_grades=$6, open_pending=0
+                        score=$4, percent=$5, open_grades=$6, open_pending=0, test_ball=$8
                     WHERE id=$7
                 """, float(rasch_ball), float(rasch_percent), grade,
                     int(raw), (raw / qcount * 100.0) if qcount else 0.0,
-                    json.dumps(grades_by_row.get(row_id) or {}, ensure_ascii=False), row_id)
+                    json.dumps(grades_by_row.get(row_id) or {}, ensure_ascii=False), row_id, test_ball)
 
             await db.execute(
                 "UPDATE tests SET rush_finalized=1, rush_finalized_ts=$1 WHERE id=$2",
@@ -2109,6 +2157,40 @@ async def init_db(db):
     await _ensure_column(db, "payments", "amount", "INTEGER")
     await _ensure_column(db, "payments", "approved_at", "TEXT")
 
+    # ✅ Milliy sertifikat: Ona tili (test + esse). Esse holati: awaiting (hali
+    # yozilmagan) -> pending (tekshirilmoqda) -> graded; muddatida yozilmasa missing.
+    await _ensure_column(db, "tests", "essay_cfg", "TEXT")
+    for col, typ in (("essay_status", "TEXT"), ("essay_text", "TEXT"), ("essay_photos", "TEXT"),
+                     ("essay_raw", "REAL"), ("essay_ball", "REAL"), ("essay_feedback", "TEXT"),
+                     ("essay_criteria", "TEXT"), ("essay_graded_by", "TEXT"), ("essay_submitted_ts", "BIGINT"),
+                     ("test_ball", "REAL")):
+        await _ensure_column(db, "results", col, typ)
+
+    # ✅ Hamyon (balans): to'ldirish, balansdan xarid, admin tuzatishi tarixi
+    await _ensure_column(db, "users", "balance", "BIGINT DEFAULT 0")
+    await _ensure_column(db, "payments", "method", "TEXT DEFAULT 'receipt'")
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS wallet_tx (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            amount BIGINT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            test_id INTEGER,
+            receipt_file_id TEXT,
+            note TEXT,
+            created_ts BIGINT DEFAULT 0,
+            decided_ts BIGINT DEFAULT 0,
+            decided_by BIGINT
+        )
+    """)
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_wallet_tx_user ON wallet_tx(user_id, id)")
+    # bir vaqtda faqat bitta tekshirilayotgan to'ldirish so'rovi
+    await db.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_topup_pending
+        ON wallet_tx(user_id) WHERE status='pending' AND kind='topup'
+    """)
+
     # ✅ Tezlik uchun indekslar — faqat qidiruvni tezlashtiradi, hech qanday
     # ma'lumotni o'zgartirmaydi yoki o'chirmaydi.
     await db.execute("CREATE INDEX IF NOT EXISTS idx_results_test_id ON results(test_id)")
@@ -2248,7 +2330,7 @@ SECURITY.exam_cb_hits = defaultdict(deque)
 class MessageSecurityMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: Message, data):
         user_id = event.from_user.id if event.from_user else 0
-        if not user_id:
+        if not user_id or _NAV_REPLAYING.get():
             return await handler(event, data)
         # ✅ Adminlar spam-himoyadan ozod — bu himoya o'quvchilarning suiiste'molini
         # cheklash uchun, admin panelidagi tez-tez tugma bosishlar tufayli
@@ -2268,7 +2350,7 @@ class MessageSecurityMiddleware(BaseMiddleware):
 class CallbackSecurityMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: CallbackQuery, data):
         user_id = event.from_user.id if event.from_user else 0
-        if not user_id:
+        if not user_id or _NAV_REPLAYING.get():
             return await handler(event, data)
         if await is_admin_user(user_id):
             return await handler(event, data)
@@ -2298,7 +2380,7 @@ def main_menu_kb(is_admin=False):
         [KeyboardButton(text=BTN_MY), KeyboardButton(text=BTN_RATING)],
         [KeyboardButton(text=BTN_RESULTS), KeyboardButton(text=BTN_HELP)],
         [KeyboardButton(text=BTN_ADD_TEST), KeyboardButton(text=BTN_MY_CREATED_TESTS)],
-        [KeyboardButton(text=BTN_PROFILE)]
+        [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_WALLET)]
     ]
     if is_admin:
         buttons.append([KeyboardButton(text=BTN_ADMIN_PENDING), KeyboardButton(text=BTN_ADMIN_STATS)])
@@ -2701,6 +2783,7 @@ class EditTrackerMiddleware(BaseRequestMiddleware):
 
 def _install_bot_session_middlewares(bot: Bot) -> None:
     bot.session.middleware(CallbackAnswerDedupMiddleware())
+    bot.session.middleware(NavRequestMiddleware())
     bot.session.middleware(EditTrackerMiddleware())
 
 
@@ -2777,7 +2860,7 @@ async def _update_button(callback: CallbackQuery, new_text: str | None = None, r
 # Bir martalik tanlov tugmalari (test yaratish sehrgari va h.k.): handler
 # muvaffaqiyatli bajarilgach o'sha xabardagi tugmalar avtomatik yopiladi.
 _CLOSE_AFTER_CHOICE = ("setfree_", "qdq_", "etype_", "sch_normal", "sch_scheduled", "stg_on", "stg_off",
-                       "stg_grader_", "edtg_grader_", "edtf_", "profregion_", "rvset_")
+                       "stg_grader_", "edtg_grader_", "edtf_", "profregion_", "rvset_", "esgr_", "esw_")
 
 
 class CloseUsedButtonsMiddleware(BaseMiddleware):
@@ -2800,6 +2883,218 @@ class CloseUsedButtonsMiddleware(BaseMiddleware):
         return result
 
 
+# ===================== BITTA XABARDA NAVIGATSIYA =====================
+# ✅ Menyu bo'limlari va ro'yxat/tafsilot tugmalari endi YANGI xabar
+# yubormaydi — joriy "ekran" xabari tahrirlanadi, foydalanuvchining bo'lim
+# tugmasi (masalan "🆓 Tekin testlar") esa o'chiriladi: chat toza qoladi.
+#  - Bo'lim tugmasi: ekran chatdagi eng oxirgi xabar bo'lsa — o'sha tahrirlanadi;
+#    aks holda yangi ekran yuboriladi va eskisi o'chiriladi.
+#  - Navigatsiya tugmasi (ro'yxat, tafsilot, panel): bosilgan xabarning o'zi
+#    tahrirlanadi va "🔙 Orqaga" tugmasi qo'shiladi (oldingi ekranga qaytaradi).
+#  - Test yechish, sehrgarlar, to'lov, fayl/sertifikat yuborish — o'zgarmaydi.
+# Bu handlerlarni qayta yozmasdan ishlaydi: navigatsiya kontekstida handler
+# yuborgan BIRINCHI matnli xabar so'rov darajasida EditMessageText'ga aylanadi.
+NAV_CB_PREFIXES = (
+    "open_mytests", "viewres_", "my_certs", "rt_overall", "rt_weekly", "rt_tests", "rt_test_",
+    "rasch_menu", "xl_menu", "trange_menu", "trange_t_", "trange_r_", "live_sessions", "users_menu",
+    "userprofile_", "finance_report", "edittest_start", "acmenu_", "hidetest_menu",
+    "today_digest", "tests_ranking", "ch_manage", "closetest_menu", "alltests_menu", "admin_list",
+    "mycreatestat_", "ogtests", "ogl_", "oga_", "skg_pending_", "raschrep_", "wallet_",
+)
+# Sahifalash: shu ekranning o'zi, "orqaga" tarixiga yangi qadam qo'shilmaydi.
+NAV_PAGE_PREFIXES = ("ulp_", "tlp_", "stagepart_")
+NAV_BACK_TEXT = "🔙 Orqaga"
+NAV_STACK_MAX = 12
+
+_NAV_CTX: contextvars.ContextVar = contextvars.ContextVar("_NAV_CTX", default=None)
+_NAV_REPLAY: contextvars.ContextVar = contextvars.ContextVar("_NAV_REPLAY", default=None)
+# "Orqaga" bosilganda oldingi ekran qayta chizilmoqda — spam-himoya buni
+# foydalanuvchining alohida bosishi deb hisoblamasin.
+_NAV_REPLAYING: contextvars.ContextVar = contextvars.ContextVar("_NAV_REPLAYING", default=False)
+# chat_id -> {"main": mid, "extra": [mid, ...], "stack": [key, ...], "last": mid}
+_NAV_SCREENS: dict[int, dict] = {}
+# chat_id -> chatdagi eng katta (eng oxirgi) xabar id (kiruvchi ham, chiquvchi ham)
+_NAV_LAST_ID: dict[int, int] = {}
+
+
+class _NavCtx:
+    __slots__ = ("chat", "target", "kind", "stack", "done", "task", "screen_mid")
+
+    def __init__(self, chat: int, target: int | None, kind: str, stack: list):
+        self.chat, self.target, self.kind, self.stack = chat, target, kind, stack
+        self.done = False
+        self.task = asyncio.current_task()
+        self.screen_mid = None
+
+
+def _nav_note_id(chat_id, mid) -> None:
+    try:
+        chat_id, mid = int(chat_id), int(mid)
+    except (TypeError, ValueError):
+        return
+    if mid > _NAV_LAST_ID.get(chat_id, 0):
+        _NAV_LAST_ID[chat_id] = mid
+
+
+def _nav_with_back(markup, ctx: _NavCtx):
+    if len(ctx.stack) < 2:
+        return markup
+    rows = [list(r) for r in markup.inline_keyboard] if isinstance(markup, InlineKeyboardMarkup) else []
+    if any("Orqaga" in (b.text or "") for r in rows for b in r):
+        return markup
+    rows.append([InlineKeyboardButton(text=NAV_BACK_TEXT, callback_data="navback")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _nav_convertible(m: SendMessage) -> bool:
+    return (bool(m.text) and (m.reply_markup is None or isinstance(m.reply_markup, InlineKeyboardMarkup))
+            and not getattr(m, "reply_parameters", None) and not getattr(m, "reply_to_message_id", None))
+
+
+async def _nav_delete_ids(bot: Bot, chat_id: int, ids) -> None:
+    for mid in ids:
+        try:
+            await bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+
+
+async def _nav_set_screen(bot: Bot, ctx: _NavCtx, mid: int) -> None:
+    old = _NAV_SCREENS.get(ctx.chat)
+    _NAV_SCREENS[ctx.chat] = {"main": mid, "extra": [], "stack": list(ctx.stack), "last": mid}
+    ctx.screen_mid = mid
+    if old:
+        stale = [x for x in [old["main"], *old["extra"]] if x != mid]
+        await _nav_delete_ids(bot, ctx.chat, stale)
+
+
+class NavRequestMiddleware(BaseRequestMiddleware):
+    async def __call__(self, make_request, bot, method):
+        ctx: _NavCtx | None = _NAV_CTX.get()
+        same = (ctx is not None and ctx.task is asyncio.current_task()
+                and str(getattr(method, "chat_id", "")) == str(ctx.chat))
+        if same and not ctx.done and isinstance(method, SendMessage):
+            ctx.done = True
+            if _nav_convertible(method):
+                markup = _nav_with_back(method.reply_markup, ctx)
+                if ctx.target:
+                    em = EditMessageText(
+                        chat_id=method.chat_id, message_id=ctx.target, text=method.text,
+                        parse_mode=method.parse_mode, entities=method.entities,
+                        link_preview_options=method.link_preview_options, reply_markup=markup)
+                    try:
+                        res = await make_request(bot, em)
+                        await _nav_set_screen(bot, ctx, ctx.target)
+                        return _nav_as_message(bot, res, method, ctx.target, markup)
+                    except TelegramBadRequest as e:
+                        if "not modified" in str(e).lower():
+                            await _nav_set_screen(bot, ctx, ctx.target)
+                            return _nav_as_message(bot, True, method, ctx.target, markup)
+                        logging.info(f"Ekran tahrirlanmadi, yangisi yuboriladi: {e}")
+                if markup is not method.reply_markup:
+                    method = method.model_copy(update={"reply_markup": markup})
+                res = await make_request(bot, method)
+                _nav_note_id(method.chat_id, getattr(res, "message_id", 0))
+                await _nav_set_screen(bot, ctx, res.message_id)
+                return res
+        elif same and not ctx.done and isinstance(method, EditMessageText) and method.message_id == ctx.target:
+            # _EditInPlace kabi o'zi tahrirlaydigan handlerlar
+            ctx.done = True
+            markup = _nav_with_back(method.reply_markup, ctx)
+            if markup is not method.reply_markup:
+                method = method.model_copy(update={"reply_markup": markup})
+            res = await make_request(bot, method)
+            await _nav_set_screen(bot, ctx, ctx.target)
+            return res
+
+        res = await make_request(bot, method)
+        if isinstance(res, Message):
+            _nav_note_id(res.chat.id, res.message_id)
+            # ekrandan keyin shu handler yuborgan qo'shimcha MATNli xabarlar
+            # (masalan yordamning 2-qismi) ekran guruhiga qo'shiladi — keyingi
+            # navigatsiyada ular ham tozalanadi. Fayl/rasm hech qachon o'chirilmaydi.
+            if same and ctx.screen_mid and isinstance(method, SendMessage):
+                scr = _NAV_SCREENS.get(ctx.chat)
+                if scr and scr["main"] == ctx.screen_mid:
+                    scr["extra"].append(res.message_id)
+                    scr["last"] = max(scr["last"], res.message_id)
+        return res
+
+
+def _nav_as_message(bot: Bot, res, method: SendMessage, mid: int, markup):
+    if isinstance(res, Message):
+        return res
+    from aiogram.types import Chat
+    return Message(message_id=mid, date=datetime.now(TZ), chat=Chat(id=int(method.chat_id), type="private"),
+                   text=method.text, reply_markup=markup).as_(bot)
+
+
+class NavIdTrackerMiddleware(BaseMiddleware):
+    """(outer) Har bir kiruvchi xabar id'sini eslab qoladi — ekran chatdagi
+    oxirgi xabarmi yoki yo'qligini bilish uchun."""
+
+    async def __call__(self, handler, event: Message, data):
+        if _NAV_REPLAY.get() is None and event.chat:
+            data["nav_prev_last"] = _NAV_LAST_ID.get(event.chat.id, 0)
+            _nav_note_id(event.chat.id, event.message_id)
+        return await handler(event, data)
+
+
+class NavMessageMiddleware(BaseMiddleware):
+    """Bo'lim (menyu) tugmasi: ekranni tahrirlaydi, foydalanuvchi xabarini o'chiradi."""
+
+    async def __call__(self, handler, event: Message, data):
+        if event.text not in SECTION_BTNS or not event.chat or event.chat.type != "private":
+            return await handler(event, data)
+        chat = event.chat.id
+        replay_mid = _NAV_REPLAY.get()
+        scr = _NAV_SCREENS.get(chat)
+        if replay_mid is not None:
+            target = replay_mid
+        else:
+            prev_last = data.get("nav_prev_last", 0)
+            target = scr["main"] if scr and scr["last"] == prev_last and prev_last else None
+        ctx = _NavCtx(chat, target, "sec", ["sec:" + event.text])
+        token = _NAV_CTX.set(ctx)
+        try:
+            return await handler(event, data)
+        finally:
+            _NAV_CTX.reset(token)
+            if replay_mid is None:
+                bot = data.get("bot")
+                if bot is not None:
+                    await _nav_delete_ids(bot, chat, [event.message_id])
+                    if _NAV_LAST_ID.get(chat) == event.message_id:
+                        _NAV_LAST_ID[chat] = data.get("nav_prev_last", 0)
+
+
+class NavCallbackMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: CallbackQuery, data):
+        d = event.data or ""
+        is_page = d.startswith(NAV_PAGE_PREFIXES)
+        msg = event.message
+        if not (is_page or d.startswith(NAV_CB_PREFIXES)) or msg is None or not getattr(msg, "chat", None) \
+                or msg.chat.type != "private":
+            return await handler(event, data)
+        chat = msg.chat.id
+        target = msg.message_id if getattr(msg, "text", None) is not None else None
+        scr = _NAV_SCREENS.get(chat)
+        stack = list(scr["stack"]) if scr and target and scr["main"] == target else []
+        if is_page:
+            if stack:
+                stack[-1] = d
+            else:
+                stack = [d]
+        elif not stack or stack[-1] != d:
+            stack.append(d)
+        ctx = _NavCtx(chat, target, "cb", stack[-NAV_STACK_MAX:])
+        token = _NAV_CTX.set(ctx)
+        try:
+            return await handler(event, data)
+        finally:
+            _NAV_CTX.reset(token)
+
+
 router = Router()
 
 # ✅ Ko'p callback handlerlar javobni tugatgach `callback.answer()` chaqirishni
@@ -2818,6 +3113,37 @@ router.callback_query.middleware(CallbackSecurityMiddleware())
 router.message.middleware(SubscriptionMessageMiddleware())
 router.callback_query.middleware(SubscriptionCallbackMiddleware())
 router.callback_query.middleware(CloseUsedButtonsMiddleware())
+router.message.outer_middleware(NavIdTrackerMiddleware())
+router.message.middleware(NavMessageMiddleware())
+router.callback_query.middleware(NavCallbackMiddleware())
+
+
+@router.callback_query(F.data == "navback")
+async def nav_back_cb(callback: CallbackQuery, **data):
+    """"🔙 Orqaga": oldingi ekranni xuddi o'sha xabarda qayta chizadi."""
+    msg = callback.message
+    scr = _NAV_SCREENS.get(msg.chat.id) if msg else None
+    if not scr or scr["main"] != msg.message_id or len(scr["stack"]) < 2:
+        await callback.answer("Bo'limni pastdagi menyudan tanlang.", show_alert=False)
+        return
+    scr["stack"].pop()
+    prev = scr["stack"][-1]
+    await callback.answer()
+    data.pop("handler", None)
+    rtok = _NAV_REPLAYING.set(True)
+    try:
+        if prev.startswith("sec:"):
+            fake = msg.model_copy(update={"from_user": callback.from_user, "text": prev[4:]})
+            mtok = _NAV_REPLAY.set(msg.message_id)
+            try:
+                await router.propagate_event(update_type="message", event=fake, **data)
+            finally:
+                _NAV_REPLAY.reset(mtok)
+        else:
+            await router.propagate_event(update_type="callback_query",
+                                         event=callback.model_copy(update={"data": prev}), **data)
+    finally:
+        _NAV_REPLAYING.reset(rtok)
 
 
 # ===================== REQUIRED SUB CHECK BUTTON =====================
@@ -2945,6 +3271,8 @@ async def nav_any_section(message: Message, state: FSMContext, bot: Bot):
         return await admin_ask_manage_admin(message, state)
     if message.text == BTN_PROFILE:
         return await profile_menu(message, state)
+    if message.text == BTN_WALLET:
+        return await wallet_menu(message)
 
 
 @router.message(StateFilter("*"), F.text == BTN_CANCEL)
@@ -3858,12 +4186,12 @@ async def show_paid_tests(message: Message):
 
 @router.callback_query(F.data == "open_mytests")
 async def open_mytests_cb(callback: CallbackQuery):
-    await callback.message.answer("📦 Pullik testlarim bo‘limiga o‘ting (menyudan).")
+    await _render_my_tests(callback.message, callback.from_user.id, 0)
 
 
 @router.callback_query(F.data.startswith("payinfo_"))
 async def payinfo(callback: CallbackQuery):
-    await callback.message.answer("🟡 Bu test bo‘yicha to‘lov admin tasdiqlashini kutyapti.")
+    await callback.answer("🟡 Bu test bo‘yicha to‘lov admin tasdiqlashini kutyapti.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("buy_"))
@@ -3925,6 +4253,7 @@ async def start_payment(callback: CallbackQuery, state: FSMContext, bot: Bot):
                 InlineKeyboardButton(text="🚀 Testni boshlash", callback_data=f"begin_{approved['id']}")
             ]]))
 
+    await _wallet_offer(callback.message, user_db_id, test_id)
     routing = await _resolve_payment_routing(test_id)
     await state.update_data(test_id=test_id)
     await callback.message.answer(
@@ -3999,6 +4328,7 @@ async def rebuy(callback: CallbackQuery, state: FSMContext, bot: Bot):
                 InlineKeyboardButton(text="🚀 Testni boshlash", callback_data=f"begin_{approved['id']}")
             ]]))
 
+    await _wallet_offer(callback.message, user_db_id, test_id)
     routing = await _resolve_payment_routing(test_id)
     await state.update_data(test_id=test_id)
     await callback.message.answer(
@@ -4166,9 +4496,8 @@ async def _render_my_tests(answerable, user_tg_id: int, page: int = 0):
 
     if not rows:
         if page == 0:
-            admin_flag = await is_admin_user(user_tg_id)
-            await answerable.answer("Siz hali pullik test sotib olmagansiz.", reply_markup=main_menu_kb(admin_flag))
-            await answerable.answer("Kod orqali qidirish:", reply_markup=actions)
+            await answerable.answer("Siz hali pullik test sotib olmagansiz.\n\nKod orqali qidirish:",
+                                    reply_markup=actions)
         else:
             await answerable.answer("Boshqa test yo'q.")
         return
@@ -4284,7 +4613,8 @@ def _render_staged_result_text(row) -> str:
             lines.append(f"• {name}: <b>{v.get('band', '-')}</b> ({v.get('score', 0)}/{v.get('total', 0)})")
         else:
             fb = f"\n   💬 {_h(v['feedback'])}" if v.get("feedback") else ""
-            lines.append(f"• {name}: <b>{v.get('band', '-')}</b>{fb}")
+            raw = f" ({float(v['raw']):g}/24)" if kind == "ms_essay" and v.get("raw") is not None else ""
+            lines.append(f"• {name}: <b>{v.get('band', '-')}</b>{raw}{fb}")
     if kind == "dtm_staged":
         overall = (f"🏆 <b>Umumiy ball:</b> {float(row['earned_points'] or 0):.1f}/{float(row['max_points'] or 0):.1f} "
                    f"({float(row['percent'] or 0):.1f}%)")
@@ -4292,6 +4622,12 @@ def _render_staged_result_text(row) -> str:
         overall = f"🏆 <b>Umumiy daraja (CEFR):</b> {row['grade'] or '-'}"
     elif kind == "sat_staged":
         overall = f"🏆 <b>Umumiy SAT ball:</b> {row['grade'] or '-'} / 1600"
+    elif kind == "ms_essay":
+        try:
+            letter = grade_from_rasch_ball(float(row["grade"])) or "sertifikatsiz"
+        except (TypeError, ValueError):
+            letter = "-"
+        overall = f"🏆 <b>Esse balli:</b> {row['grade'] or '-'} / 75 — daraja: <b>{letter}</b>"
     else:
         overall = f"🏆 <b>Overall band (IELTS):</b> {row['grade'] or '-'}"
     return (
@@ -4317,7 +4653,8 @@ async def view_result(callback: CallbackQuery, bot: Bot):
                r.earned_points, r.max_points, r.details,
                r.rasch_ball, r.rasch_percent, r.grade, r.date,
                r.open_grades, COALESCE(r.open_pending,0) AS open_pending,
-               COALESCE(t.show_review,1) AS show_review
+               COALESCE(t.show_review,1) AS show_review, t.essay_cfg, r.essay_status, r.essay_raw,
+               r.essay_ball, r.essay_feedback, r.essay_graded_by, r.test_ball
         FROM results r
         JOIN tests t ON t.id=r.test_id
         WHERE r.user_id=$1 AND r.test_id=$2
@@ -4349,18 +4686,20 @@ async def view_result(callback: CallbackQuery, bot: Bot):
     )
 
     exam_type = (exam_type or "simple")
+    test_ball_v = row["test_ball"]
 
     if exam_type == "rasch":
         await finalize_rush_for_test_if_ready(test_id, bot=bot)
 
         rr = await POOL.fetchrow("""
-            SELECT rasch_ball, rasch_percent, grade
+            SELECT rasch_ball, rasch_percent, grade, test_ball
             FROM results
             WHERE user_id=$1 AND test_id=$2
             ORDER BY id ASC LIMIT 1
         """, user_db_id, test_id)
         if rr:
             rasch_ball, rasch_percent, grade = rr["rasch_ball"], rr["rasch_percent"], rr["grade"]
+            test_ball_v = rr["test_ball"]
 
     pay_line = ""
     if int(is_free or 0) == 0:
@@ -4409,18 +4748,22 @@ async def view_result(callback: CallbackQuery, bot: Bot):
                 f"🕒 Qolgan vaqt: <b>{remain_text}</b>\n"
             )
         else:
+            if test_ball_v is not None and _essay_cfg_of(row["essay_cfg"]):
+                rasch_block = f"\n📝 Test qismi (Rasch): <b>{float(test_ball_v):.1f} / 75</b>"
             if grade is None:
-                rasch_block = (
+                rasch_block += (
                     f"\n⚡ Rasch ball: <b>{float(rasch_ball):.1f} / 75</b>\n"
                     f"⚡ Rasch foiz: <b>{float(rasch_percent or 0):.1f}%</b>\n"
                     f"🎯 Daraja: <b>Sertifikat yo‘q</b>\n"
                 )
             else:
-                rasch_block = (
+                rasch_block += (
                     f"\n⚡ Rasch ball: <b>{float(rasch_ball):.1f} / 75</b>\n"
                     f"⚡ Rasch foiz: <b>{float(rasch_percent or 0):.1f}%</b>\n"
                     f"🎯 Daraja: <b>{grade}</b>\n"
                 )
+            if test_ball_v is not None and _essay_cfg_of(row["essay_cfg"]):
+                rasch_block = rasch_block.replace("⚡ Rasch ball:", "⚡ Yakuniy ball (test + esse):", 1)
 
     intl_block = ""
     if exam_type == "cefr":
@@ -4458,10 +4801,27 @@ async def view_result(callback: CallbackQuery, bot: Bot):
         rows.insert(0, [InlineKeyboardButton(text="🔎 Xatolarni ko'rish", callback_data=f"mistakes_{test_id}")])
     else:
         review_line = f"\n{REVIEW_HIDDEN_NOTE}\n"
+    essay_block = ""
+    if exam_type == "rasch" and _essay_cfg_of(row["essay_cfg"]):
+        er = await POOL.fetchrow("""
+            SELECT essay_status, essay_raw, essay_ball, essay_feedback, essay_graded_by FROM results
+            WHERE user_id=$1 AND test_id=$2 ORDER BY id LIMIT 1
+        """, user_db_id, test_id)
+        essay_block = _essay_view_text(er)
+        if (er["essay_status"] or "awaiting") == "awaiting":
+            dl = await _essay_deadline(test_id)
+            if not dl or now_ts() <= dl:
+                rows.insert(0, [InlineKeyboardButton(text="✍️ Esse yozish", callback_data=f"essay_{test_id}")])
+        elif er["essay_status"] == "pending":
+            open_pending = open_pending or 1
+    if open_pending or (exam_type == "rasch" and rasch_ball is None):
+        # natija hali yakunlanmagan — shu ekranning o'zida yangilab ko'rish
+        rows.insert(0, [InlineKeyboardButton(text="🔄 Yangilash", callback_data=f"viewres_{test_id}")])
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
 
     await callback.message.answer(
-        base_block + dtm_block + rasch_block + intl_block + rank_block + review_line + f"\n🗓 Sana: {date_}",
+        base_block + dtm_block + rasch_block + essay_block + intl_block + rank_block + review_line
+        + f"\n🗓 Sana: {date_}",
         parse_mode=ParseMode.HTML,
         reply_markup=kb
     )
@@ -5053,11 +5413,18 @@ SAT_STAGE_SPEC = [
      "default_label": "🧮 Math"},
 ]
 
+# ✅ Milliy sertifikat esse (Ona tili): bitta yozma bo'lim. Kalit "writing" —
+# baholash oqimi (ustoz/AI) Writing bilan bir xil ishlaydi, faqat shkala
+# boshqa: ustoz 0-24 ball kiritadi, natija 75 ballik shkalada (A+ … C).
+MS_ESSAY_STAGE_SPEC = [
+    {"key": "writing", "toggle": False, "ask_name": False, "type": STAGE_TYPE_TEXT, "default_label": "✍️ Esse"},
+]
+
 STAGE_SPEC_BY_KIND = {
     "dtm_staged": DTM_STAGE_SPEC, "ielts4": IELTS4_STAGE_SPEC, "cefr4": CEFR4_STAGE_SPEC,
-    "sat_staged": SAT_STAGE_SPEC,
+    "sat_staged": SAT_STAGE_SPEC, "ms_essay": MS_ESSAY_STAGE_SPEC,
 }
-STAGED_EXAM_TYPES = ("dtm_staged", "ielts4", "cefr4", "sat_staged")
+STAGED_EXAM_TYPES = ("dtm_staged", "ielts4", "cefr4", "sat_staged", "ms_essay")
 
 CEFR_LEVEL_ORDER = ["A1", "A2", "B1", "B2", "C1", "C2"]
 
@@ -5089,6 +5456,8 @@ def _stage_band_for_mcq(kind: str, key: str, score: int, total: int):
 
 
 def _stage_ai_scale(kind: str) -> str:
+    if kind == "ms_essay":
+        return "ms"
     return "cefr" if kind == "cefr4" else "ielts"
 
 
@@ -5107,6 +5476,8 @@ def _compute_overall_stage_grade(kind: str, sections: dict, order: list):
         return _cefr_ordinal_to_level(avg_ordinal)
     if kind == "sat_staged":
         return int(sum(int(v) for v in values)) if values else 0
+    if kind == "ms_essay":
+        return round(float(values[0]), 1) if values else 0.0
     if not values:
         return 0.0
     nums = [float(v) for v in values]
@@ -5216,8 +5587,10 @@ async def _ask_stage_prompt_or_file(answerable, state: FSMContext, spec: dict) -
             )
             await state.update_data(stage_field="file")
     elif spec["type"] == STAGE_TYPE_TEXT:
+        example = ("«Kitob — bilim manbai» mavzusida publitsistik uslubda esse yozing"
+                   if data.get("stage_kind") == "ms_essay" else "Writing Task 2 mavzusi")
         await answerable.answer(
-            f"<b>{label}</b> uchun topshiriq matnini kiriting (masalan: Writing Task 2 mavzusi):",
+            f"<b>{label}</b> uchun topshiriq (mavzu) matnini kiriting (masalan: {example}):",
             parse_mode=ParseMode.HTML
         )
         await state.update_data(stage_field="prompt")
@@ -5299,12 +5672,19 @@ async def staged_build_file(message: Message, state: FSMContext) -> None:
     idx = data["stage_spec_idx"]
     spec = _stage_spec_list(kind)[idx]
 
+    problem = _upload_problem(message, "media" if field == "listening_media" else "doc")
+    if problem:
+        return await message.answer(problem, parse_mode=ParseMode.HTML)
     if message.document:
         file_id, file_kind = message.document.file_id, "document"
     elif message.audio:
         file_id, file_kind = message.audio.file_id, "audio"
     else:
         file_id, file_kind = message.video.file_id, "video"
+    if file_kind == "document" and message.document.mime_type and \
+            message.document.mime_type.lower().startswith(("audio/", "video/")):
+        file_kind = "audio" if message.document.mime_type.lower().startswith("audio/") else "video"
+    _warm_file_later(message.bot, file_id)
 
     if field == "listening_media":
         # ✅ Audio/video qabul qilindi — endi alohida savollar PDF'ini so'raymiz.
@@ -5431,7 +5811,7 @@ async def staged_build_text(message: Message, state: FSMContext) -> None:
             "duration_min": int(data.get("stage_pending_duration") or 0),
             "prompt": text,
         }
-        if GEMINI_API_KEY:
+        if _ai_can_grade(spec["type"]):
             await state.update_data(stage_pending_section=section_data)
             await _nav_push(state, "staged", "prompt", idx)
             kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -5609,7 +5989,8 @@ async def _finalize_staged_test(answerable, state: FSMContext) -> None:
         for k in order
     )
     kind_label = {"dtm_staged": "DTM (5 bosqich)", "ielts4": "IELTS (4 ko'nikma)",
-                  "cefr4": "CEFR (4 ko'nikma)", "sat_staged": "SAT (2 bosqich)"}.get(kind, kind)
+                  "cefr4": "CEFR (4 ko'nikma)", "sat_staged": "SAT (2 bosqich)",
+                  "ms_essay": "Esse (Milliy sertifikat)"}.get(kind, kind)
     link = await _test_deep_link(answerable, data.get("code"))
     await answerable.answer(
         f"✅ <b>{kind_label}</b> testi qo'shildi!\n🔑 Kod: <code>{data.get('code')}</code>\n🔗 Havola: {link}\n\n"
@@ -6321,7 +6702,7 @@ async def _finalize_staged_attempt(
     ai_graded_any = False
     ai_failed_sections = []  # [(label, reason_key), ...] — ustozga SABABINI aytish uchun
 
-    # ✅ AI (Gemini) so'rovi bir necha soniya (ba'zan sekinroq) davom etishi
+    # ✅ AI so'rovi bir necha soniya (ba'zan sekinroq) davom etishi
     # mumkin, shu payt o'quvchiga hech narsa yuborilmasa "bot qotib qoldi"
     # degan taassurot qoldirardi. Shuning uchun AI chaqirilishidan OLDIN,
     # kutish kerakligini ANIQ aytamiz.
@@ -6355,15 +6736,16 @@ async def _finalize_staged_attempt(
 
         ai_scale = _stage_ai_scale(kind)
         if sec_cfg["type"] == STAGE_TYPE_TEXT and v.get("text"):
-            result = await _gemini_grade(sec_cfg.get("prompt", ""), essay_text=v["text"], skill="writing", scale=ai_scale)
+            result = await _ai_grade(sec_cfg.get("prompt", ""), essay_text=v["text"], bot=bot,
+                                     skill="writing", scale=ai_scale)
         elif sec_cfg["type"] == STAGE_TYPE_VOICE and v.get("voice_id"):
-            result = await _gemini_grade(
+            result = await _ai_grade(
                 sec_cfg.get("prompt", ""), voice_file_id=v["voice_id"], bot=bot, skill="speaking", scale=ai_scale)
         elif sec_cfg["type"] == STAGE_TYPE_TEXT and v.get("photo_id"):
-            # ✅ Writing rasm (fotosurat) qilib yuborilgan bo'lsa, AI hozircha
-            # o'qiy olmaydi — bu ham "muvaffaqiyatsiz" deb hisoblanadi, shunda
-            # ustozga sababi aniq aytiladi (avval sababsiz jim qo'lda qolardi).
-            result = {"ok": False, "reason": "photo_unsupported"}
+            # ✅ Writing rasm (qo'lyozma/skrinshot) bo'lsa — AI rasmdagi matnni
+            # o'qib baholaydi; o'qib bo'lmasa sababi ustozga aniq aytiladi.
+            result = await _ai_grade(sec_cfg.get("prompt", ""), photo_file_id=v["photo_id"], bot=bot,
+                                     skill="writing", scale=ai_scale)
         else:
             continue
 
@@ -6371,14 +6753,15 @@ async def _finalize_staged_attempt(
             v["band"] = result["band"]
             v["feedback"] = result["feedback"]
             v["graded_by"] = "ai"
+            if result.get("raw") is not None:
+                v["raw"] = result["raw"]
+                v["criteria"] = result.get("criteria")
             sections[k] = v
             ai_graded_any = True
         else:
             v["ai_failed_reason"] = result["reason"]
             sections[k] = v
             ai_failed_sections.append((sec_cfg["name"], result["reason"]))
-            if result["reason"] == "quota":
-                await _maybe_alert_admin_ai_quota(bot)
 
     if ai_graded_any or ai_failed_sections:
         await POOL.execute(
@@ -6459,7 +6842,7 @@ async def _finalize_staged_attempt(
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Baholashni boshlash", callback_data=f"skg_start_{attempt_id}")
     ]])
-    kind_title = "CEFR" if kind == "cefr4" else "IELTS"
+    kind_title = {"cefr4": "CEFR", "ms_essay": "esse", "sat_staged": "SAT", "dtm_staged": "DTM"}.get(kind, "IELTS")
     try:
         await bot.send_message(
             creator_id,
@@ -6473,7 +6856,7 @@ async def _finalize_staged_attempt(
         logging.exception(f"Baholash bildirishnomasini yuborib bo'lmadi (creator={creator_id})")
 
 
-# ----- AI (Gemini) orqali avtomatik baholash -----
+# ----- AI qatlami: Claude (asosiy) + Gemini (zaxira) -----
 def _extract_json_object(text: str) -> dict | None:
     match = re.search(r"\{.*\}", text or "", re.DOTALL)
     if not match:
@@ -6482,6 +6865,17 @@ def _extract_json_object(text: str) -> dict | None:
         return json.loads(match.group(0))
     except json.JSONDecodeError:
         return None
+
+
+def _ai_enabled() -> bool:
+    return bool((ANTHROPIC_API_KEY and anthropic is not None) or GEMINI_API_KEY)
+
+
+def _ai_can_grade(stage_type: str) -> bool:
+    """Bo'lim turini AI baholay oladimi: ovozni faqat Gemini eshitadi."""
+    if stage_type == STAGE_TYPE_VOICE:
+        return bool(GEMINI_API_KEY)
+    return _ai_enabled()
 
 
 # ✅ AI baholash muvaffaqiyatsiz bo'lganda ustozga (va zarur bo'lsa adminga)
@@ -6494,31 +6888,41 @@ AI_FAIL_REASON_LABELS = {
     "timeout": "AI javob berishga ulgurmadi (vaqt tugadi)",
     "network": "AI xizmatiga ulanishda xatolik",
     "parse_error": "AI javobini o'qib bo'lmadi",
+    "refusal": "AI bu javobni baholashdan bosh tortdi",
     "voice_download": "Ovozli faylni yuklab bo'lmadi",
+    "photo_download": "Rasmni yuklab bo'lmadi",
+    "photo_unreadable": "Rasmdagi yozuvni o'qib bo'lmadi (xira yoki noaniq)",
     "photo_unsupported": "AI hozircha rasm (fotosurat) shaklidagi javoblarni o'qiy olmaydi",
 }
+AI_PROVIDER_LABELS = {"claude": "Claude", "gemini": "Gemini"}
 
 # ✅ AI kvotasi tugashi BUTUN tizim uchun umumiy muammo (bitta API kalit) —
 # har bir muvaffaqiyatsiz baholashda alohida xabar yuborsak, admin bir zumda
 # o'nlab bir xil xabarga to'lib ketardi. Shuning uchun shu turdagi
-# ogohlantirish faqat cooldown oralig'ida BIR MARTA yuboriladi.
-_LAST_AI_QUOTA_ALERT_TS = 0
+# ogohlantirish har bir AI uchun cooldown oralig'ida BIR MARTA yuboriladi.
+_LAST_AI_QUOTA_ALERT_TS: dict[str, int] = {}
 AI_QUOTA_ALERT_COOLDOWN_SEC = 3600
 
 
-async def _maybe_alert_admin_ai_quota(bot: Bot) -> None:
-    global _LAST_AI_QUOTA_ALERT_TS
-    now = now_ts()
-    if now - _LAST_AI_QUOTA_ALERT_TS < AI_QUOTA_ALERT_COOLDOWN_SEC:
+async def _maybe_alert_admin_ai_quota(bot: Bot | None, provider: str = "", backup_ok: bool = False) -> None:
+    if bot is None:
         return
-    _LAST_AI_QUOTA_ALERT_TS = now
+    now = now_ts()
+    if now - _LAST_AI_QUOTA_ALERT_TS.get(provider, 0) < AI_QUOTA_ALERT_COOLDOWN_SEC:
+        return
+    _LAST_AI_QUOTA_ALERT_TS[provider] = now
+    name = AI_PROVIDER_LABELS.get(provider, "AI")
+    where = {"claude": "console.anthropic.com (Billing)", "gemini": "Google AI Studio"}.get(provider, "AI hisobingiz")
+    if backup_ok:
+        state_line = "Hozircha zaxira AI ishlab turibdi — baholash to'xtamadi, lekin aniqligi pastroq bo'lishi mumkin."
+    else:
+        state_line = ("Writing/Speaking/Esse'ni avtomatik (AI) baholash hozircha ishlamayapti — "
+                      "tegishli o'qituvchilarga qo'lda tekshirish so'ralmoqda.")
     try:
         await bot.send_message(
             ADMIN_ID,
-            "⚠️ <b>Gemini AI limiti tugagan ko'rinadi</b>\n\n"
-            "Writing/Speaking'ni avtomatik (AI) baholash hozircha ishlamayapti — "
-            "tegishli o'qituvchilarga qo'lda tekshirish so'ralmoqda.\n\n"
-            "Google AI Studio hisobingizda kredit/limitni tekshiring. "
+            f"⚠️ <b>{name} AI limiti tugagan ko'rinadi</b>\n\n{state_line}\n\n"
+            f"{where} sahifasida kredit/limitni tekshiring. "
             f"(Keyingi shunga o'xshash ogohlantirish {AI_QUOTA_ALERT_COOLDOWN_SEC // 60} daqiqadan keyin yuboriladi.)",
             parse_mode=ParseMode.HTML
         )
@@ -6526,96 +6930,375 @@ async def _maybe_alert_admin_ai_quota(bot: Bot) -> None:
         logging.exception("AI kvota ogohlantirishini adminga yuborib bo'lmadi")
 
 
-async def _gemini_grade(
-    prompt_text: str, *, essay_text: str | None = None,
+_CLAUDE_CLIENT = None
+
+
+def _claude_client():
+    global _CLAUDE_CLIENT
+    if _CLAUDE_CLIENT is None:
+        _CLAUDE_CLIENT = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY, timeout=150.0, max_retries=2)
+    return _CLAUDE_CLIENT
+
+
+async def _claude_json(prompt: str, schema: dict, *, images: list | None = None,
+                       effort: str = "medium", max_tokens: int = 12000) -> dict:
+    """Claude'dan sxemaga mos JSON oladi. {"ok": True, "data": {...}} yoki
+    {"ok": False, "reason": "<AI_FAIL_REASON_LABELS kaliti>"}.
+    images — [(mime, bytes), ...] (qo'lyozma/rasm javoblar uchun)."""
+    if not ANTHROPIC_API_KEY or anthropic is None:
+        return {"ok": False, "reason": "no_key"}
+    content = [
+        {"type": "image", "source": {"type": "base64", "media_type": mime,
+                                     "data": base64.b64encode(data).decode("ascii")}}
+        for mime, data in (images or [])
+    ]
+    content.append({"type": "text", "text": prompt})
+    try:
+        resp = await _claude_client().messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": content}],
+            output_config={"effort": effort, "format": {"type": "json_schema", "schema": schema}},
+        )
+    except anthropic.RateLimitError:
+        logging.error("Claude API limiti (429)")
+        return {"ok": False, "reason": "quota"}
+    except anthropic.APITimeoutError:
+        logging.error("Claude API so'rovi vaqti tugadi")
+        return {"ok": False, "reason": "timeout"}
+    except anthropic.APIConnectionError:
+        logging.exception("Claude API'ga ulanib bo'lmadi")
+        return {"ok": False, "reason": "network"}
+    except anthropic.APIStatusError as e:
+        msg = str(getattr(e, "message", "") or e).lower()
+        logging.error(f"Claude API xatosi: {e.status_code} {msg[:300]}")
+        # Kredit tugaganda Anthropic 400 qaytaradi ("credit balance is too low").
+        if "credit balance" in msg or "billing" in msg:
+            return {"ok": False, "reason": "quota"}
+        return {"ok": False, "reason": "api_error"}
+    except Exception:
+        logging.exception("Claude API so'rovida kutilmagan xatolik")
+        return {"ok": False, "reason": "network"}
+
+    if resp.stop_reason == "refusal":
+        return {"ok": False, "reason": "refusal"}
+    text = next((b.text for b in resp.content if getattr(b, "type", "") == "text"), "")
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        data = _extract_json_object(text)
+    if not isinstance(data, dict):
+        return {"ok": False, "reason": "parse_error"}
+    return {"ok": True, "data": data}
+
+
+async def _gemini_json(prompt: str, *, extra_parts: list | None = None, timeout: int = 90) -> dict:
+    """Gemini'dan JSON oladi (zaxira AI). Javob shakli _claude_json bilan bir xil."""
+    if not GEMINI_API_KEY:
+        return {"ok": False, "reason": "no_key"}
+    # ✅ Kalit URL'da emas, header'da — aiohttp xatolari (masalan JSON o'rniga
+    # HTML qaytsa) to'liq URL'ni logga yozadi, kalit server logiga tushardi.
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}] + list(extra_parts or [])}],
+        "generationConfig": {"responseMimeType": "application/json"},
+    }
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+            async with session.post(url, json=payload, headers={"x-goog-api-key": GEMINI_API_KEY}) as resp:
+                if resp.status == 429:
+                    logging.error(f"Gemini API kvota tugadi: {resp.status} {(await resp.text())[:300]}")
+                    return {"ok": False, "reason": "quota"}
+                if resp.status != 200:
+                    logging.error(f"Gemini API xatosi: {resp.status} {(await resp.text())[:300]}")
+                    return {"ok": False, "reason": "api_error"}
+                data = await resp.json()
+        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except asyncio.TimeoutError:
+        logging.error("Gemini API so'rovi vaqti tugadi")
+        return {"ok": False, "reason": "timeout"}
+    except (KeyError, IndexError, TypeError):
+        logging.exception("Gemini javobi kutilgan shaklda emas")
+        return {"ok": False, "reason": "parse_error"}
+    except Exception:
+        logging.exception("Gemini API so'rovida xatolik")
+        return {"ok": False, "reason": "network"}
+    obj = _extract_json_object(raw_text)
+    if not isinstance(obj, dict):
+        return {"ok": False, "reason": "parse_error"}
+    return {"ok": True, "data": obj}
+
+
+async def _ai_json(prompt: str, schema: dict, *, images: list | None = None,
+                   gemini_parts: list | None = None, validate=None, bot: Bot | None = None,
+                   effort: str = "medium", claude_ok: bool = True, max_tokens: int = 12000) -> dict:
+    """Avval Claude, u ishlamasa (yoki javobi yaroqsiz bo'lsa) — Gemini.
+    validate(data) -> dict|None: javobni tekshirib normallashtiradi; None
+    bo'lsa javob yaroqsiz (parse_error) deb keyingi AI'ga o'tiladi.
+    Natija: {"ok": True, "data": ..., "provider": "claude"|"gemini"} yoki
+    {"ok": False, "reason": ...} — ikkalasi ham ishlamasa birinchi haqiqiy sabab."""
+    attempts = []
+    if claude_ok:
+        attempts.append(("claude", lambda: _claude_json(prompt, schema, images=images, effort=effort,
+                                                        max_tokens=max_tokens)))
+    g_parts = list(gemini_parts or [])
+    for mime, data in (images or []):
+        g_parts.append({"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode("ascii")}})
+    attempts.append(("gemini", lambda: _gemini_json(prompt, extra_parts=g_parts)))
+
+    reasons = []
+    quota_hit = []
+    for provider, call in attempts:
+        res = await call()
+        if res.get("ok"):
+            data = validate(res["data"]) if validate else res["data"]
+            if data is not None:
+                for p in quota_hit:
+                    await _maybe_alert_admin_ai_quota(bot, p, backup_ok=True)
+                return {"ok": True, "data": data, "provider": provider}
+            res = {"ok": False, "reason": "parse_error"}
+        reasons.append(res["reason"])
+        if res["reason"] == "quota":
+            quota_hit.append(provider)
+
+    for p in quota_hit:
+        await _maybe_alert_admin_ai_quota(bot, p, backup_ok=False)
+    real = [r for r in reasons if r != "no_key"]
+    return {"ok": False, "reason": real[0] if real else "no_key"}
+
+
+async def _download_tg_file(bot: Bot, file_id: str, max_bytes: int = 15 * 1024 * 1024) -> bytes | None:
+    try:
+        tg_file = await bot.get_file(file_id)
+        if tg_file.file_size and tg_file.file_size > max_bytes:
+            return None
+        buf = await bot.download_file(tg_file.file_path)
+        return buf.read()
+    except Exception:
+        logging.exception("Telegram faylini yuklab bo'lmadi")
+        return None
+
+
+def _sniff_image_mime(data: bytes) -> str:
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return "image/jpeg"
+
+
+async def _ai_grade(
+    prompt_text: str, *, essay_text: str | None = None, photo_file_id: str | None = None,
     voice_file_id: str | None = None, bot: Bot | None = None, skill: str = "writing",
     scale: str = "ielts"
 ) -> dict:
-    """Gemini API orqali Writing (matn) yoki Speaking (ovozli xabar)
-    javobini baholaydi. Har doim dict qaytaradi:
-      - muvaffaqiyatli: {"ok": True, "band": <0-9 yoki A1-C2>, "feedback": "..."}
+    """Writing (matn yoki rasm) yoki Speaking (ovozli xabar) javobini baholaydi.
+    Writing: Claude -> Gemini; Speaking: faqat Gemini (Claude audio qabul qilmaydi).
+    Har doim dict qaytaradi:
+      - muvaffaqiyatli: {"ok": True, "band": <0-9 yoki A1-C2>, "feedback": "...", "provider": ...}
       - muvaffaqiyatsiz: {"ok": False, "reason": "<AI_FAIL_REASON_LABELS kaliti>"}
     Muvaffaqiyatsiz bo'lganda chaqiruvchi qo'lda (ustoz) tekshirishga
     qaytishi VA sababni ustozga aytishi kerak — natija hech qachon
     "yo'qolib" qolmasligi, sababi ham hech qachon yashirin qolmasligi uchun.
     """
-    if not GEMINI_API_KEY:
+    if scale == "ms":
+        # Milliy sertifikat esse mezoni (Ona tili) — alohida, 24 ballik baholovchi
+        return await _ai_grade_essay_ms(prompt_text, essay_text=essay_text,
+                                        photo_file_ids=[photo_file_id] if photo_file_id else None, bot=bot)
+    if not _ai_enabled():
         return {"ok": False, "reason": "no_key"}
 
     skill_label = "Writing" if skill == "writing" else "Speaking"
     if scale == "cefr":
-        instructions = (
-            f"Siz tajribali CEFR {skill_label} baholovchisisiz. Quyidagi topshiriq/mavzu va "
-            f"o'quvchi javobini rasmiy CEFR (A1-C2) mezonlari asosida baholang.\n\n"
-            f"Topshiriq/mavzu: {prompt_text}\n\n"
-            f"Faqat quyidagi JSON formatda javob bering, boshqa hech qanday matn, izoh yoki "
-            f"markdown belgisi qo'shmang:\n"
-            f'{{"level": "<A1, A2, B1, B2, C1 yoki C2>", '
-            f'"feedback": "<o\'zbek tilida 2-4 jumlali aniq, foydali fikr-mulohaza>"}}'
-        )
+        head = (f"Siz tajribali CEFR {skill_label} baholovchisisiz. Quyidagi topshiriq/mavzu va "
+                f"o'quvchi javobini rasmiy CEFR (A1-C2) mezonlari asosida baholang.")
+        fmt = ('{"level": "<A1, A2, B1, B2, C1 yoki C2>", '
+               '"feedback": "<o\'zbek tilida 2-4 jumlali aniq, foydali fikr-mulohaza>"')
+        props = {"level": {"type": "string", "enum": list(CEFR_LEVEL_ORDER)}}
     else:
-        instructions = (
-            f"Siz tajribali IELTS {skill_label} baholovchisisiz. Quyidagi topshiriq/mavzu va "
-            f"o'quvchi javobini rasmiy IELTS {skill_label} mezonlari asosida baholang.\n\n"
-            f"Topshiriq/mavzu: {prompt_text}\n\n"
-            f"Faqat quyidagi JSON formatda javob bering, boshqa hech qanday matn, izoh yoki "
-            f"markdown belgisi qo'shmang:\n"
-            f'{{"band": <0.0 dan 9.0 gacha, 0.5 qadamli raqam>, '
-            f'"feedback": "<o\'zbek tilida 2-4 jumlali aniq, foydali fikr-mulohaza>"}}'
-        )
+        head = (f"Siz tajribali IELTS {skill_label} baholovchisisiz. Quyidagi topshiriq/mavzu va "
+                f"o'quvchi javobini rasmiy IELTS {skill_label} mezonlari (band descriptors) asosida baholang.")
+        fmt = ('{"band": <0.0 dan 9.0 gacha, 0.5 qadamli raqam>, '
+               '"feedback": "<o\'zbek tilida 2-4 jumlali aniq, foydali fikr-mulohaza>"')
+        props = {"band": {"type": "number"}}
+    props["feedback"] = {"type": "string"}
 
-    parts = [{"text": instructions}]
+    images = []
+    gemini_parts = []
+    body = f"{head}\n\nTopshiriq/mavzu: {prompt_text}\n\n"
     if essay_text:
-        parts.append({"text": f"O'quvchi javobi:\n{essay_text}"})
-    if voice_file_id and bot:
-        try:
-            tg_file = await bot.get_file(voice_file_id)
-            buf = await bot.download_file(tg_file.file_path)
-            audio_b64 = base64.b64encode(buf.read()).decode("ascii")
-            parts.append({"inline_data": {"mime_type": "audio/ogg", "data": audio_b64}})
-        except Exception:
-            logging.exception("Gemini uchun ovozli faylni yuklab bo'lmadi")
+        body += f"O'quvchi javobi:\n<<<\n{essay_text}\n>>>\n\n"
+    if photo_file_id:
+        if not bot:
+            return {"ok": False, "reason": "photo_download"}
+        raw = await _download_tg_file(bot, photo_file_id)
+        if not raw:
+            return {"ok": False, "reason": "photo_download"}
+        images.append((_sniff_image_mime(raw), raw))
+        body += ("O'quvchi javobi rasmda (qo'lyozma yoki skrinshot). Avval rasmdagi matnni diqqat bilan "
+                 "o'qing. Agar matnni ishonchli o'qib bo'lmasa, \"readable\": false qiling.\n\n")
+        props["readable"] = {"type": "boolean"}
+        fmt += ', "readable": <true yoki false>'
+    if voice_file_id:
+        if not bot:
             return {"ok": False, "reason": "voice_download"}
+        raw = await _download_tg_file(bot, voice_file_id, max_bytes=19 * 1024 * 1024)
+        if not raw:
+            return {"ok": False, "reason": "voice_download"}
+        gemini_parts.append({"inline_data": {"mime_type": _sniff_audio_mime(raw),
+                                             "data": base64.b64encode(raw).decode("ascii")}})
+    body += f"Faqat quyidagi JSON formatda javob bering, boshqa hech qanday matn qo'shmang:\n{fmt}}}"
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    payload = {"contents": [{"parts": parts}]}
+    schema = {"type": "object", "properties": props, "required": list(props), "additionalProperties": False}
 
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
-            async with session.post(url, json=payload, headers={"x-goog-api-key": GEMINI_API_KEY}) as resp:
-                if resp.status == 429:
-                    logging.error(f"Gemini API kvota tugadi: {resp.status} {await resp.text()}")
-                    return {"ok": False, "reason": "quota"}
-                if resp.status != 200:
-                    logging.error(f"Gemini API xatosi: {resp.status} {await resp.text()}")
-                    return {"ok": False, "reason": "api_error"}
-                data = await resp.json()
-
-        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-        obj = _extract_json_object(raw_text)
-        if not obj:
-            return {"ok": False, "reason": "parse_error"}
-
-        feedback = sanitize_plain_text(str(obj.get("feedback") or ""), max_len=1000)
-        if not feedback:
-            feedback = "🤖 AI tomonidan baholandi."
-
+    def validate(obj: dict):
+        if "readable" in props and obj.get("readable") is False:
+            return {"unreadable": True}
+        feedback = sanitize_plain_text(str(obj.get("feedback") or ""), max_len=1000) or "🤖 AI tomonidan baholandi."
         if scale == "cefr":
             level = str(obj.get("level") or "").strip().upper()
-            if level not in CEFR_LEVEL_ORDER:
-                return {"ok": False, "reason": "parse_error"}
-            return {"ok": True, "band": level, "feedback": feedback}
+            return {"band": level, "feedback": feedback} if level in CEFR_LEVEL_ORDER else None
+        try:
+            band = round(_clamp(float(obj["band"]), 0.0, 9.0) * 2) / 2
+        except (KeyError, TypeError, ValueError):
+            return None
+        return {"band": band, "feedback": feedback}
 
-        if "band" not in obj:
-            return {"ok": False, "reason": "parse_error"}
-        band = round(_clamp(float(obj["band"]), 0.0, 9.0) * 2) / 2
-        return {"ok": True, "band": band, "feedback": feedback}
-    except asyncio.TimeoutError:
-        logging.exception("Gemini API so'rovi vaqti tugadi")
-        return {"ok": False, "reason": "timeout"}
-    except Exception:
-        logging.exception("Gemini API so'rovida xatolik")
-        return {"ok": False, "reason": "network"}
+    res = await _ai_json(body, schema, images=images, gemini_parts=gemini_parts, validate=validate,
+                         bot=bot, claude_ok=not voice_file_id)
+    if not res["ok"]:
+        return res
+    if res["data"].get("unreadable"):
+        return {"ok": False, "reason": "photo_unreadable"}
+    return {"ok": True, "band": res["data"]["band"], "feedback": res["data"]["feedback"],
+            "provider": res["provider"]}
+
+
+def _sniff_audio_mime(data: bytes) -> str:
+    if data[:4] == b"OggS":
+        return "audio/ogg"
+    if data[:3] == b"ID3" or data[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        return "audio/mp3"
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return "audio/wav"
+    if data[4:8] == b"ftyp":
+        return "audio/aac"
+    if data[:4] == b"\x1a\x45\xdf\xa3":
+        return "audio/webm"
+    if data[:4] == b"fLaC":
+        return "audio/flac"
+    return "audio/ogg"
+
+
+# ----- Milliy sertifikat: esse mezoni (Ona tili va adabiyot) -----
+# ✅ Milliy sertifikat «Ona tili va adabiyot» imtihonida esse 24 ballik tizimda
+# baholanadi va 75 ballik shkalaga o'tkaziladi. Rasmiy mezonlar bo'yicha
+# ballar taqsimoti ochiq e'lon qilinmagan — quyidagi bo'linma imtihon talablari
+# (publitsistik uslub, kirish 2-3 gap, kamida 3 xatboshili asosiy qism, xulosa,
+# savodxonlik) asosida tuzilgan va foydalanuvchiga "taxminiy" deb ko'rsatiladi.
+MS_ESSAY_MAX_RAW = 24
+MS_ESSAY_CRITERIA = (
+    ("mazmun", "Mavzuning ochilishi va mazmun", 6),
+    ("tuzilish", "Tuzilish: kirish, 3+ xatboshili asosiy qism, xulosa", 4),
+    ("dalil", "Dalil va misollar, muallif pozitsiyasi", 4),
+    ("uslub", "Publitsistik uslub, so'z boyligi, izchillik", 4),
+    ("savodxonlik", "Imlo va tinish belgilari", 6),
+)
+MS_ESSAY_NOTE = ("Mezon taxminiy: rasmiy ballar taqsimoti e'lon qilinmagan — 24 ballik tizim va "
+                 "Milliy sertifikat esse talablari asosida tuzilgan.")
+MS_ESSAY_RULES = ("Talablar: publitsistik uslub; kirish 2–3 gap; asosiy qism kamida 3 xatboshi (dalil, misol, "
+                  "o'z fikringiz); xulosa 2–3 gap; lotin yozuvi. Faqat kirishdan iborat, mavzuga aloqasiz yoki "
+                  "kirill yozuvidagi esse 0 ball oladi.")
+
+
+def ms_essay_ball(raw) -> float:
+    return round(_clamp(float(raw or 0), 0.0, float(MS_ESSAY_MAX_RAW)) / MS_ESSAY_MAX_RAW * 75.0, 1)
+
+
+def _cyrillic_ratio(text: str) -> float:
+    letters = [c for c in (text or "") if c.isalpha()]
+    if not letters:
+        return 0.0
+    return sum(1 for c in letters if "Ѐ" <= c <= "ӿ") / len(letters)
+
+
+def ms_essay_criteria_text(crit: dict | None) -> str:
+    if not crit:
+        return ""
+    return "\n".join(f"• {label}: <b>{int(crit.get(key, 0))}/{mx}</b>" for key, label, mx in MS_ESSAY_CRITERIA)
+
+
+async def _ai_grade_essay_ms(prompt_text: str, *, essay_text: str | None = None,
+                             photo_file_ids: list | None = None, bot: Bot | None = None) -> dict:
+    """Ona tili essesini 24 ballik mezon bo'yicha baholaydi (Claude -> Gemini).
+    {"ok": True, "raw", "band" (0-75), "criteria", "feedback", "provider"} yoki {"ok": False, "reason"}."""
+    def zero(reason: str) -> dict:
+        return {"ok": True, "raw": 0, "band": 0.0, "criteria": {k: 0 for k, _l, _m in MS_ESSAY_CRITERIA},
+                "feedback": reason, "provider": "rule"}
+
+    if essay_text and not photo_file_ids:
+        if _cyrillic_ratio(essay_text) > 0.5:
+            return zero("Esse kirill yozuvida yozilgan — Milliy sertifikat talabiga ko'ra bunday ish 0 ball bilan "
+                        "baholanadi. Esseni lotin yozuvida yozing.")
+        if len(essay_text.split()) < 25:
+            return zero("Esse juda qisqa (faqat kirish yoki bir necha gap) — talab bo'yicha bunday ish baholanmaydi. "
+                        "Kirish, kamida 3 xatboshili asosiy qism va xulosa yozing.")
+    if not _ai_enabled():
+        return {"ok": False, "reason": "no_key"}
+
+    images = []
+    for fid in (photo_file_ids or [])[:3]:
+        raw = await _download_tg_file(bot, fid) if bot else None
+        if not raw:
+            return {"ok": False, "reason": "photo_download"}
+        images.append((_sniff_image_mime(raw), raw))
+
+    crit_lines = "\n".join(f"- {key}: {label} (0–{mx} ball)" for key, label, mx in MS_ESSAY_CRITERIA)
+    body = (
+        "Siz O'zbekiston Milliy sertifikat imtihonining «Ona tili va adabiyot» fanidan tajribali esse "
+        "baholovchisisiz. O'quvchi essesini quyidagi 24 ballik mezon bo'yicha qat'iy va xolis baholang.\n\n"
+        f"Mezonlar:\n{crit_lines}\n\n"
+        "Talablar: publitsistik uslub; kirish 2–3 gap; asosiy qism kamida 3 xatboshi (har birida dalil yoki "
+        "misol va muallif pozitsiyasi); xulosa 2–3 gap; adabiy til me'yorlari; lotin yozuvi.\n"
+        "0 ball holatlari: esse bo'sh, mavzuga umuman aloqasiz, faqat kirish qismidan iborat yoki to'liq kirill "
+        "yozuvida. Shunday bo'lsa \"zero_reason\"ga qisqa sabab yozing, aks holda bo'sh satr qoldiring.\n\n"
+        f"Esse mavzusi: {prompt_text}\n\n"
+    )
+    if essay_text:
+        body += f"O'quvchi essesi:\n<<<\n{essay_text}\n>>>\n\n"
+    if images:
+        body += ("O'quvchi essesi rasmda (qo'lyozma, bir yoki bir necha sahifa). Avval matnni diqqat bilan o'qing. "
+                 "Agar matnni ishonchli o'qib bo'lmasa, \"readable\": false qiling.\n\n")
+    body += ("Faqat JSON qaytaring: har bir mezon kaliti uchun butun son ball, \"zero_reason\", \"readable\" va "
+             "\"feedback\" (o'zbek tilida, lotin yozuvida, 3–5 jumla: kuchli tomonlar va aniq tavsiyalar).")
+
+    props = {key: {"type": "integer"} for key, _l, _m in MS_ESSAY_CRITERIA}
+    props.update({"zero_reason": {"type": "string"}, "readable": {"type": "boolean"}, "feedback": {"type": "string"}})
+    schema = {"type": "object", "properties": props, "required": list(props), "additionalProperties": False}
+
+    def validate(obj: dict):
+        if obj.get("readable") is False:
+            return {"unreadable": True}
+        try:
+            crit = {key: int(_clamp(float(obj[key]), 0, mx)) for key, _l, mx in MS_ESSAY_CRITERIA}
+        except (KeyError, TypeError, ValueError):
+            return None
+        fb = sanitize_plain_text(str(obj.get("feedback") or ""), max_len=1500) or "🤖 AI tomonidan baholandi."
+        zr = sanitize_plain_text(str(obj.get("zero_reason") or ""), max_len=300)
+        if zr:
+            return {"raw": 0, "criteria": {k: 0 for k in crit}, "feedback": f"{zr}. {fb}"}
+        return {"raw": sum(crit.values()), "criteria": crit, "feedback": fb}
+
+    res = await _ai_json(body, schema, images=images, validate=validate, bot=bot, effort="high", max_tokens=16000)
+    if not res["ok"]:
+        return res
+    d = res["data"]
+    if d.get("unreadable"):
+        return {"ok": False, "reason": "photo_unreadable"}
+    return {"ok": True, "raw": d["raw"], "band": ms_essay_ball(d["raw"]), "criteria": d["criteria"],
+            "feedback": d["feedback"], "provider": res["provider"]}
 
 
 # ----- Ustoz: bosqichli testdagi ochiq (x) javoblarni baholash -----
@@ -6850,12 +7533,13 @@ async def staged_grading_start(callback: CallbackQuery, state: FSMContext, bot: 
 
     if "writing" in sections:
         w = sections["writing"]
+        wl = "Esse" if cfg.get("kind") == "ms_essay" else "Writing"
         if w.get("photo_id"):
-            await callback.message.answer_photo(w["photo_id"], caption="✍️ Writing javobi (rasm)")
+            await callback.message.answer_photo(w["photo_id"], caption=f"✍️ {wl} javobi (rasm)")
         if w.get("text"):
-            await callback.message.answer(f"✍️ <b>Writing matni:</b>\n\n{_h(w['text'])}", parse_mode=ParseMode.HTML)
+            await callback.message.answer(f"✍️ <b>{wl} matni:</b>\n\n{_h(w['text'])}", parse_mode=ParseMode.HTML)
     if "speaking" in sections and sections["speaking"].get("voice_id"):
-        await callback.message.answer_voice(sections["speaking"]["voice_id"], caption="🎙 Speaking javobi")
+        await _send_voice_answer(callback.message, sections["speaking"], "🎙 Speaking javobi")
 
     for k in ("reading", "listening"):
         if k in sections:
@@ -6871,16 +7555,32 @@ async def staged_grading_start(callback: CallbackQuery, state: FSMContext, bot: 
     await _ask_next_grading_field(callback.message, state, bot)
 
 
+async def _send_voice_answer(answerable, v: dict, caption: str | None = None):
+    """Ovozli javobni ko'rsatadi: chatda yozilgan — voice, Mini App'da yozilgan — audio (MP3)."""
+    if v.get("voice_kind") == "audio":
+        return await answerable.answer_audio(v["voice_id"], caption=caption)
+    if v.get("voice_kind") == "document":
+        return await answerable.answer_document(v["voice_id"], caption=caption)
+    return await answerable.answer_voice(v["voice_id"], caption=caption)
+
+
 def _parse_grade_input(text: str, kind: str) -> float | str | None:
     if kind == "cefr4":
         level = (text or "").strip().upper()
         return level if level in CEFR_LEVEL_ORDER else None
+    if kind == "ms_essay":
+        m = re.match(r"^\s*(\d{1,2}(?:[.,]5)?)\s*(?:/\s*24)?\s*$", text or "")
+        raw = float(m.group(1).replace(",", ".")) if m else -1
+        return ms_essay_ball(raw) if 0 <= raw <= MS_ESSAY_MAX_RAW else None
     return _parse_band(text)
 
 
 def _grade_input_hint(kind: str) -> str:
     if kind == "cefr4":
         return "A1, A2, B1, B2, C1 yoki C2 darajasini kiriting:"
+    if kind == "ms_essay":
+        crit = "; ".join(f"{label} — {mx}" for _k, label, mx in MS_ESSAY_CRITERIA)
+        return f"0 dan 24 gacha ball kiriting (masalan: 18). Mezon (taxminiy): {crit}."
     return "0 dan 9 gacha, 0.5 qadamli raqam kiriting (masalan: 6.5):"
 
 
@@ -6897,7 +7597,8 @@ async def _ask_next_grading_field(answerable, state: FSMContext, bot: Bot) -> No
         return
 
     if "writing" in sections and sections["writing"].get("band") is None:
-        await answerable.answer(f"✍️ <b>Writing</b> uchun baho bering — {hint}", parse_mode=ParseMode.HTML)
+        wl = "Esse" if kind == "ms_essay" else "Writing"
+        await answerable.answer(f"✍️ <b>{wl}</b> uchun baho bering — {hint}", parse_mode=ParseMode.HTML)
         await state.set_state(StagedGradingState.writing_band)
         return
     if "speaking" in sections and sections["speaking"].get("band") is None:
@@ -6917,7 +7618,7 @@ async def grading_writing_band(message: Message, state: FSMContext, bot: Bot) ->
         await message.answer(f"⚠️ {_grade_input_hint(kind)}")
         return
     await state.update_data(pending_writing_band=band)
-    await message.answer("✍️ Writing uchun qisqa fikr-mulohaza (feedback) yozing:")
+    await message.answer(f"✍️ {'Esse' if kind == 'ms_essay' else 'Writing'} uchun qisqa fikr-mulohaza (feedback) yozing:")
     await state.set_state(StagedGradingState.writing_feedback)
 
 
@@ -6993,6 +7694,8 @@ def _stage_overall_percent(kind: str, overall_value) -> float:
         return ordinal / (len(CEFR_LEVEL_ORDER) - 1) * 100.0
     if kind == "sat_staged":
         return (float(overall_value) - 400.0) / 1200.0 * 100.0
+    if kind == "ms_essay":
+        return float(overall_value) / 75.0 * 100.0
     return float(overall_value) / 9.0 * 100.0
 
 
@@ -7001,6 +7704,8 @@ def _stage_cert_eligible(kind: str, overall_value) -> bool:
         return _cefr_level_to_ordinal(str(overall_value)) >= 2  # B1 va undan yuqori
     if kind == "sat_staged":
         return float(overall_value) >= 1000.0  # taxminan o'rtachadan yuqori (~1050 o'rtacha)
+    if kind == "ms_essay":
+        return grade_from_rasch_ball(float(overall_value)) is not None  # C (46) va undan yuqori
     return float(overall_value) >= 5.0
 
 
@@ -7019,6 +7724,8 @@ async def _apply_staged_grading_result(
         overall_label = "Umumiy daraja"
     elif kind == "sat_staged":
         overall_label = "Umumiy SAT ball (400-1600)"
+    elif kind == "ms_essay":
+        overall_label = "Esse balli (0-75)"
     else:
         overall_label = "Overall band"
     overall_percent = _stage_overall_percent(kind, overall)
@@ -7087,7 +7794,9 @@ async def _apply_staged_grading_result(
         await bot.send_message(
             student_tg_id,
             "🎓 <b>Natijangiz baholandi!</b>\n\n" + "\n".join(lines) +
-            f"\n\n🏆 <b>{overall_label}: {overall}</b>",
+            f"\n\n🏆 <b>{overall_label}: {overall}</b>"
+            + (f" — daraja: <b>{grade_from_rasch_ball(float(overall)) or 'sertifikatsiz'}</b>\n<i>{MS_ESSAY_NOTE}</i>"
+               if kind == "ms_essay" else ""),
             parse_mode=ParseMode.HTML,
             reply_markup=main_menu_kb(admin_flag)
         )
@@ -7101,12 +7810,14 @@ async def _apply_staged_grading_result(
             tmp_dir = tempfile.gettempdir()
             safe_code = re.sub(r"[^A-Z0-9\-_]+", "_", str(t["code"]).upper())
             pdf_path = os.path.join(tmp_dir, f"cert_{safe_code}_{user_db_id}.pdf")
-            cert_subject_fallback = "CEFR" if kind == "cefr4" else ("SAT" if kind == "sat_staged" else "IELTS")
+            cert_subject_fallback = {"cefr4": "CEFR", "sat_staged": "SAT", "ms_essay": "Ona tili"}.get(kind, "IELTS")
             make_certificate_pdf(
                 full_name=u["full_name"] or "Noma'lum", subject=t["subject"] or cert_subject_fallback,
                 test_code=t["code"], test_title=t["title"], exam_date_str=now_str_local(),
                 percent=overall_percent, correct_count=raw_score,
-                total_questions=max(raw_total, 1), grade=str(overall), out_path=pdf_path,
+                total_questions=max(raw_total, 1),
+                grade=(grade_from_rasch_ball(float(overall)) or str(overall)) if kind == "ms_essay" else str(overall),
+                out_path=pdf_path,
                 academy_name=cert_academy, signee_name=cert_signee, template=cert_tpl,
             )
             sent = await bot.send_document(student_tg_id, FSInputFile(pdf_path), caption="🎁 Sertifikatingiz tayyor!")
@@ -7350,7 +8061,7 @@ def _cert_decision(exam_type: str, percent, grade, rasch_finalized: bool, open_p
         if not rasch_finalized:
             return None
         return grade is not None
-    if et in ("ielts4", "cefr4", "sat_staged"):
+    if et in ("ielts4", "cefr4", "sat_staged", "ms_essay"):
         if grade is None:
             return False
         try:
@@ -7737,6 +8448,10 @@ async def process_test_submission(
             f"📌 Ball foiz: <b>{percent_points:.1f}%</b>\n"
         )
 
+    essay_cfg_row = _essay_cfg_of(await POOL.fetchval("SELECT essay_cfg FROM tests WHERE id=$1", test_id)) \
+        if exam_type == "rasch" else {}
+    if essay_cfg_row:
+        await POOL.execute("UPDATE results SET essay_status='awaiting' WHERE id=$1", result_id)
     rasch_pending_block = ""
     if exam_type == "rasch":
         rasch_pending_block = (
@@ -7799,8 +8514,13 @@ async def process_test_submission(
     ])
 
     admin_flag = await is_admin_user(user_tg_id)
+    if essay_cfg_row:
+        result_text = result_text.replace("🏁 <b>Test yakunlandi!</b>", "🏁 <b>Test qismi yakunlandi!</b>", 1) + \
+            "\n\n✍️ <b>Endi 2-qism — esse.</b> Mavzu pastda."
     await bot.send_message(user_tg_id, result_text, parse_mode=ParseMode.HTML, reply_markup=res_kb)
     await bot.send_message(user_tg_id, "🏠 Bosh menyu", reply_markup=main_menu_kb(admin_flag))
+    if essay_cfg_row:
+        await _essay_open_writing(bot, user_tg_id, test_id, state)
 
 
 # ----- Ustoz: ochiq javoblarni baholash tugmalari -----
@@ -8390,6 +9110,1035 @@ async def rating_per_test(callback: CallbackQuery, bot: Bot):
     await callback.message.answer(text, parse_mode=ParseMode.HTML)
 
 
+# ===================== MILLIY SERTIFIKAT: ONA TILI (TEST + ESSE) =====================
+# ✅ Rasch testiga esse qismi biriktiriladi (tests.essay_cfg). O'quvchi test
+# qismini topshirgach, qolgan umumiy vaqt ichida esse yozadi (matn yoki
+# qo'lyozma rasmi). Esseni AI (Claude, zaxirada Gemini) yoki ustoz 24 ballik
+# mezonda baholaydi; Rasch yakunida yakuniy ball = test×(1−ulush) + esse×ulush.
+ESSAY_GRACE_SEC = 180          # test vaqti tugagach esse yozib tugatish uchun qo'shimcha muhlat
+ESSAY_TEXT_MAX = 12000
+ESSAY_MAX_PHOTOS = 3
+ESSAY_STATUS_LABELS = {
+    "awaiting": "hali yozilmagan", "pending": "tekshirilmoqda", "graded": "baholangan", "missing": "topshirilmagan",
+}
+
+
+def _essay_cfg_of(raw) -> dict:
+    cfg = _load_json_dict(raw)
+    return cfg if cfg.get("prompt") else {}
+
+
+async def _essay_deadline(test_id: int) -> int:
+    end = await get_test_end_ts(test_id)
+    return end + ESSAY_GRACE_SEC if end > 0 else 0
+
+
+def _essay_submit_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Esseni topshirish", callback_data="essub")],
+        [InlineKeyboardButton(text="🗑 Tozalab qaytadan yozish", callback_data="esclear")],
+    ])
+
+
+async def _essay_open_writing(bot: Bot, user_tg_id: int, test_id: int, state: FSMContext) -> str | None:
+    """Esse yozish oynasini ochadi (FSM + mavzu). Ochib bo'lmasa — sabab matni."""
+    user_db_id = await get_user_db_id(user_tg_id)
+    r = await POOL.fetchrow("""
+        SELECT r.id, r.essay_status, t.essay_cfg, COALESCE(t.is_closed,0) AS is_closed
+        FROM results r JOIN tests t ON t.id=r.test_id WHERE r.user_id=$1 AND r.test_id=$2
+        ORDER BY r.id LIMIT 1
+    """, user_db_id, test_id)
+    cfg = _essay_cfg_of(r["essay_cfg"]) if r else {}
+    if not r or not cfg:
+        return "Esse topilmadi."
+    st = r["essay_status"] or "awaiting"
+    if st != "awaiting":
+        return {"pending": "🟡 Esseingiz allaqachon topshirilgan — tekshirilmoqda.",
+                "graded": "✅ Esseingiz allaqachon baholangan.",
+                "missing": "⏰ Esse topshirish muddati tugagan."}.get(st, "Esse yozib bo'lmaydi.")
+    deadline = await _essay_deadline(test_id)
+    if int(r["is_closed"]) == 1 or (deadline and now_ts() > deadline):
+        return "⏰ Esse topshirish muddati tugagan."
+    await state.set_state(EssayState.writing)
+    await state.update_data(essay_test_id=test_id, essay_result_id=r["id"], essay_parts=[], essay_photos=[])
+    remain = fmt_seconds(deadline - now_ts()) if deadline else "-"
+    await bot.send_message(
+        user_tg_id,
+        f"✍️ <b>Esse (2-qism)</b>\n\n📌 Mavzu: <b>{_h(cfg['prompt'])}</b>\n\n<i>{MS_ESSAY_RULES}</i>\n\n"
+        f"🕒 Qolgan vaqt: <b>{remain}</b> (test va esse uchun umumiy vaqt)\n\n"
+        f"Esseni shu yerga <b>matn</b> qilib yozing (bir necha xabarda bo'lsa ham bo'ladi) yoki qo'lda yozilgan "
+        f"varaqlarni <b>rasmga olib</b> yuboring ({ESSAY_MAX_PHOTOS} tagacha). Tugatgach «✅ Esseni topshirish»ni bosing.",
+        parse_mode=ParseMode.HTML)
+    return None
+
+
+async def essay_submit(bot: Bot, result_id: int, text: str | None, photos: list | None) -> dict:
+    """Esseni qabul qiladi (bot ham, Mini App ham) va baholashni fon rejimida boshlaydi."""
+    r = await POOL.fetchrow("""
+        SELECT r.id, r.test_id, r.essay_status, t.essay_cfg, COALESCE(t.is_closed,0) AS is_closed
+        FROM results r JOIN tests t ON t.id=r.test_id WHERE r.id=$1
+    """, result_id)
+    cfg = _essay_cfg_of(r["essay_cfg"]) if r else {}
+    if not r or not cfg:
+        return {"ok": False, "reason": "not_found", "message": "Esse topilmadi."}
+    if (r["essay_status"] or "awaiting") != "awaiting":
+        return {"ok": False, "reason": "already", "message": "Esse allaqachon topshirilgan."}
+    deadline = await _essay_deadline(r["test_id"])
+    if int(r["is_closed"]) == 1 or (deadline and now_ts() > deadline):
+        return {"ok": False, "reason": "late", "message": "⏰ Esse topshirish muddati tugagan."}
+    text = (text or "").strip()[:ESSAY_TEXT_MAX] or None
+    photos = [p for p in (photos or []) if isinstance(p, str) and p][:ESSAY_MAX_PHOTOS]
+    if not text and not photos:
+        return {"ok": False, "reason": "empty", "message": "Esse matni yoki rasmi yuborilmadi."}
+    upd = await POOL.execute("""
+        UPDATE results SET essay_status='pending', essay_text=$1, essay_photos=$2, essay_submitted_ts=$3
+        WHERE id=$4 AND COALESCE(essay_status,'awaiting')='awaiting'
+    """, text, json.dumps(photos) if photos else None, now_ts(), result_id)
+    if upd.endswith(" 0"):
+        return {"ok": False, "reason": "already", "message": "Esse allaqachon topshirilgan."}
+    asyncio.create_task(_essay_grade_job(bot, result_id))
+    if cfg.get("grader") == "ai" and _ai_enabled():
+        msg = "⏳ Esseingiz sun'iy intellekt tomonidan tekshirilmoqda — natija odatda 1-2 daqiqada keladi."
+    else:
+        msg = "✅ Esse qabul qilindi — ustoz baholagach natija shu yerga keladi."
+    return {"ok": True, "message": msg}
+
+
+async def _essay_grade_job(bot: Bot, result_id: int) -> None:
+    try:
+        r = await POOL.fetchrow("""
+            SELECT r.essay_text, r.essay_photos, t.essay_cfg FROM results r JOIN tests t ON t.id=r.test_id
+            WHERE r.id=$1
+        """, result_id)
+        cfg = _essay_cfg_of(r["essay_cfg"]) if r else {}
+        if not cfg:
+            return
+        reason = None
+        if cfg.get("grader") == "ai":
+            res = await _ai_grade_essay_ms(cfg.get("prompt", ""), essay_text=r["essay_text"],
+                                           photo_file_ids=json.loads(r["essay_photos"] or "[]"), bot=bot)
+            if res["ok"]:
+                await _essay_store_grade(bot, result_id, res["raw"], res["feedback"], "ai", res.get("criteria"))
+                return
+            reason = res["reason"]
+        await _essay_send_for_review(bot, None, result_id, ai_fail_reason=reason)
+    except Exception:
+        logging.exception(f"Esseni baholashda xatolik (result={result_id})")
+
+
+async def _essay_send_for_review(bot: Bot, chat_id: int | None, result_id: int, ai_fail_reason: str | None = None) -> bool:
+    """Esseni ustozga (yoki ko'rmoqchi bo'lgan admin/ustozga) baholash tugmasi bilan yuboradi."""
+    r = await POOL.fetchrow("""
+        SELECT r.id, r.essay_text, r.essay_photos, r.essay_status, r.essay_raw, u.full_name, t.title, t.code,
+               t.creator_id, t.essay_cfg
+        FROM results r JOIN tests t ON t.id=r.test_id JOIN users u ON u.id=r.user_id WHERE r.id=$1
+    """, result_id)
+    if not r:
+        return False
+    cfg = _essay_cfg_of(r["essay_cfg"])
+    target = chat_id or r["creator_id"] or ADMIN_ID
+    head = (f"✍️ <b>Esse — baholash kerak</b>\n\n👤 {_h(r['full_name'])}\n📚 {_h(r['title'])} "
+            f"(<code>{r['code']}</code>)\n📌 Mavzu: <i>{_h(cfg.get('prompt', ''))}</i>")
+    if r["essay_status"] == "graded":
+        head = head.replace("baholash kerak", f"baholangan: {float(r['essay_raw'] or 0):g}/24")
+    if ai_fail_reason:
+        head += (f"\n\n⚠️ AI baholay olmadi ({AI_FAIL_REASON_LABELS.get(ai_fail_reason, ai_fail_reason)}) — "
+                 f"iltimos, qo'lda baholang.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Baholash (0–24)" if r["essay_status"] != "graded" else "✏️ Bahoni o'zgartirish",
+                              callback_data=f"esg_{result_id}")]])
+    photos = json.loads(r["essay_photos"] or "[]")
+    text = r["essay_text"] or ""
+    try:
+        await bot.send_message(target, head, parse_mode=ParseMode.HTML)
+        for i in range(0, len(text), 3500):
+            await bot.send_message(target, _h(text[i:i + 3500]), parse_mode=ParseMode.HTML)
+        for i, pid in enumerate(photos, start=1):
+            await bot.send_photo(target, pid, caption=f"{i}-varaq")
+        words = len(text.split())
+        await bot.send_message(target, f"👆 Esse ({words} so'z{', ' + str(len(photos)) + ' ta rasm' if photos else ''}).",
+                               reply_markup=kb)
+        return True
+    except (TelegramForbiddenError, TelegramBadRequest):
+        logging.warning(f"Esseni ustozga yuborib bo'lmadi (result={result_id}, chat={target})")
+        if chat_id is None and target != ADMIN_ID:
+            try:
+                await bot.send_message(ADMIN_ID, head + "\n\n<i>(Ustozga yetkazilmadi — admin baholashi mumkin.)</i>",
+                                       parse_mode=ParseMode.HTML, reply_markup=kb)
+                return True
+            except Exception:
+                pass
+        return False
+
+
+async def _essay_apply_final(result_id: int) -> None:
+    """Rasch allaqachon hisoblangan bo'lsa — shu o'quvchining yakuniy balini
+    (test qismi o'zgarmagan) yangi esse bahosi bilan qayta hisoblaydi."""
+    r = await POOL.fetchrow("""
+        SELECT r.test_ball, r.essay_ball, r.essay_status, r.certificate_sent, t.essay_cfg
+        FROM results r JOIN tests t ON t.id=r.test_id WHERE r.id=$1
+    """, result_id)
+    if not r or r["test_ball"] is None:
+        return
+    w = float(_essay_cfg_of(r["essay_cfg"]).get("weight") or 0.5)
+    essay = float(r["essay_ball"] or 0) if r["essay_status"] == "graded" else 0.0
+    final = (1 - w) * float(r["test_ball"]) + w * essay
+    await POOL.execute("""
+        UPDATE results SET rasch_ball=$1, rasch_percent=$2, grade=$3,
+               certificate_sent=CASE WHEN certificate_sent=2 THEN 0 ELSE certificate_sent END
+        WHERE id=$4
+    """, float(final), float(final / 75.0 * 100.0), grade_from_rasch_ball(final), result_id)
+
+
+async def _essay_store_grade(bot: Bot, result_id: int, raw: float, feedback: str, graded_by: str,
+                             criteria: dict | None = None) -> None:
+    raw = float(_clamp(float(raw), 0.0, float(MS_ESSAY_MAX_RAW)))
+    ball = ms_essay_ball(raw)
+    row = await POOL.fetchrow("""
+        UPDATE results SET essay_status='graded', essay_raw=$1, essay_ball=$2, essay_feedback=$3,
+               essay_graded_by=$4, essay_criteria=$5
+        WHERE id=$6 RETURNING test_id, user_id
+    """, raw, ball, feedback, graded_by, json.dumps(criteria) if criteria else None, result_id)
+    if not row:
+        return
+    test_id = row["test_id"]
+    finalized = await POOL.fetchval("SELECT COALESCE(rush_finalized,0) FROM tests WHERE id=$1", test_id) == 1
+    if finalized:
+        await _essay_apply_final(result_id)
+    tg = await POOL.fetchval("SELECT telegram_id FROM users WHERE id=$1", row["user_id"])
+    who = "🤖 AI" if graded_by == "ai" else "👤 Ustoz"
+    crit = ms_essay_criteria_text(criteria)
+    tail = ("\n\n📄 Yakuniy (test + esse) natija «📄 Natijalarim» bo'limida."
+            if finalized else "\n\n⏳ Yakuniy (test + esse) ball test vaqti tugagach hisoblanadi.")
+    try:
+        await bot.send_message(
+            tg,
+            f"✅ <b>Esseingiz baholandi</b> ({who})\n\n✍️ Ball: <b>{raw:g}/24</b> → <b>{ball:.1f}/75</b>\n"
+            + (f"\n{crit}\n" if crit else "")
+            + f"\n💬 {_h(feedback)}\n\n<i>{MS_ESSAY_NOTE}</i>" + tail,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="📄 Natijani ko‘rish", callback_data=f"viewres_{test_id}")]]))
+    except (TelegramForbiddenError, TelegramBadRequest):
+        pass
+    if not finalized:
+        await finalize_rush_for_test_if_ready(test_id, bot=bot)
+
+
+def _essay_view_text(row) -> str:
+    st = row["essay_status"] or "awaiting"
+    if st == "graded":
+        who = "🤖 AI" if row["essay_graded_by"] == "ai" else "👤 ustoz"
+        fb = f"\n💬 <i>{_h(row['essay_feedback'])}</i>" if row["essay_feedback"] else ""
+        return (f"\n✍️ Esse: <b>{float(row['essay_raw'] or 0):g}/24</b> ({float(row['essay_ball'] or 0):.1f}/75 ball, "
+                f"{who} baholadi){fb}\n")
+    if st == "pending":
+        return "\n✍️ Esse: <b>tekshirilmoqda</b> — baholangach xabar keladi.\n"
+    if st == "missing":
+        return "\n✍️ Esse: <b>topshirilmagan</b> (0 ball).\n"
+    return "\n✍️ Esse: <b>hali yozilmagan</b> — «✍️ Esse yozish» tugmasini bosing.\n"
+
+
+@router.message(EssayState.writing, F.photo)
+async def essay_photo_part(message: Message, state: FSMContext):
+    data = await state.get_data()
+    photos = list(data.get("essay_photos") or [])
+    if len(photos) >= ESSAY_MAX_PHOTOS:
+        return await message.answer(f"⚠️ Ko'pi bilan {ESSAY_MAX_PHOTOS} ta rasm. «✅ Esseni topshirish»ni bosing.",
+                                    reply_markup=_essay_submit_kb())
+    photos.append(message.photo[-1].file_id)
+    await state.update_data(essay_photos=photos)
+    await message.answer(f"📸 {len(photos)}-varaq qabul qilindi. Yana varaq bo'lsa yuboring, aks holda "
+                         f"«✅ Esseni topshirish»ni bosing.", reply_markup=_essay_submit_kb())
+
+
+@router.message(EssayState.writing, F.text)
+async def essay_text_part(message: Message, state: FSMContext):
+    if message.text in TOP_MENU_BTNS:
+        return
+    data = await state.get_data()
+    parts = list(data.get("essay_parts") or [])
+    if sum(len(p) for p in parts) + len(message.text) > ESSAY_TEXT_MAX:
+        return await message.answer("⚠️ Esse juda uzun. «✅ Esseni topshirish»ni bosing yoki qaytadan yozing.",
+                                    reply_markup=_essay_submit_kb())
+    parts.append(message.text)
+    await state.update_data(essay_parts=parts)
+    words = len(" ".join(parts).split())
+    await message.answer(f"📝 Matn qabul qilindi — jami <b>{words}</b> so'z. Davomi bo'lsa yana yuboring, tugatgan "
+                         f"bo'lsangiz «✅ Esseni topshirish»ni bosing.", parse_mode=ParseMode.HTML,
+                         reply_markup=_essay_submit_kb())
+
+
+@router.message(EssayState.writing)
+async def essay_other_part(message: Message):
+    await message.answer("✍️ Esseni matn qilib yozing yoki qo'lda yozilgan varaq rasmini yuboring.")
+
+
+@router.callback_query(F.data == "esclear")
+async def essay_clear_cb(callback: CallbackQuery, state: FSMContext):
+    if await state.get_state() != EssayState.writing.state:
+        return await callback.answer("Esse oynasi yopilgan.", show_alert=True)
+    await state.update_data(essay_parts=[], essay_photos=[])
+    await _close_buttons(callback)
+    await callback.answer("🗑 Tozalandi — esseni qaytadan yuboring.", show_alert=True)
+
+
+@router.callback_query(F.data == "essub")
+async def essay_submit_cb(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if await state.get_state() != EssayState.writing.state:
+        return await callback.answer("Esse oynasi yopilgan. «📄 Natijalarim» orqali qayta oching.", show_alert=True)
+    data = await state.get_data()
+    text = "\n\n".join(data.get("essay_parts") or []).strip()
+    photos = data.get("essay_photos") or []
+    if not text and not photos:
+        return await callback.answer("Avval esse matni yoki rasmini yuboring.", show_alert=True)
+    res = await essay_submit(bot, int(data.get("essay_result_id") or 0), text, photos)
+    if not res["ok"] and res["reason"] == "empty":
+        return await callback.answer(res["message"], show_alert=True)
+    await state.clear()
+    await _close_buttons(callback)
+    admin_flag = await is_admin_user(callback.from_user.id)
+    await callback.message.answer(("✅ <b>Esse topshirildi!</b>\n\n" if res["ok"] else "") + res["message"],
+                                  parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(admin_flag))
+
+
+@router.callback_query(F.data.startswith("essay_"))
+async def essay_open_cb(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    test_id = int(callback.data.split("_")[1])
+    err = await _essay_open_writing(bot, callback.from_user.id, test_id, state)
+    if err:
+        return await callback.answer(err, show_alert=True)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("esl_"))
+async def essay_list_cb(callback: CallbackQuery):
+    test_id = int(callback.data.split("_")[1])
+    if not await _is_admin_or_creator(callback.from_user.id, test_id):
+        return await callback.answer("Sizda ruxsat yo'q!", show_alert=True)
+    rows = await POOL.fetch("""
+        SELECT r.id, r.essay_status, r.essay_raw, u.full_name FROM results r JOIN users u ON u.id=r.user_id
+        WHERE r.test_id=$1 AND r.essay_status IN ('pending','graded')
+        ORDER BY (r.essay_status='pending') DESC, r.id LIMIT 60
+    """, test_id)
+    if not rows:
+        return await callback.message.answer("Bu testda hali topshirilgan esse yo'q.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=(f"🟡 {r['full_name']}" if r["essay_status"] == "pending"
+                  else f"✅ {r['full_name']} — {float(r['essay_raw'] or 0):g}/24")[:60],
+            callback_data=f"esv_{r['id']}")]
+        for r in rows])
+    n_pending = sum(1 for r in rows if r["essay_status"] == "pending")
+    await callback.message.answer(f"✍️ <b>Esselar</b> — baholash kutayotgan: <b>{n_pending}</b>",
+                                  parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("esv_"))
+async def essay_view_cb(callback: CallbackQuery, bot: Bot):
+    rid = int(callback.data.split("_")[1])
+    test_id = await POOL.fetchval("SELECT test_id FROM results WHERE id=$1", rid)
+    if not test_id or not await _is_admin_or_creator(callback.from_user.id, test_id):
+        return await callback.answer("Sizda ruxsat yo'q!", show_alert=True)
+    await _essay_send_for_review(bot, callback.from_user.id, rid)
+
+
+@router.callback_query(F.data.startswith("esg_"))
+async def essay_grade_start(callback: CallbackQuery, state: FSMContext):
+    rid = int(callback.data.split("_")[1])
+    r = await POOL.fetchrow("SELECT test_id, essay_status, essay_raw FROM results WHERE id=$1", rid)
+    if not r or not await _is_admin_or_creator(callback.from_user.id, r["test_id"]):
+        return await callback.answer("Sizda ruxsat yo'q!", show_alert=True)
+    if r["essay_status"] not in ("pending", "graded"):
+        return await callback.answer("Esse hali topshirilmagan.", show_alert=True)
+    await state.set_state(EssayGradeState.score)
+    await state.update_data(esg_result_id=rid)
+    crit = "\n".join(f"• {label} — {mx} ball" for _k, label, mx in MS_ESSAY_CRITERIA)
+    cur = f"\nHozirgi baho: <b>{float(r['essay_raw'] or 0):g}/24</b>\n" if r["essay_status"] == "graded" else ""
+    await callback.message.answer(
+        f"✍️ <b>Esse balini kiriting (0–24)</b> va izoh yozing, masalan:\n"
+        f"<code>18 Mavzu yaxshi ochilgan, lekin xulosa qisqa</code>\n{cur}\n<b>Mezon (taxminiy):</b>\n{crit}",
+        parse_mode=ParseMode.HTML, reply_markup=nav_kb(include_back=True))
+    await callback.answer()
+
+
+@router.message(EssayGradeState.score)
+async def essay_grade_input(message: Message, state: FSMContext, bot: Bot):
+    if (message.text or "") in TOP_MENU_BTNS:
+        return
+    m = re.match(r"^\s*(\d{1,2}(?:[.,]5)?)(?:\s*/\s*24)?\s*(.*)$", message.text or "", re.S)
+    raw = float(m.group(1).replace(",", ".")) if m else -1
+    if not m or not (0 <= raw <= MS_ESSAY_MAX_RAW):
+        return await message.answer("⚠️ 0 dan 24 gacha ball yozing, masalan: <code>18 izoh...</code>",
+                                    parse_mode=ParseMode.HTML)
+    rid = int((await state.get_data()).get("esg_result_id") or 0)
+    test_id = await POOL.fetchval("SELECT test_id FROM results WHERE id=$1", rid)
+    if not test_id or not await _is_admin_or_creator(message.from_user.id, test_id):
+        await state.clear()
+        return await message.answer("Sizda ruxsat yo'q!")
+    feedback = sanitize_plain_text(m.group(2) or "", max_len=1500) or "Ustoz tomonidan baholandi."
+    await state.clear()
+    await _essay_store_grade(bot, rid, raw, feedback, str(message.from_user.id))
+    admin_flag = await is_admin_user(message.from_user.id)
+    await message.answer(f"✅ Esse baholandi: <b>{raw:g}/24</b> ({ms_essay_ball(raw):.1f}/75). O'quvchiga yuborildi.",
+                         parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(admin_flag))
+
+
+# ----- Test yaratish sehrgari: esse qismi -----
+async def _ask_essay_prompt(answerable, state: FSMContext) -> None:
+    await answerable.answer(
+        "✍️ <b>Esse qismi</b>\n\nEsse <b>mavzusini</b> (topshiriq matnini) kiriting.\n"
+        "Masalan: <i>«Kitob — bilim manbai» mavzusida publitsistik uslubda esse yozing.</i>",
+        parse_mode=ParseMode.HTML, reply_markup=nav_kb(include_back=True))
+    await state.set_state(AdminAddTestState.essay_prompt)
+
+
+@router.message(AdminAddTestState.essay_prompt)
+async def essay_prompt_input(message: Message, state: FSMContext):
+    if (message.text or "") in TOP_MENU_BTNS:
+        return
+    prompt = sanitize_plain_text(message.text or "", max_len=1500)
+    if len(prompt) < 5:
+        return await message.answer("⚠️ Mavzu juda qisqa. Qayta kiriting:")
+    await state.update_data(essay_prompt=prompt)
+    if _ai_enabled():
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🤖 AI baholasin (darhol natija)", callback_data="esgr_ai")],
+            [InlineKeyboardButton(text="👤 O'zim / ustoz baholaydi", callback_data="esgr_teacher")],
+        ])
+        await message.answer(
+            "Esseni kim baholasin?\n\n🤖 <b>AI</b> — 24 ballik mezon bo'yicha (mazmun, tuzilish, dalil, uslub, "
+            "savodxonlik) bir-ikki daqiqada baholaydi, qo'lyozma rasmini ham o'qiydi. Ishlamay qolsa, esse sizga "
+            "yuboriladi.\n👤 <b>Ustoz</b> — har bir esse sizga keladi, ball va izoh yozasiz.",
+            parse_mode=ParseMode.HTML, reply_markup=kb)
+        await state.set_state(AdminAddTestState.essay_grader)
+        return
+    await state.update_data(essay_grader="teacher")
+    await _ask_essay_weight(message, state)
+
+
+@router.callback_query(AdminAddTestState.essay_grader, F.data.startswith("esgr_"))
+async def essay_grader_pick(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(essay_grader="ai" if callback.data == "esgr_ai" else "teacher")
+    await callback.answer()
+    await _ask_essay_weight(callback.message, state)
+
+
+async def _ask_essay_weight(answerable, state: FSMContext) -> None:
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="25%", callback_data="esw_25"),
+        InlineKeyboardButton(text="33%", callback_data="esw_33"),
+        InlineKeyboardButton(text="50%", callback_data="esw_50"),
+    ]])
+    await answerable.answer(
+        "⚖️ Yakuniy ballda <b>essening ulushi</b> qancha bo'lsin?\n\n"
+        "<i>Test qismi Rasch bo'yicha 75 ballik shkalada, esse 24 ballik mezondan 75 ballik shkalaga o'tkaziladi. "
+        "Yakuniy ball = test × (1 − ulush) + esse × ulush; daraja (A+ … C) yakuniy ballga qarab beriladi.</i>",
+        parse_mode=ParseMode.HTML, reply_markup=kb)
+    await state.set_state(AdminAddTestState.essay_weight)
+
+
+class _MsgAs:
+    """Callback ichidan "foydalanuvchi xabari" kutadigan funksiyani chaqirish uchun."""
+
+    def __init__(self, message: Message, user):
+        self._m, self.from_user, self.chat = message, user, message.chat
+
+    async def answer(self, *a, **kw):
+        return await self._m.answer(*a, **kw)
+
+
+@router.callback_query(AdminAddTestState.essay_weight, F.data.startswith("esw_"))
+async def essay_weight_pick(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    w = {"esw_25": 0.25, "esw_33": 0.33, "esw_50": 0.5}.get(callback.data, 0.5)
+    data = await state.get_data()
+    cfg = {"prompt": data.get("essay_prompt") or "", "grader": data.get("essay_grader") or "teacher",
+           "weight": w, "max_raw": MS_ESSAY_MAX_RAW}
+    await state.update_data(essay_cfg=json.dumps(cfg, ensure_ascii=False))
+    await callback.answer()
+    await _finish_base_test_creation(_MsgAs(callback.message, callback.from_user), state,
+                                     data.get("essay_pending_answers"), data.get("essay_pending_open_ref"), bot)
+
+
+# ===================== TEST FAYLLARINI QABUL QILISH (Mini App'da albatta ochilsin) =====================
+# ✅ Bot API botga 20 MB dan katta faylni yuklab olishga ruxsat bermaydi —
+# bunday fayl Mini App'da hech qachon ochilmasdi. Word/PowerPoint kabi
+# formatlarni esa brauzer ko'rsata olmaydi. Shuning uchun fayl yuklanayotgan
+# paytdayoq tekshiriladi va ustozga aniq sabab aytiladi; qabul qilingan fayl
+# darhol server keshiga olinadi (o'quvchi ochganda kutib qolmasin).
+TG_BOT_FILE_LIMIT = 20 * 1024 * 1024
+_DOC_OK_EXT = (".pdf", ".jpg", ".jpeg", ".png", ".webp")
+_MEDIA_OK_EXT = (".mp3", ".m4a", ".aac", ".mp4", ".m4v", ".mov", ".wav", ".ogg", ".oga", ".opus", ".webm",
+                 ".flac", ".mpeg", ".mpga")
+_MEDIA_BAD_EXT = (".wma", ".amr", ".3gp", ".ra", ".aiff", ".aif", ".mid", ".midi", ".avi", ".wmv", ".mkv", ".flv")
+
+
+def _upload_problem(message: Message, purpose: str) -> str | None:
+    """purpose: 'doc' — savollar fayli (PDF/rasm), 'media' — Listening audio/video,
+    'any' — ikkalasidan biri. Muammo bo'lsa — foydalanuvchiga ko'rsatiladigan matn."""
+    obj = message.document or message.audio or message.video
+    if obj is None:
+        return "⚠️ Fayl topilmadi — qaytadan yuboring."
+    size = int(getattr(obj, "file_size", 0) or 0)
+    name = (getattr(obj, "file_name", "") or "").lower()
+    mime = (getattr(obj, "mime_type", "") or "").lower()
+    is_doc = bool(message.document) and (mime in ("application/pdf", "image/jpeg", "image/png", "image/webp")
+                                         or name.endswith(_DOC_OK_EXT))
+    is_media = bool(message.audio or message.video) or (
+        bool(message.document) and (mime.startswith(("audio/", "video/")) or name.endswith(_MEDIA_OK_EXT)))
+    if name.endswith(_MEDIA_BAD_EXT) or mime in ("audio/x-ms-wma", "audio/amr", "video/x-msvideo", "video/x-ms-wmv",
+                                                 "video/x-matroska", "audio/3gpp", "video/3gpp"):
+        return ("⚠️ Bu audio/video formati telefon brauzerida ijro etilmaydi (Mini App'da ochilmaydi).\n"
+                "Iltimos, <b>MP3</b> (audio) yoki <b>MP4</b> (video) qilib qayta yuboring.")
+    if size > TG_BOT_FILE_LIMIT:
+        tip = ("PDF'ni siqib (masalan, ilovepdf.com → Compress PDF) qayta yuboring."
+               if is_doc or purpose == "doc" else
+               "Audioni MP3 64–96 kbps qilib siqib qayta yuboring (30 daqiqalik yozuv shunda ~15–20 MB bo'ladi).")
+        return (f"⚠️ Fayl hajmi <b>{size / 1024 / 1024:.1f} MB</b>. Telegram botlar 20 MB dan katta faylni "
+                f"yuklab ololmaydi — u o'quvchiga Mini App'da ochilmay qoladi.\n{tip}")
+    if purpose == "doc" and not is_doc:
+        return ("⚠️ Savollar fayli <b>PDF</b> (yoki rasm) bo'lishi kerak — Mini App'da faqat shular aniq ochiladi.\n"
+                "Word/PowerPoint faylni «Saqlash → PDF» qilib qayta yuboring.")
+    if purpose == "media" and not is_media:
+        return "⚠️ Listening uchun <b>audio</b> (MP3/M4A) yoki <b>video</b> (MP4) fayl yuboring."
+    if purpose == "any" and not (is_doc or is_media):
+        return ("⚠️ Fayl <b>PDF</b> (savollar) yoki <b>MP3/MP4</b> (audio/video) bo'lishi kerak — "
+                "boshqa formatlar Mini App'da ochilmaydi.")
+    return None
+
+
+def _warm_file_later(bot, file_id: str | None) -> None:
+    """Yangi yuklangan faylni Mini App keshiga fonda oldindan yuklaydi."""
+    if not file_id or bot is None or not WEBAPP_URL:
+        return
+
+    async def _job():
+        try:
+            await _web_fetch_file(bot, file_id)
+        except Exception:
+            logging.warning(f"Faylni oldindan keshlab bo'lmadi: {file_id[:16]}…")
+    asyncio.create_task(_job())
+
+
+# ===================== HAMYON (BALANS) =====================
+# ✅ O'quvchi hamyonini bir marta (chek bilan) to'ldiradi, admin tasdiqlaydi —
+# keyin pullik testlarni chek kutmasdan, bir zumda balansdan sotib oladi.
+# Har bir o'zgarish wallet_tx jadvalida qoladi (to'ldirish, xarid, tuzatish).
+WALLET_PRESETS = (10000, 20000, 50000, 100000)
+WALLET_TOPUP_MIN = 1000
+WALLET_TOPUP_MAX = 10_000_000
+WALLET_REJECT_REASONS = (
+    "Chek noaniq yoki o'qib bo'lmaydi",
+    "Summa chekdagi summaga mos emas",
+    "To'lov kartaga tushmagan",
+)
+WALLET_TX_LABELS = {"topup": "To'ldirish", "purchase": "Test xaridi", "refund": "Qaytarish",
+                    "adjust": "Admin tuzatishi"}
+WALLET_STATUS_ICONS = {"pending": "🟡", "approved": "✅", "rejected": "❌"}
+WALLET_BUY_ERRORS = {
+    "not_found": "Test topilmadi.",
+    "hidden": "⏸ Bu test vaqtincha to'xtatilgan.",
+    "closed": "🛑 Bu test yakunlangan.",
+    "expired": "❌ Bu testning vaqti tugab bo'lgan — to'lov qabul qilinmaydi.",
+    "already": "✅ Siz bu testni allaqachon sotib olgansiz.",
+    "pending": "🟡 Bu test bo'yicha chekingiz tekshirilmoqda — admin javobini kuting.",
+    "low": "Balansingiz yetarli emas.",
+    "no_user": "Avval /start orqali ro'yxatdan o'ting.",
+}
+
+
+async def wallet_balance(user_db_id: int) -> int:
+    return int(await POOL.fetchval("SELECT COALESCE(balance,0) FROM users WHERE id=$1", user_db_id) or 0)
+
+
+async def _wallet_history(user_db_id: int, limit: int = 10):
+    return await POOL.fetch("""
+        SELECT w.id, w.kind, w.amount, w.status, w.created_ts, w.note, t.code
+        FROM wallet_tx w LEFT JOIN tests t ON t.id=w.test_id
+        WHERE w.user_id=$1 ORDER BY w.id DESC LIMIT $2
+    """, user_db_id, limit)
+
+
+async def _wallet_pending_topup(user_db_id: int):
+    return await POOL.fetchrow(
+        "SELECT id, amount FROM wallet_tx WHERE user_id=$1 AND kind='topup' AND status='pending' "
+        "ORDER BY id DESC LIMIT 1", user_db_id)
+
+
+def _wallet_tx_line(r) -> str:
+    amount = int(r["amount"] or 0)
+    sign = "+" if amount > 0 else "−"
+    dt = datetime.fromtimestamp(int(r["created_ts"]), TZ).strftime("%d.%m %H:%M") if r["created_ts"] else ""
+    code = f" · <code>{_h(r['code'])}</code>" if r["code"] else ""
+    return (f"{WALLET_STATUS_ICONS.get(r['status'], '•')} {WALLET_TX_LABELS.get(r['kind'], r['kind'])}: "
+            f"<b>{sign}{_fmt_money(abs(amount))}</b>{code} · {dt}")
+
+
+def _wallet_tx_json(r) -> dict:
+    return {"id": r["id"], "kind": r["kind"], "label": WALLET_TX_LABELS.get(r["kind"], r["kind"]),
+            "amount": int(r["amount"] or 0), "status": r["status"], "ts": int(r["created_ts"] or 0),
+            "code": r["code"], "note": r["note"] if r["kind"] != "purchase" else None}
+
+
+def _parse_money(text: str) -> int | None:
+    digits = re.sub(r"[\s,.'’]|so['’]?m|сум|sum", "", (text or "").lower())
+    return int(digits) if digits.isdigit() and len(digits) <= 9 else None
+
+
+async def _render_wallet(answerable, user_tg_id: int):
+    user_db_id = await get_user_db_id(user_tg_id)
+    if not user_db_id:
+        return await answerable.answer("Avval /start orqali ro'yxatdan o'ting.")
+    bal = await wallet_balance(user_db_id)
+    hist = await _wallet_history(user_db_id, 5)
+    pending = await _wallet_pending_topup(user_db_id)
+    text = f"👛 <b>Hamyonim</b>\n\n💰 Balans: <b>{_fmt_money(bal)}</b>\n"
+    if pending:
+        text += f"🟡 Tekshirilayotgan to'ldirish: <b>{_fmt_money(pending['amount'])}</b>\n"
+    text += "\n<i>Balansdan pullik testlarni chek kutmasdan, bir zumda sotib olasiz.</i>\n"
+    if hist:
+        text += "\n<b>So'nggi amallar:</b>\n" + "\n".join(_wallet_tx_line(r) for r in hist)
+    rows = [[InlineKeyboardButton(text="➕ Hisobni to'ldirish", callback_data="wallet_topup")]]
+    if hist:
+        rows.append([InlineKeyboardButton(text="📜 To'liq tarix", callback_data="wallet_hist")])
+    await answerable.answer(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.message(F.text == BTN_WALLET)
+async def wallet_menu(message: Message):
+    await _render_wallet(message, message.from_user.id)
+
+
+@router.callback_query(F.data == "wallet_home")
+async def wallet_home_cb(callback: CallbackQuery, state: FSMContext):
+    if (await state.get_state() or "").startswith("WalletState"):
+        await state.clear()
+    await _render_wallet(callback.message, callback.from_user.id)
+
+
+@router.callback_query(F.data == "wallet_hist")
+async def wallet_hist_cb(callback: CallbackQuery):
+    user_db_id = await get_user_db_id(callback.from_user.id)
+    if not user_db_id:
+        return await callback.answer("Avval /start orqali ro'yxatdan o'ting.", show_alert=True)
+    hist = await _wallet_history(user_db_id, 30)
+    text = "📜 <b>Hamyon tarixi</b> (oxirgi 30 ta)\n\n" + ("\n".join(_wallet_tx_line(r) for r in hist) or "Hali amal yo'q.")
+    await callback.message.answer(text, parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data == "wallet_topup")
+async def wallet_topup_cb(callback: CallbackQuery):
+    user_db_id = await get_user_db_id(callback.from_user.id)
+    if not user_db_id:
+        return await callback.answer("Avval /start orqali ro'yxatdan o'ting.", show_alert=True)
+    if await _wallet_pending_topup(user_db_id):
+        return await callback.answer("🟡 Oldingi to'ldirish so'rovingiz tekshirilmoqda. Tasdiqlangach yana "
+                                     "to'ldirishingiz mumkin.", show_alert=True)
+    btns = [InlineKeyboardButton(text=_fmt_money(a), callback_data=f"wallet_amt_{a}") for a in WALLET_PRESETS]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        btns[:2], btns[2:],
+        [InlineKeyboardButton(text="✍️ Boshqa summa", callback_data="wallet_amt_custom")],
+    ])
+    await callback.message.answer("➕ <b>Hisobni to'ldirish</b>\n\nQancha summa kiritmoqchisiz?",
+                                  parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def _wallet_ask_receipt(answerable, state: FSMContext, amount: int):
+    await state.set_state(WalletState.receipt)
+    await state.update_data(wallet_amount=amount)
+    await answerable.answer(
+        f"💳 <b>{_fmt_money(amount)}</b> — hamyonni to'ldirish\n\n"
+        f"1) Shu summani kartaga o'tkazing:\n"
+        f"💳 Karta: <code>{PAYMENT_CARD}</code>\n"
+        f"👤 Ega: <b>{_h(PAYMENT_OWNER)}</b>\n"
+        f"📞 Telefon: <code>{PAYMENT_PHONE}</code>\n\n"
+        f"2) To'lov chekining <b>rasmini (skrinshot)</b> shu yerga yuboring.\n\n"
+        f"Admin tasdiqlagach summa balansingizga tushadi.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="wallet_home")]]))
+
+
+@router.callback_query(F.data.startswith("wallet_amt_"))
+async def wallet_amount_cb(callback: CallbackQuery, state: FSMContext):
+    user_db_id = await get_user_db_id(callback.from_user.id)
+    if not user_db_id:
+        return await callback.answer("Avval /start orqali ro'yxatdan o'ting.", show_alert=True)
+    if await _wallet_pending_topup(user_db_id):
+        return await callback.answer("🟡 Oldingi to'ldirish so'rovingiz hali tekshirilmoqda.", show_alert=True)
+    val = callback.data[len("wallet_amt_"):]
+    if val == "custom":
+        await state.set_state(WalletState.amount)
+        return await callback.message.answer(
+            f"✍️ Summani yozing (so'mda, {_fmt_money(WALLET_TOPUP_MIN)} dan kam bo'lmasin).\nMasalan: <code>25000</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="wallet_home")]]))
+    amount = _parse_money(val)
+    if not amount or not (WALLET_TOPUP_MIN <= amount <= WALLET_TOPUP_MAX):
+        return await callback.answer("Noto'g'ri summa.", show_alert=True)
+    await _wallet_ask_receipt(callback.message, state, amount)
+
+
+@router.message(WalletState.amount)
+async def wallet_amount_text(message: Message, state: FSMContext):
+    amount = _parse_money(message.text or "")
+    if not amount:
+        return await message.answer("⚠️ Faqat raqam yozing, masalan: <code>25000</code>", parse_mode=ParseMode.HTML)
+    if amount < WALLET_TOPUP_MIN or amount > WALLET_TOPUP_MAX:
+        return await message.answer(
+            f"⚠️ Summa {_fmt_money(WALLET_TOPUP_MIN)} dan {_fmt_money(WALLET_TOPUP_MAX)} gacha bo'lsin.")
+    await _wallet_ask_receipt(message, state, amount)
+
+
+async def wallet_create_topup(bot: Bot, user_db_id: int, amount: int, *, photo_id: str | None = None,
+                              photo_bytes: bytes | None = None) -> dict:
+    """To'ldirish so'rovini yaratadi va chekni adminga yuboradi (bot ham, Mini App ham shu yerdan)."""
+    try:
+        tx_id = await POOL.fetchval(
+            "INSERT INTO wallet_tx (user_id, kind, amount, status, receipt_file_id, created_ts) "
+            "VALUES ($1,'topup',$2,'pending',$3,$4) RETURNING id", user_db_id, amount, photo_id, now_ts())
+    except asyncpg.UniqueViolationError:
+        return {"ok": False, "reason": "pending"}
+    u = await POOL.fetchrow("SELECT full_name, phone, telegram_id FROM users WHERE id=$1", user_db_id)
+    caption = (
+        f"👛 <b>Hamyonni to'ldirish (PENDING)</b>\n\n"
+        f"👤 {_h(u['full_name'] if u else '?')}\n"
+        f"📞 {_h((u['phone'] if u else '') or '-')}\n"
+        f"💰 Summa: <b>{_fmt_money(amount)}</b>\n"
+        f"🆔 So'rov: <code>W-{tx_id}</code>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"wapp_{tx_id}")],
+        [InlineKeyboardButton(text="❌ Rad etish", callback_data=f"wrej_{tx_id}")],
+    ])
+    photo = photo_id or BufferedInputFile(photo_bytes or b"", filename="chek.jpg")
+    try:
+        sent = await bot.send_photo(ADMIN_ID, photo=photo, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+        if not photo_id and getattr(sent, "photo", None):
+            await POOL.execute("UPDATE wallet_tx SET receipt_file_id=$1 WHERE id=$2", sent.photo[-1].file_id, tx_id)
+    except Exception:
+        logging.exception(f"Hamyon cheki adminga yuborilmadi (tx={tx_id})")
+        if not photo_id:
+            # chek hech qayerda saqlanmadi — so'rov bekor, o'quvchi qayta yuboradi
+            await POOL.execute("DELETE FROM wallet_tx WHERE id=$1 AND status='pending'", tx_id)
+            return {"ok": False, "reason": "send_failed"}
+    return {"ok": True, "tx_id": tx_id}
+
+
+@router.message(WalletState.receipt, F.photo)
+async def wallet_receipt_photo(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    amount = int(data.get("wallet_amount") or 0)
+    user_db_id = await get_user_db_id(message.from_user.id)
+    await state.clear()
+    if not user_db_id or amount <= 0:
+        return await message.answer("⚠️ So'rov topilmadi. «👛 Hamyonim» bo'limidan qaytadan boshlang.")
+    res = await wallet_create_topup(bot, user_db_id, amount, photo_id=message.photo[-1].file_id)
+    if not res["ok"]:
+        return await message.answer("🟡 Sizda tekshirilayotgan to'ldirish so'rovi bor. Admin javobini kuting.")
+    await message.answer(
+        f"✅ Chek qabul qilindi: <b>{_fmt_money(amount)}</b>\nAdmin tasdiqlagach balansingizga tushadi — "
+        f"sizga xabar keladi.", parse_mode=ParseMode.HTML)
+
+
+@router.message(WalletState.receipt)
+async def wallet_receipt_other(message: Message):
+    await message.answer("📸 Iltimos, to'lov chekining <b>rasmini</b> (skrinshot) yuboring.", parse_mode=ParseMode.HTML)
+
+
+async def wallet_decide_topup(tx_id: int, admin_tg: int, approve: bool, reason: str = "") -> dict | None:
+    async with POOL.acquire() as con:
+        async with con.transaction():
+            r = await con.fetchrow(
+                "UPDATE wallet_tx SET status=$2, decided_ts=$3, decided_by=$4, note=COALESCE($5, note) "
+                "WHERE id=$1 AND status='pending' AND kind='topup' RETURNING user_id, amount",
+                tx_id, "approved" if approve else "rejected", now_ts(), admin_tg, reason or None)
+            if not r:
+                return None
+            bal = await con.fetchval("SELECT COALESCE(balance,0) FROM users WHERE id=$1", r["user_id"])
+            if approve:
+                bal = await con.fetchval(
+                    "UPDATE users SET balance=COALESCE(balance,0)+$1 WHERE id=$2 RETURNING balance",
+                    r["amount"], r["user_id"])
+    tg = await POOL.fetchval("SELECT telegram_id FROM users WHERE id=$1", r["user_id"])
+    return {"user_id": r["user_id"], "amount": int(r["amount"]), "balance": int(bal or 0), "tg_id": tg}
+
+
+@router.callback_query(F.data.startswith("wapp_"))
+async def wallet_approve_cb(callback: CallbackQuery, bot: Bot):
+    if not await is_admin_user(callback.from_user.id):
+        return
+    tx_id = int(callback.data.split("_")[1])
+    res = await wallet_decide_topup(tx_id, callback.from_user.id, True)
+    if not res:
+        await _close_buttons(callback, "ℹ️ <b>Bu so'rov allaqachon ko'rib chiqilgan.</b>")
+        return await callback.answer("Bu so'rov allaqachon ko'rib chiqilgan.", show_alert=True)
+    await _close_buttons(callback, f"✅ <b>Tasdiqlandi</b> ({_h(now_str_local())}) — balans: {_fmt_money(res['balance'])}")
+    try:
+        await bot.send_message(
+            res["tg_id"],
+            f"✅ <b>Hamyoningiz to'ldirildi!</b>\n\n➕ {_fmt_money(res['amount'])}\n"
+            f"💰 Balans: <b>{_fmt_money(res['balance'])}</b>\n\n"
+            f"Endi pullik testlarni «🧾 Pullik testlar» bo'limidan bir zumda sotib olishingiz mumkin.",
+            parse_mode=ParseMode.HTML)
+    except (TelegramForbiddenError, TelegramBadRequest):
+        await callback.message.answer("⚠️ O'quvchiga xabar yetkazilmadi (botni bloklagan bo'lishi mumkin).")
+
+
+@router.callback_query(F.data.startswith("wrej_"))
+async def wallet_reject_ask(callback: CallbackQuery):
+    if not await is_admin_user(callback.from_user.id):
+        return
+    tx_id = int(callback.data.split("_")[1])
+    st = await POOL.fetchval("SELECT status FROM wallet_tx WHERE id=$1", tx_id)
+    if st != "pending":
+        await _close_buttons(callback, "ℹ️ <b>Bu so'rov allaqachon ko'rib chiqilgan.</b>")
+        return await callback.answer("Bu so'rov allaqachon ko'rib chiqilgan.", show_alert=True)
+    rows = [[InlineKeyboardButton(text=f"❌ {r}", callback_data=f"wrejr_{tx_id}_{i}")]
+            for i, r in enumerate(WALLET_REJECT_REASONS)]
+    rows.append([InlineKeyboardButton(text="✅ Baribir tasdiqlash", callback_data=f"wapp_{tx_id}")])
+    try:
+        await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    except TelegramBadRequest:
+        pass
+    await callback.answer("Rad etish sababini tanlang")
+
+
+@router.callback_query(F.data.startswith("wrejr_"))
+async def wallet_reject_cb(callback: CallbackQuery, bot: Bot):
+    if not await is_admin_user(callback.from_user.id):
+        return
+    _, tx_s, k_s = callback.data.split("_")
+    reason = WALLET_REJECT_REASONS[int(k_s)] if k_s.isdigit() and int(k_s) < len(WALLET_REJECT_REASONS) else ""
+    res = await wallet_decide_topup(int(tx_s), callback.from_user.id, False, reason)
+    if not res:
+        await _close_buttons(callback, "ℹ️ <b>Bu so'rov allaqachon ko'rib chiqilgan.</b>")
+        return await callback.answer("Bu so'rov allaqachon ko'rib chiqilgan.", show_alert=True)
+    await _close_buttons(callback, f"❌ <b>Rad etildi:</b> <i>{_h(reason)}</i>")
+    try:
+        await bot.send_message(
+            res["tg_id"],
+            f"❌ <b>Hamyonni to'ldirish rad etildi</b>\n\n💰 Summa: {_fmt_money(res['amount'])}\n"
+            f"📝 Sabab: <i>{_h(reason)}</i>\n\n«👛 Hamyonim» bo'limidan qayta yuborishingiz mumkin.",
+            parse_mode=ParseMode.HTML)
+    except (TelegramForbiddenError, TelegramBadRequest):
+        pass
+
+
+@router.callback_query(F.data.startswith("wview_"))
+async def wallet_view_cb(callback: CallbackQuery, bot: Bot):
+    if not await is_admin_user(callback.from_user.id):
+        return
+    tx_id = int(callback.data.split("_")[1])
+    r = await POOL.fetchrow("""
+        SELECT w.id, w.amount, w.status, w.receipt_file_id, w.created_ts, u.full_name, u.phone
+        FROM wallet_tx w JOIN users u ON u.id=w.user_id WHERE w.id=$1
+    """, tx_id)
+    if not r:
+        return await callback.answer("So'rov topilmadi.", show_alert=True)
+    caption = (f"👛 <b>Hamyonni to'ldirish</b> ({WALLET_STATUS_ICONS.get(r['status'], '')} {r['status']})\n\n"
+               f"👤 {_h(r['full_name'])}\n📞 {_h(r['phone'] or '-')}\n"
+               f"💰 Summa: <b>{_fmt_money(r['amount'])}</b>\n🆔 <code>W-{r['id']}</code>")
+    kb = None
+    if r["status"] == "pending":
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"wapp_{tx_id}")],
+            [InlineKeyboardButton(text="❌ Rad etish", callback_data=f"wrej_{tx_id}")]])
+    if r["receipt_file_id"]:
+        await bot.send_photo(callback.from_user.id, r["receipt_file_id"], caption=caption,
+                             parse_mode=ParseMode.HTML, reply_markup=kb)
+    else:
+        await callback.message.answer(caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def wallet_buy_test(bot: Bot | None, user_db_id: int, test_id: int) -> dict:
+    """Pullik testni balansdan sotib oladi (atomik). Natija:
+    {"ok": True, "payment_id", "balance", "price", "test"} yoki {"ok": False, "reason", ...}."""
+    if not user_db_id:
+        return {"ok": False, "reason": "no_user"}
+    t = await POOL.fetchrow("""
+        SELECT id, code, title, price, is_free, duration, questions_count, start_mode, start_ts, start_at,
+               COALESCE(is_hidden,0) AS is_hidden, COALESCE(is_closed,0) AS is_closed
+        FROM tests WHERE id=$1
+    """, test_id)
+    if not t or int(t["is_free"] or 0) == 1:
+        return {"ok": False, "reason": "not_found"}
+    if int(t["is_hidden"]) == 1:
+        return {"ok": False, "reason": "hidden"}
+    if int(t["is_closed"]) == 1:
+        return {"ok": False, "reason": "closed"}
+    if is_scheduled_expired(t["start_mode"], t["start_ts"], t["duration"])[0]:
+        return {"ok": False, "reason": "expired"}
+    price = max(0, int(t["price"] or 0))
+    async with POOL.acquire() as con:
+        async with con.transaction():
+            # foydalanuvchi qatori qulflanadi — bir vaqtdagi ikki bosish ikki marta yechmaydi
+            bal = int(await con.fetchval("SELECT COALESCE(balance,0) FROM users WHERE id=$1 FOR UPDATE",
+                                         user_db_id) or 0)
+            if await con.fetchval("SELECT 1 FROM payments WHERE user_id=$1 AND test_id=$2 AND status='approved'",
+                                  user_db_id, test_id):
+                return {"ok": False, "reason": "already"}
+            if await con.fetchval("SELECT 1 FROM payments WHERE user_id=$1 AND test_id=$2 AND status='pending'",
+                                  user_db_id, test_id):
+                return {"ok": False, "reason": "pending"}
+            if bal < price:
+                return {"ok": False, "reason": "low", "balance": bal, "price": price}
+            new_bal = await con.fetchval("UPDATE users SET balance=COALESCE(balance,0)-$1 WHERE id=$2 RETURNING balance",
+                                         price, user_db_id)
+            now_s = now_str_local()
+            pid = await con.fetchval(
+                "INSERT INTO payments (user_id, test_id, status, created_at, approved_at, amount, method) "
+                "VALUES ($1,$2,'approved',$3,$3,$4,'wallet') RETURNING id", user_db_id, test_id, now_s, price)
+            await con.execute(
+                "INSERT INTO wallet_tx (user_id, kind, amount, status, test_id, created_ts, decided_ts, note) "
+                "VALUES ($1,'purchase',$2,'approved',$3,$4,$4,$5)", user_db_id, -price, test_id, now_ts(),
+                f"payment:{pid}")
+    reminder = False
+    if (t["start_mode"] or "normal") == "scheduled" and is_scheduled_not_started(t["start_mode"], t["start_ts"])[0]:
+        await _set_reminder(user_db_id, test_id, True)
+        reminder = True
+    if bot is not None:
+        await _wallet_notify_purchase(bot, user_db_id, t, price)
+    return {"ok": True, "payment_id": pid, "balance": int(new_bal or 0), "price": price, "test": t,
+            "reminder": reminder}
+
+
+async def _wallet_notify_purchase(bot: Bot, user_db_id: int, t, price: int) -> None:
+    """Admin(lar)ga ma'lumot: test balansdan sotib olindi (tasdiqlash shart emas)."""
+    try:
+        u = await POOL.fetchrow("SELECT full_name FROM users WHERE id=$1", user_db_id)
+        routing = await _resolve_payment_routing(t["id"])
+        note = ""
+        if routing["share_reminder"] or routing["notify_tg_id"] != ADMIN_ID:
+            note = (f"\n\n💡 <i>Test egasi — {_h(routing['creator_name'])}. Pul platforma hamyonida: "
+                    f"tegishli ulushni o'ziga o'tkazib berishni unutmang.</i>")
+        text = (f"👛 <b>Balansdan sotib olindi</b>\n\n👤 {_h(u['full_name'] if u else '?')}\n"
+                f"📚 {_h(t['title'])} (<code>{t['code']}</code>)\n💰 {_fmt_money(price)}{note}")
+        for tg in dict.fromkeys([ADMIN_ID, routing["notify_tg_id"]]):
+            try:
+                await bot.send_message(tg, text, parse_mode=ParseMode.HTML)
+            except (TelegramForbiddenError, TelegramBadRequest):
+                pass
+    except Exception:
+        logging.exception("Balansdan xarid haqida adminga xabar yuborilmadi")
+
+
+def _purchase_access_text(t, payment_id: int, *, via_wallet: bool, balance: int | None = None,
+                          reminder: bool = False) -> tuple[str, InlineKeyboardMarkup]:
+    extra = ""
+    if (t["start_mode"] or "normal") == "scheduled":
+        extra = f"\n📅 Boshlanish: <b>{t['start_at']}</b>\n⚠️ PDF faqat vaqt yetganda beriladi."
+        if reminder:
+            extra += "\n🔔 Boshlanishidan 30 va 5 daqiqa oldin eslatma yuboriladi."
+    head = "✅ <b>Test balansdan sotib olindi!</b>" if via_wallet else "✅ <b>To‘lov tasdiqlandi!</b>"
+    bal_line = f"\n👛 Qolgan balans: <b>{_fmt_money(balance)}</b>" if balance is not None else ""
+    text = (f"{head}\n\n📚 Test: <b>{_h(t['title'])}</b>\n🔑 Kod: <code>{t['code']}</code>\n"
+            f"🧮 Savollar: <b>{t['questions_count']}</b>\n⏳ Vaqt: {t['duration']} daqiqa{bal_line}\n"
+            f"{extra}\n\n✅ Boshlash uchun tugmani bosing.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 Testni boshlash", callback_data=f"begin_{payment_id}")]])
+    return text, kb
+
+
+async def _wallet_offer(answerable, user_db_id: int, test_id: int) -> None:
+    """Pullik test to'lovi oynasidan oldin: balans yetsa — "Balansdan to'lash" tugmasi."""
+    price = int(await POOL.fetchval("SELECT COALESCE(price,0) FROM tests WHERE id=$1", test_id) or 0)
+    bal = await wallet_balance(user_db_id)
+    if bal >= price:
+        await answerable.answer(
+            f"👛 Hamyoningizda <b>{_fmt_money(bal)}</b> bor — testni chek yubormasdan, darhol sotib olishingiz mumkin:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                text=f"👛 Balansdan to'lash — {_fmt_money(price)}", callback_data=f"wbuy_{test_id}")]]))
+    elif bal > 0:
+        await answerable.answer(
+            f"👛 Balansingiz: <b>{_fmt_money(bal)}</b> (bu test uchun {_fmt_money(price - bal)} yetmaydi). "
+            f"Hamyonni to'ldirib, keyingi testlarni bir zumda sotib olishingiz mumkin.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                text="➕ Hamyonni to'ldirish", callback_data="wallet_topup")]]))
+
+
+@router.callback_query(F.data.startswith("wbuy_"))
+async def wallet_buy_cb(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if not await ensure_subscribed_callback(callback, bot):
+        return
+    test_id = int(callback.data.split("_")[1])
+    user_db_id = await get_user_db_id(callback.from_user.id)
+    res = await wallet_buy_test(bot, user_db_id, test_id)
+    if not res["ok"]:
+        msg = WALLET_BUY_ERRORS.get(res["reason"], "Sotib olib bo'lmadi.")
+        if res["reason"] == "low":
+            msg += f"\nBalans: {_fmt_money(res['balance'])}, kerak: {_fmt_money(res['price'])}."
+        return await callback.answer(msg, show_alert=True)
+    if (await state.get_state() or "") == PaymentState.waiting_for_screenshot.state:
+        await state.clear()
+    await _close_buttons(callback, f"✅ <b>Balansdan to'landi:</b> {_fmt_money(res['price'])}")
+    admin_flag = await is_admin_user(callback.from_user.id)
+    await callback.message.answer("✅ To'lov balansdan amalga oshirildi.", reply_markup=main_menu_kb(admin_flag))
+    text, kb = _purchase_access_text(res["test"], res["payment_id"], via_wallet=True, balance=res["balance"],
+                                     reminder=res["reminder"])
+    await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("wadj_"))
+async def wallet_adjust_start(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin_user(callback.from_user.id):
+        return
+    uid = int(callback.data.split("_")[1])
+    u = await POOL.fetchrow("SELECT full_name, COALESCE(balance,0) AS balance FROM users WHERE id=$1", uid)
+    if not u:
+        return await callback.answer("Foydalanuvchi topilmadi.", show_alert=True)
+    await state.set_state(WalletAdjState.amount)
+    await state.update_data(wadj_uid=uid)
+    await callback.message.answer(
+        f"👛 <b>{_h(u['full_name'])}</b> — balans: <b>{_fmt_money(u['balance'])}</b>\n\n"
+        f"Qo'shish uchun <code>+5000 sabab</code>, ayirish uchun <code>-5000 sabab</code> ko'rinishida yozing "
+        f"(masalan: <code>+20000 naqd to'ladi</code>).",
+        parse_mode=ParseMode.HTML, reply_markup=nav_kb(include_back=True))
+
+
+@router.message(WalletAdjState.amount)
+async def wallet_adjust_amount(message: Message, state: FSMContext, bot: Bot):
+    if not await is_admin_user(message.from_user.id):
+        await state.clear()
+        return
+    m = re.match(r"^\s*([+-])\s*(\d{1,3}(?: \d{3})+|\d+)\s*(?:so['’]?m\b)?\s*(.*)$", message.text or "", re.S)
+    amount = int(m.group(2).replace(" ", "")) if m else 0
+    if not m or amount <= 0 or amount > WALLET_TOPUP_MAX:
+        return await message.answer("⚠️ Format: <code>+5000 sabab</code> yoki <code>-5000 sabab</code>",
+                                    parse_mode=ParseMode.HTML)
+    delta = amount if m.group(1) == "+" else -amount
+    note = sanitize_plain_text(m.group(3) or "", max_len=200) or "Admin tuzatishi"
+    uid = int((await state.get_data()).get("wadj_uid") or 0)
+    async with POOL.acquire() as con:
+        async with con.transaction():
+            bal = await con.fetchval("SELECT COALESCE(balance,0) FROM users WHERE id=$1 FOR UPDATE", uid)
+            if bal is None:
+                await state.clear()
+                return await message.answer("Foydalanuvchi topilmadi.")
+            if int(bal) + delta < 0:
+                return await message.answer(f"⚠️ Balans manfiy bo'lib qoladi (hozir {_fmt_money(bal)}). Qayta yozing:")
+            new_bal = await con.fetchval("UPDATE users SET balance=COALESCE(balance,0)+$1 WHERE id=$2 RETURNING balance",
+                                         delta, uid)
+            await con.execute(
+                "INSERT INTO wallet_tx (user_id, kind, amount, status, created_ts, decided_ts, decided_by, note) "
+                "VALUES ($1,'adjust',$2,'approved',$3,$3,$4,$5)", uid, delta, now_ts(), message.from_user.id, note)
+    await state.clear()
+    admin_flag = await is_admin_user(message.from_user.id)
+    await message.answer(f"✅ Balans o'zgartirildi: {'+' if delta > 0 else '−'}{_fmt_money(abs(delta))}. "
+                         f"Yangi balans: <b>{_fmt_money(new_bal)}</b>",
+                         parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(admin_flag))
+    tg = await POOL.fetchval("SELECT telegram_id FROM users WHERE id=$1", uid)
+    try:
+        await bot.send_message(
+            tg, f"👛 <b>Hamyoningiz yangilandi</b>\n\n{'➕' if delta > 0 else '➖'} {_fmt_money(abs(delta))}\n"
+                f"📝 {_h(note)}\n💰 Balans: <b>{_fmt_money(new_bal)}</b>", parse_mode=ParseMode.HTML)
+    except (TelegramForbiddenError, TelegramBadRequest):
+        pass
+
+
 # ===================== ADMIN: PENDING =====================
 @router.message(F.text == BTN_ADMIN_PENDING)
 async def admin_pending(message: Message):
@@ -8406,11 +10155,24 @@ async def admin_pending(message: Message):
         LIMIT 30
     """)
 
-    if not rows:
+    wrows = await POOL.fetch("""
+        SELECT w.id, w.amount, w.created_ts, u.full_name
+        FROM wallet_tx w JOIN users u ON u.id=w.user_id
+        WHERE w.status='pending' AND w.kind='topup' ORDER BY w.id DESC LIMIT 20
+    """)
+    if not rows and not wrows:
         return await message.answer("🟡 Pending to‘lovlar yo‘q.")
 
-    text = "<b>🟡 Pending to‘lovlar (oxirgi 30 ta)</b>\n\n"
+    text = "<b>🟡 Pending to‘lovlar (oxirgi 30 ta)</b>\n\n" if rows else ""
     kb = InlineKeyboardMarkup(inline_keyboard=[])
+    if wrows:
+        text += "<b>👛 Hamyonni to'ldirish so'rovlari</b>\n"
+        for r in wrows:
+            dt = datetime.fromtimestamp(int(r["created_ts"] or 0), TZ).strftime("%m-%d %H:%M")
+            text += f"🆔 <code>W-{r['id']}</code> · {_h(r['full_name'])} · <b>{_fmt_money(r['amount'])}</b> · {dt}\n"
+            kb.inline_keyboard.append([InlineKeyboardButton(text=f"👛 Ko‘rish: W-{r['id']}",
+                                                            callback_data=f"wview_{r['id']}")])
+        text += "\n"
     for r in rows:
         pid, uname, code, title, price, created_at = (
             r["id"], r["full_name"], r["code"], r["title"], r["price"], r["created_at"]
@@ -9225,9 +10987,12 @@ async def user_profile_view(callback: CallbackQuery, bot: Bot):
         f"🗓 Ro'yxatdan o'tgan: {reg_at}\n\n"
         f"📄 Topshirgan testlar: <b>{results_count}</b> (o'rtacha {float(avg_pct or 0):.1f}%)\n"
         f"💳 To'lovlar: ✅ {approved} | 🟡 {pending}\n"
-        f"💰 Jami to'lagan: <b>{_fmt_money(spent)}</b>"
+        f"💰 Jami to'lagan: <b>{_fmt_money(spent)}</b>\n"
+        f"👛 Hamyon balansi: <b>{_fmt_money(u['balance'])}</b>"
     )
-    await callback.message.answer(text, parse_mode=ParseMode.HTML)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👛 Balansni o'zgartirish", callback_data=f"wadj_{uid}")]])
+    await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 # ===================== ADMIN: BARCHAGA XABAR YUBORISH (REKLAMA) =====================
@@ -9378,6 +11143,19 @@ async def finance_report(callback: CallbackQuery):
         f"📅 Bugun: <b>{_fmt_money(today)}</b>\n"
         f"🗓 So'nggi 7 kun: <b>{_fmt_money(week)}</b>\n"
     )
+    w = await POOL.fetchrow("""
+        SELECT COALESCE(SUM(amount) FILTER (WHERE kind='topup' AND status='approved'),0) AS topups,
+               COALESCE(-SUM(amount) FILTER (WHERE kind='purchase' AND status='approved'),0) AS spent,
+               COUNT(*) FILTER (WHERE kind='topup' AND status='pending') AS pending
+        FROM wallet_tx
+    """)
+    held = await POOL.fetchval("SELECT COALESCE(SUM(balance),0) FROM users")
+    text += (f"\n👛 <b>Hamyonlar</b>\n"
+             f"• To'ldirilgan: <b>{_fmt_money(w['topups'])}</b>\n"
+             f"• Testlarga sarflangan: <b>{_fmt_money(w['spent'])}</b>\n"
+             f"• Hamyonlarda qoldiq: <b>{_fmt_money(held)}</b>\n")
+    if w["pending"]:
+        text += f"• 🟡 Tekshirilmagan to'ldirishlar: {w['pending']} ta\n"
     if top_tests:
         text += "\n🏅 <b>Eng ko'p sotilgan testlar:</b>\n"
         for r in top_tests:
@@ -9621,6 +11399,10 @@ async def anticheat_b_file(message: Message, state: FSMContext):
     t = await POOL.fetchrow("SELECT questions_count, answers FROM tests WHERE id=$1", test_id)
     if t:
         qcount, a_key = int(t["questions_count"] or 0), normalize_answers(t["answers"] or "")
+    problem = _upload_problem(message, "doc")
+    if problem:
+        return await message.answer(problem, parse_mode=ParseMode.HTML)
+    _warm_file_later(message.bot, message.document.file_id)
     await state.update_data(ac_b_file=message.document.file_id)
     await state.set_state(AntiCheatState.b_answers)
     xs = open_question_positions(a_key)
@@ -9757,12 +11539,16 @@ async def edittest_save_file(message: Message, state: FSMContext):
             await state.clear()
             return await message.answer("⚠️ Bu testni tahrirlashga ruxsatingiz yo'q.")
 
+    problem = _upload_problem(message, "any")
+    if problem:
+        return await message.answer(problem, parse_mode=ParseMode.HTML)
     if message.document:
         file_id = message.document.file_id
     elif message.audio:
         file_id = message.audio.file_id
     else:
         file_id = message.video.file_id
+    _warm_file_later(message.bot, file_id)
 
     await POOL.execute("UPDATE tests SET file_id=$1 WHERE id=$2", file_id, test_id)
     await state.clear()
@@ -9991,6 +11777,10 @@ async def staged_edit_file(message: Message, state: FSMContext) -> None:
 
     cfg = data["stagedit_cfg"]
     key = data["stagedit_key"]
+    problem = _upload_problem(message, "media" if (field == "file" and key == "listening") else "doc")
+    if problem:
+        return await message.answer(problem, parse_mode=ParseMode.HTML)
+    _warm_file_later(message.bot, (message.document or message.audio or message.video).file_id)
 
     if field == "question_file":
         file_id = message.document.file_id if message.document else (
@@ -10157,7 +11947,7 @@ async def staged_edit_text(message: Message, state: FSMContext) -> None:
         cfg["sections"][key] = section
         await state.update_data(stagedit_cfg=cfg)
 
-        if GEMINI_API_KEY:
+        if _ai_can_grade(section.get("type")):
             kb = InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="🤖 AI avtomatik tekshirsin", callback_data="edtg_grader_ai"),
                 InlineKeyboardButton(text="👤 O'zim/ustoz qo'lda", callback_data="edtg_grader_manual"),
@@ -11001,7 +12791,9 @@ async def set_duration_and_qcount(message: Message, state: FSMContext):
 async def _ask_exam_type(answerable, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Oddiy test", callback_data="etype_simple")],
-        [InlineKeyboardButton(text="⚡ Rasch (MS)", callback_data="etype_rasch")],
+        [InlineKeyboardButton(text="⚡ Milliy sertifikat (Rasch)", callback_data="etype_rasch")],
+        [InlineKeyboardButton(text="🇺🇿 Milliy sertifikat: Ona tili (test + esse)", callback_data="etype_msona")],
+        [InlineKeyboardButton(text="✍️ Esse (Milliy sertifikat mezoni)", callback_data="etype_msessay")],
         [InlineKeyboardButton(text="📚 DTM (5 fan, 1 sessiya)", callback_data="etype_dtm")],
         [InlineKeyboardButton(text="🎯 DTM (5 bosqich, alohida vaqt)", callback_data="etype_dtmstaged")],
         [InlineKeyboardButton(text="🎓 CEFR (ko'nikmalar, alohida vaqt)", callback_data="etype_cefr4")],
@@ -11012,9 +12804,13 @@ async def _ask_exam_type(answerable, state: FSMContext):
     await answerable.answer(
         "5-qadam: <b>baholash rejimini tanlang</b>\n\n"
         "📝 <b>Oddiy</b> — har savol 1 ball, natija oddiy foizda.\n"
-        "⚡ <b>Rasch (MS)</b> — natija guruhga nisbatan statistik baholanadi "
-        "(milliy sertifikat uslubiga yaqin); istalgan guruh kattaligida (1 kishidan "
-        "minglab kishigacha) ishlaydi.\n"
+        "⚡ <b>Milliy sertifikat (Rasch)</b> — matematika, tarix, kimyo, biologiya, fizika va boshqa "
+        "fanlar: natija guruhga nisbatan 75 ballik shkalada (A+ … C) baholanadi; istalgan guruh kattaligida "
+        "ishlaydi.\n"
+        "🇺🇿 <b>Ona tili (test + esse)</b> — Rasch test qismi + esse; esseni AI yoki ustoz 24 ballik mezonda "
+        "baholaydi, yakuniy ball birlashtiriladi.\n"
+        "✍️ <b>Esse</b> — faqat esse: o'quvchi mavzu bo'yicha yozadi (matn yoki qo'lyozma rasmi), AI/ustoz "
+        "baholaydi.\n"
         "📚 <b>DTM (5 fan, 1 sessiya)</b> — 90 savol bitta yaxlit vaqt ichida.\n"
         "🎯 <b>DTM (5 bosqich)</b> — xuddi shu 5 fan, lekin har biri O'Z ALOHIDA "
         "vaqtida ketma-ket topshiriladi (haqiqiy DTM tartibiga yaqin); xohlagan fan(lar)ni "
@@ -11064,6 +12860,13 @@ async def set_exam_type(callback: CallbackQuery, state: FSMContext):
         )
         await start_staged_wizard(callback, state, "cefr4")
         return
+    if et == "msessay":
+        await callback.message.answer(
+            "✅ <b>Esse (Milliy sertifikat mezoni)</b> tanlandi. Vaqt, mavzu va baholovchini so'rayman.",
+            parse_mode=ParseMode.HTML
+        )
+        await start_staged_wizard(callback, state, "ms_essay")
+        return
     if et == "satstaged":
         await callback.message.answer(
             "✅ <b>SAT (2 bosqich)</b> tanlandi. Reading&Writing va Math uchun alohida so'rayman.",
@@ -11087,8 +12890,15 @@ async def set_exam_type(callback: CallbackQuery, state: FSMContext):
         )
 
     elif et == "rasch":
-        await state.update_data(exam_type="rasch", dtm_cfg=None)
-        await callback.message.answer("✅ <b>Rasch (MS)</b> rejimi tanlandi.", parse_mode=ParseMode.HTML)
+        await state.update_data(exam_type="rasch", dtm_cfg=None, essay_mode=False, essay_cfg=None)
+        await callback.message.answer("✅ <b>Milliy sertifikat (Rasch)</b> rejimi tanlandi.", parse_mode=ParseMode.HTML)
+    elif et == "msona":
+        await state.update_data(exam_type="rasch", dtm_cfg=None, essay_mode=True, essay_cfg=None)
+        await callback.message.answer(
+            "✅ <b>Milliy sertifikat: Ona tili</b> tanlandi — avval test qismi (Rasch), oxirida esse mavzusini "
+            "so'rayman.\n\n<i>Rasmiy tuzilma: 45 ta topshiriq (35 yopiq, 10 ochiq, shundan biri esse), 180 daqiqa. "
+            "Vaqt test va esse uchun umumiy — o'quvchi test qismini topshirgach qolgan vaqtda esse yozadi.</i>",
+            parse_mode=ParseMode.HTML)
     elif et == "sat":
         await state.update_data(exam_type="sat", dtm_cfg=None)
         await callback.message.answer(
@@ -11097,7 +12907,7 @@ async def set_exam_type(callback: CallbackQuery, state: FSMContext):
             parse_mode=ParseMode.HTML
         )
     else:
-        await state.update_data(exam_type="simple", dtm_cfg=None)
+        await state.update_data(exam_type="simple", dtm_cfg=None, essay_mode=False, essay_cfg=None)
         await callback.message.answer("✅ <b>Oddiy</b> rejim tanlandi.", parse_mode=ParseMode.HTML)
 
     await _ask_duration_and_qcount(callback.message, state)
@@ -11194,7 +13004,11 @@ async def _nav_show_answers(answerable, state: FSMContext) -> None:
 
 @router.message(AdminAddTestState.file, F.document)
 async def set_file(message: Message, state: FSMContext):
+    problem = _upload_problem(message, "doc")
+    if problem:
+        return await message.answer(problem, parse_mode=ParseMode.HTML)
     await state.update_data(file_id=message.document.file_id)
+    _warm_file_later(message.bot, message.document.file_id)
     await message.answer("✅ Fayl qabul qilindi.")
     await _nav_push(state, "base", "file")
     await _nav_show_answers(message, state)
@@ -11260,6 +13074,13 @@ async def _finish_base_test_creation(
     message: Message, state: FSMContext, answers: str, open_ref_json: str | None, bot: Bot | None = None
 ) -> None:
     data = await state.get_data()
+    if data.get("essay_mode") and not data.get("essay_cfg"):
+        # Ona tili: test qismi tayyor — endi esse mavzusi, baholovchi va ulushi so'raladi
+        await state.update_data(essay_pending_answers=answers, essay_pending_open_ref=open_ref_json,
+                                essay_creator_tg=message.from_user.id)
+        await _ask_essay_prompt(message, state)
+        return
+    creator_tg = int(data.get("essay_creator_tg") or message.from_user.id)
     qcount = int(data.get("questions_count") or 30)
     is_free = int(data.get("is_free") or 0)
     price = 0 if is_free else int(data.get("price") or 0)
@@ -11275,9 +13096,9 @@ async def _finish_base_test_creation(
         INSERT INTO tests (
             code, title, subject, price, duration, questions_count, file_id, answers, is_free,
             start_mode, start_ts, start_at,
-            exam_type, dtm_cfg, creator_id, created_ts, open_ref_answers, show_review
+            exam_type, dtm_cfg, creator_id, created_ts, open_ref_answers, show_review, essay_cfg
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
         RETURNING id
     """,
         data.get("code"),
@@ -11294,10 +13115,11 @@ async def _finish_base_test_creation(
         start_at,
         exam_type,
         dtm_cfg,
-        message.from_user.id,
+        creator_tg,
         now_ts(),
         open_ref_json,
         0 if int(data.get("show_review", 1)) == 0 else 1,
+        data.get("essay_cfg") if data.get("essay_mode") else None,
     )
 
     extra = ""
@@ -11305,8 +13127,13 @@ async def _finish_base_test_creation(
         extra = f"\n📅 Boshlanish: <b>{start_at}</b>"
     if int(data.get("show_review", 1)) == 0:
         extra += "\n🔒 Javoblar tahlili: <b>yopiq</b> (o'quvchi faqat sonlarni ko'radi)"
+    ecfg = _essay_cfg_of(data.get("essay_cfg")) if data.get("essay_mode") else {}
+    if ecfg:
+        extra += (f"\n✍️ Esse: <i>{_h(ecfg['prompt'][:200])}</i>\n   baholovchi: "
+                  f"<b>{'🤖 AI' if ecfg.get('grader') == 'ai' else '👤 ustoz'}</b>, yakuniy balldagi ulushi: "
+                  f"<b>{int(round(float(ecfg.get('weight') or 0.5) * 100))}%</b>")
 
-    admin_flag = await is_admin_user(message.from_user.id)
+    admin_flag = await is_admin_user(creator_tg)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎓 Sertifikat sozlamalari (ixtiyoriy)", callback_data=f"certcfg_start_{new_test_id}")]
     ])
@@ -11558,6 +13385,11 @@ async def creator_test_stat_cb(callback: CallbackQuery):
     ])
     if exam_type == 'rasch':
         kb.inline_keyboard.append([InlineKeyboardButton(text="⚡ Rasch hisobot", callback_data=f"raschrep_{test_id}")])
+        if _essay_cfg_of(await POOL.fetchval("SELECT essay_cfg FROM tests WHERE id=$1", test_id)):
+            n_es = await POOL.fetchval(
+                "SELECT COUNT(*) FROM results WHERE test_id=$1 AND essay_status='pending'", test_id)
+            kb.inline_keyboard.append([InlineKeyboardButton(text=f"✍️ Esselar (kutmoqda: {n_es})",
+                                                            callback_data=f"esl_{test_id}")])
     open_pending_n = await POOL.fetchval(
         "SELECT COUNT(*) FROM results WHERE test_id=$1 AND COALESCE(open_pending,0)>0", test_id)
     if open_pending_n:
@@ -11785,7 +13617,7 @@ async def stage_attempt_detail(callback: CallbackQuery) -> None:
                 msg += f"💬 {_h(v['feedback'])}\n"
             await callback.message.answer(msg, parse_mode=ParseMode.HTML)
             if v.get("voice_id"):
-                await callback.message.answer_voice(v["voice_id"])
+                await _send_voice_answer(callback.message, v)
 
 
 async def _send_delete_confirm(answerable, test_id: int):
@@ -12170,7 +14002,9 @@ async def help_menu(message: Message):
         "1️⃣ Testni tanlab «Sotib olish»ni bosing.\n"
         "2️⃣ Ko'rsatilgan karta raqamiga to'lov qiling.\n"
         "3️⃣ To'lov chekini (skrinshot) botga yuboring.\n"
-        "4️⃣ Admin tasdiqlagach, test <b>«📦 Pullik testlarim»</b> bo'limida ochiladi.\n\n"
+        "4️⃣ Admin tasdiqlagach, test <b>«📦 Pullik testlarim»</b> bo'limida ochiladi.\n"
+        "⚡ Tezroq: <b>👛 Hamyonim</b>ni bir marta to'ldirsangiz, pullik testlarni chek kutmasdan "
+        "<b>balansdan bir zumda</b> sotib olasiz.\n\n"
 
         "<b>5. O'zingiz test yaratish</b> (barcha ro'yxatdan o'tgan foydalanuvchilar uchun)\n"
         "• <b>➕ Test yaratish</b> — o'zingiz test tuzib ulashishingiz mumkin, kuniga 10 tagacha "
@@ -12183,15 +14017,19 @@ async def help_menu(message: Message):
         "<b>✏️ tahrirlash</b>, <b>🛑 vaqtincha yakunlash/qayta ochish</b>, <b>🎓 sertifikat ko'rinishini "
         "sozlash</b> (o'quv markazi nomi, mas'ul shaxs, rangi) va kerak bo'lsa <b>🗑 o'chirish</b>.\n"
         "• Shu yerda: <b>🔗 test havolasi</b> (bosilsa test darhol ochiladi), <b>📑 nusxa olish</b> va "
-        "<b>🛡 ko'chirishga qarshi</b> (fayl himoyasi, A/B variant).\n\n"
+        "<b>🛡 ko'chirishga qarshi</b> (fayl himoyasi, A/B variant).\n"
+        "• <b>Milliy sertifikat</b>: barcha fanlar uchun Rasch (75 ball, A+…C); <b>Ona tili</b> uchun test + "
+        "<b>esse</b>, alohida <b>Esse</b> turi ham bor — esseni AI (Claude) yoki ustoz 24 ballik mezonda baholaydi.\n\n"
 
         "<b>6. Reyting va profil</b>\n"
         "• <b>📄 Natijalarim</b> — shaxsiy statistikangiz va topshirgan testlaringiz tarixi.\n"
         "• <b>🏆 Reyting</b> — umumiy va test bo'yicha eng yaxshi natijalar.\n"
-        "• <b>👤 Profilim</b> — ism-familiya va telefon raqamini o'zgartirish.\n\n"
+        "• <b>👤 Profilim</b> — ism-familiya va telefon raqamini o'zgartirish.\n"
+        "• <b>👛 Hamyonim</b> — balans, to'ldirish (chek bilan) va amallar tarixi.\n\n"
 
-        "🔁 <b>Navigatsiya:</b> istalgan vaqtda «🏠 Bosh menyu» tugmasidan foydalaning; test yaratishda "
-        "«🔄 Boshidan boshlash» bitta qadam orqaga qaytaradi.\n\n"
+        "🔁 <b>Navigatsiya:</b> menyu bo'limlari bitta xabarda ochiladi (chat toza qoladi), «🔙 Orqaga» — "
+        "oldingi ekran; test yaratishda «🔄 Boshidan boshlash» bitta qadam orqaga qaytaradi.\n"
+        "📱 <b>Mini App</b>da test, Listening, Speaking (ovoz yozish), esse, to'lov va hamyon — hammasi ilovaning o'zida.\n\n"
 
         "📞 <b>Aloqa:</b> pastdagi «✉️ Admin bilan bog'lanish» tugmasi orqali to'g'ridan-to'g'ri yozishingiz "
         "mumkin, yoki:\n"
@@ -12351,10 +14189,10 @@ async def certificate_daemon(bot: Bot):
 # ===================== MA'LUMOTLAR BAZASI ZAXIRA NUSXASI (BACKUP) =====================
 BACKUP_TABLES = [
     "users", "tests", "payments", "results", "sessions", "required_channels", "user_limits",
-    "staged_attempts", "retake_grants", "test_reminders", "suspicious_events",
+    "staged_attempts", "retake_grants", "test_reminders", "suspicious_events", "wallet_tx",
 ]
 # Eski zaxira fayllarida bo'lmagan jadvallar (ular bo'lmasa ham tiklash ishlaydi)
-BACKUP_OPTIONAL_TABLES = {"retake_grants", "test_reminders", "suspicious_events"}
+BACKUP_OPTIONAL_TABLES = {"retake_grants", "test_reminders", "suspicious_events", "wallet_tx"}
 
 
 async def _run_db_backup(bot: Bot, requester_tg_id: int | None = None):
@@ -12425,7 +14263,7 @@ async def backup_now(callback: CallbackQuery, bot: Bot):
 # amal bo'lgani uchun har doim aniq tasdiqlash bosqichidan o'tadi.
 _TABLES_WITH_SERIAL_ID = [
     "users", "tests", "payments", "results", "sessions", "required_channels", "staged_attempts",
-    "suspicious_events",
+    "suspicious_events", "wallet_tx",
 ]
 
 
@@ -12886,7 +14724,7 @@ async def profile_menu(message: Message, state: FSMContext):
         return await message.answer("Avval /start orqali ro'yxatdan o'ting.")
 
     row = await POOL.fetchrow(
-        "SELECT full_name, phone, region, age, school, grade, payment_card "
+        "SELECT full_name, phone, region, age, school, grade, payment_card, COALESCE(balance,0) AS balance "
         "FROM users WHERE telegram_id=$1",
         message.from_user.id
     )
@@ -12919,6 +14757,7 @@ async def profile_menu(message: Message, state: FSMContext):
         f"👤 <b>Sizning profilingiz:</b>\n\n"
         f"Ism: <b>{fname}</b>\n"
         f"Telefon: <b>{phone}</b>\n"
+        f"👛 Balans: <b>{_fmt_money(row['balance'])}</b>\n"
         f"{card_block}\n"
         f"<i>Quyidagilar ixtiyoriy — xohlasangiz to'ldiring:</i>\n"
         f"Viloyat: <b>{region}</b>\n"
@@ -13244,6 +15083,19 @@ _STATE_HINTS = {
 }
 
 
+@router.message(F.contact)
+async def contact_shared_anywhere(message: Message):
+    """Mini App'da «Telegram raqamimni ulashish» bosilganda kontakt chatga ham
+    keladi — ro'yxatdan o'tgan bo'lsa raqam yangilanadi, aks holda jim o'tiladi."""
+    c = message.contact
+    if not c or c.user_id != message.from_user.id:
+        return
+    upd = await POOL.execute("UPDATE users SET phone=$1 WHERE telegram_id=$2 AND COALESCE(full_name,'')<>''",
+                             c.phone_number, message.from_user.id)
+    if not upd.endswith(" 0"):
+        await message.answer("📱 Telefon raqamingiz saqlandi.")
+
+
 @router.message(StateFilter("*"))
 async def fallback_message(message: Message, state: FSMContext):
     st = await state.get_state()
@@ -13360,13 +15212,17 @@ async def _webapp_auth_user_row(request: web.Request):
 
 
 WEB_EXAM_LABELS = {
-    "simple": "Oddiy test", "rasch": "Rasch (MS)", "dtm": "DTM (5 fan)", "cefr": "CEFR", "ielts": "IELTS",
-    "sat": "SAT", "dtm_staged": "DTM (5 bosqich)", "ielts4": "IELTS (4 ko'nikma)",
-    "cefr4": "CEFR (4 ko'nikma)", "sat_staged": "SAT (R&W + Math)",
+    "simple": "Oddiy test", "rasch": "Milliy sertifikat (Rasch)", "dtm": "DTM (5 fan)", "cefr": "CEFR",
+    "ielts": "IELTS", "sat": "SAT", "dtm_staged": "DTM (5 bosqich)", "ielts4": "IELTS (4 ko'nikma)",
+    "cefr4": "CEFR (4 ko'nikma)", "sat_staged": "SAT (R&W + Math)", "ms_essay": "Esse (Milliy sertifikat)",
 }
 WEB_DEADLINE_TASKS: dict[tuple[int, int], asyncio.Task] = {}
 WEB_DEADLINE_GRACE_SEC = 20   # ilova o'zi topshirishga ulgurmasa (internet uzilgan) — server topshiradi
-WEB_FILE_CACHE_DIR = os.path.join(tempfile.gettempdir(), "edutest_webapp_files")
+# ✅ Doimiy kesh papkasi (/tmp emas — u server qayta ishga tushganda yoki
+# tizim tomonidan tozalanadi). WEBAPP_CACHE_DIR bilan o'zgartirish mumkin.
+WEB_FILE_CACHE_DIR = _env("WEBAPP_CACHE_DIR", "") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "webapp_cache")
+WEB_CACHE_KEEP_DAYS = 120
 WEB_MAX_PHOTO_BYTES = 10 * 1024 * 1024
 WEB_RATE_WINDOW_SEC = 60
 WEB_RATE_LIMIT = 240          # avtomatik saqlash bilan birga ham bemalol yetadi
@@ -13697,10 +15553,10 @@ WEB_STATE_MESSAGES = {
     "not_started": "Test hali boshlanmagan.",
     "expired": "Bu testning vaqti tugagan.",
     "broken": "Test noto'g'ri sozlangan (javob kaliti savollar soniga mos emas). Ustozga xabar bering.",
-    "need_payment": "Bu test pullik. To'lov bot orqali qilinadi: «🧾 Pullik testlar» bo'limi.",
+    "need_payment": "Bu test pullik. Shu yerning o'zida hamyon balansidan yoki chek yuborib to'lashingiz mumkin.",
     "payment_pending": "To'lov chekingiz tekshirilmoqda. Tasdiqlangach shu yerda boshlay olasiz.",
-    "payment_rejected": "To'lovingiz rad etilgan. Botdagi «📦 Pullik testlarim» orqali qayta yuboring.",
-    "pending_review": "Javoblaringiz yuborilgan — ustoz baholayapti. Natija botga keladi.",
+    "payment_rejected": "To'lovingiz rad etilgan. Pastdan qayta chek yuborishingiz yoki balansdan to'lashingiz mumkin.",
+    "pending_review": "Javoblaringiz yuborilgan — ustoz (yoki AI) baholayapti. Natija tayyor bo'lgach shu yerda ko'rinadi.",
     "staged_done": "Siz bu imtihonni topshirgansiz. Xohlasangiz qaytadan yechishingiz mumkin (eski natija saqlanadi).",
 }
 
@@ -13744,39 +15600,114 @@ async def _web_deadline(bot: Bot, tg_id: int, test_id: int, end_ts: int) -> None
 
 # ----- Fayllar (test PDF, Listening audio) -----
 def _web_sniff_type(head: bytes, kind: str | None) -> str:
-    if head.startswith(b"%PDF"):
+    if head.startswith(b"%PDF") or b"%PDF" in head[:1024]:
         return "application/pdf"
     if head.startswith(b"RIFF") and head[8:12] == b"WAVE":
         return "audio/wav"
+    if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+        return "image/webp"
     if head.startswith(b"OggS"):
         return "audio/ogg"
-    if head.startswith(b"ID3") or head[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+    if head.startswith(b"fLaC"):
+        return "audio/flac"
+    if head.startswith(b"ID3"):
         return "audio/mpeg"
+    if len(head) > 1 and head[0] == 0xFF and (head[1] & 0xF6) == 0xF0:
+        return "audio/aac"      # ADTS AAC
+    if len(head) > 1 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0:
+        return "audio/mpeg"     # MP3 kadr sinxroni
     if head[4:8] == b"ftyp":
-        return "audio/mp4" if kind == "audio" else "video/mp4"
+        brand = head[8:12]
+        if kind == "audio" or brand in (b"M4A ", b"M4B "):
+            return "audio/mp4"
+        return "video/mp4"
+    if head.startswith(b"\x1a\x45\xdf\xa3"):
+        return "audio/webm" if kind == "audio" else "video/webm"
     if head.startswith(b"\x89PNG"):
         return "image/png"
     if head.startswith(b"\xff\xd8"):
         return "image/jpeg"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
     return "application/octet-stream"
 
 
 async def _web_fetch_file(bot: Bot, file_id: str) -> str:
-    os.makedirs(WEB_FILE_CACHE_DIR, exist_ok=True)
+    try:
+        os.makedirs(WEB_FILE_CACHE_DIR, exist_ok=True)
+        cache_dir = WEB_FILE_CACHE_DIR
+    except OSError:
+        cache_dir = os.path.join(tempfile.gettempdir(), "edutest_webapp_files")
+        os.makedirs(cache_dir, exist_ok=True)
     name = hashlib.sha256(file_id.encode()).hexdigest()[:48]
-    path = os.path.join(WEB_FILE_CACHE_DIR, name)
+    path = os.path.join(cache_dir, name)
     async with _web_file_locks[name]:
-        if not os.path.exists(path):
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            last_err = None
+            for attempt in range(3):
+                try:
+                    tg_file = await bot.get_file(file_id)
+                    tmp = path + ".part"
+                    await bot.download_file(tg_file.file_path, destination=tmp, timeout=180)
+                    os.replace(tmp, path)
+                    last_err = None
+                    break
+                except TelegramBadRequest as e:
+                    if "too big" in str(e).lower():
+                        raise WebError("file_too_big", "Fayl juda katta (20 MB dan ortiq). Ustozingizdan faylni "
+                                                       "siqib qayta yuklashni so'rang.", 413)
+                    raise
+                except Exception as e:      # tarmoq uzilishi — qayta urinamiz
+                    last_err = e
+                    await asyncio.sleep(1.5 * (attempt + 1))
+            if last_err is not None:
+                raise last_err
+        else:
             try:
-                tg_file = await bot.get_file(file_id)
-            except TelegramBadRequest as e:
-                if "too big" in str(e).lower():
-                    raise WebError("file_too_big", "Fayl juda katta (20 MB dan ortiq) — uni botdan oling.", 413)
-                raise
-            tmp = path + ".part"
-            await bot.download_file(tg_file.file_path, destination=tmp)
-            os.replace(tmp, path)
+                os.utime(path)      # ishlatilgan fayl keshda uzoqroq qolsin
+            except OSError:
+                pass
     return path
+
+
+def _web_cache_cleanup() -> None:
+    """Uzoq vaqt ishlatilmagan kesh fayllarini o'chiradi (disk to'lib qolmasin)."""
+    cutoff = time.time() - WEB_CACHE_KEEP_DAYS * 86400
+    try:
+        for name in os.listdir(WEB_FILE_CACHE_DIR):
+            p = os.path.join(WEB_FILE_CACHE_DIR, name)
+            if os.path.isfile(p) and (name.endswith(".part") or os.path.getmtime(p) < cutoff):
+                os.remove(p)
+    except OSError:
+        pass
+
+
+async def _web_warm_cache(bot: Bot) -> None:
+    """Ishga tushganda: so'nggi 60 kunda yaratilgan/ishlatilgan testlar fayllarini
+    fonda keshga olib qo'yadi — o'quvchi ochganda Telegram'dan kutib qolmaydi."""
+    await asyncio.sleep(20)
+    _web_cache_cleanup()
+    since = now_ts() - 60 * 86400
+    rows = await POOL.fetch("""
+        SELECT DISTINCT t.id, t.file_id, t.b_file_id, t.skills_cfg FROM tests t
+        LEFT JOIN results r ON r.test_id=t.id
+        WHERE COALESCE(t.is_hidden,0)=0 AND (t.created_ts >= $1 OR r.finished_ts >= $1)
+    """, since)
+    ids = []
+    for r in rows:
+        ids += [r["file_id"], r["b_file_id"]]
+        cfg = _load_skills_cfg(r["skills_cfg"])
+        for sec in (cfg.get("sections") or {}).values():
+            ids += [sec.get("file_id"), sec.get("question_file_id")]
+    done = 0
+    for fid in dict.fromkeys(f for f in ids if f):
+        try:
+            await _web_fetch_file(bot, fid)
+            done += 1
+        except Exception:
+            pass
+        await asyncio.sleep(0.3)
+    logging.info(f"Mini App kesh: {done} ta fayl tayyor")
 
 
 # ----- Bitta sessiyali testlar (oddiy, DTM, Rasch, SAT, CEFR, IELTS) -----
@@ -13889,9 +15820,11 @@ async def _web_result_view(user_db_id: int, test_id: int) -> dict:
         view["subjects"] = (_load_json_dict(r["details"]) or {}).get("subjects") or []
     review_allowed = True
     if et == "rasch":
+        view["essay"] = await _web_essay_view(user_db_id, test_id)
         finalized = int(t["rush_finalized"]) == 1
         view["rasch"] = {"finalized": finalized, "ball": r["rasch_ball"], "percent": r["rasch_percent"],
-                         "grade": r["grade"], "remain_text": None if finalized else await remaining_time_text(test_id)}
+                         "grade": r["grade"], "remain_text": None if finalized else await remaining_time_text(test_id),
+                         "test_ball": await POOL.fetchval("SELECT test_ball FROM results WHERE id=$1", r["id"])}
         end_ts = await get_test_end_ts(test_id)
         review_allowed = end_ts > 0 and now_ts() >= end_ts
     # ✅ O'qituvchi javoblar tahlilini yopgan bo'lsa — faqat sonlar ko'rinadi
@@ -13986,6 +15919,10 @@ async def _web_staged_finish_section(bot: Bot, tg_id: int, user_db_id: int, t, a
                                                    allowed_photos)
         user_ans = "".join(answers.get(str(i), "*") for i in range(1, qcount + 1))
         result = _build_stage_mcq_result(cfg, key, user_ans, open_answers)
+    elif stype == STAGE_TYPE_VOICE:
+        trusted = raw.get("_trusted") is _WEB_TRUSTED
+        result = {"voice_id": raw.get("voice_id") if trusted else None,
+                  "voice_kind": raw.get("voice_kind") if trusted else None, "band": None, "feedback": None}
     else:
         text = sanitize_plain_text(str(raw.get("text") or ""), max_len=WEB_WRITING_TEXT_MAX) or None
         pid = raw.get("photo_id")
@@ -14051,10 +15988,6 @@ async def _web_staged_section_payload(bot: Bot, ctx: dict, t, attempt) -> dict:
     et = t["exam_type"]
     base = {"kind": "section", "test": _web_test_info(t), "key": key, "name": sec.get("name") or key,
             "type": stype, "pos": pos, "total": len(order), "duration_min": int(sec.get("duration_min") or 0)}
-    if stype == STAGE_TYPE_VOICE:
-        return {**base, "handoff": True, "prompt": sec.get("prompt") or "",
-                "bot_username": await _web_bot_username(bot)}
-
     await _web_take_over_chat_staged(bot, tg_id, test_id, user_db_id, key)
     sess = await get_session(user_db_id, test_id, f"stage_{key}")
     if sess:
@@ -14085,6 +16018,9 @@ async def _web_staged_section_payload(bot: Bot, ctx: dict, t, attempt) -> dict:
         qcount = int(sec.get("qcount") or 0)
         payload.update(_web_question_payload(skey, qcount, saved))
         payload["layout"] = [{"name": "", "from": 1, "to": qcount}]
+    elif stype == STAGE_TYPE_VOICE:
+        payload.update({"prompt": sec.get("prompt") or "", "max_bytes": WEB_MAX_AUDIO_BYTES,
+                        "bot_username": await _web_bot_username(bot)})
     else:
         payload.update({"prompt": sec.get("prompt") or "", "text": saved.get("text") or "",
                         "photo_id": saved.get("photo_id"), "text_max": WEB_WRITING_TEXT_MAX,
@@ -14101,6 +16037,7 @@ async def webapp_api_me(request: web.Request):
            "bot_username": await _web_bot_username(bot), "academy": ACADEMY_NAME,
            "is_admin": await is_admin_user(ctx["tg_id"])}
     if ctx["registered"]:
+        out["balance"] = await wallet_balance(ctx["user_db_id"])
         try:
             await _web_require_subscribed(bot, ctx["tg_id"])
             out["subscribed"] = True
@@ -14153,6 +16090,9 @@ async def webapp_api_lookup(request: web.Request):
     if access["state"] == "not_started":
         access["reminder"] = bool(await POOL.fetchval(
             "SELECT 1 FROM test_reminders WHERE user_id=$1 AND test_id=$2", ctx["user_db_id"], t["id"]))
+    if access["state"] in ("need_payment", "payment_rejected", "payment_pending"):
+        access["payment"] = _web_payment_info(t, await _resolve_payment_routing(t["id"]),
+                                              await wallet_balance(ctx["user_db_id"]))
     return web.json_response({"ok": True, "test": _web_test_info(t), "access": access, "message": msg,
                               "bot_username": await _web_bot_username(bot), "server_now": now_ts()})
 
@@ -14527,7 +16467,7 @@ async def webapp_api_file(request: web.Request):
         raise WebError("not_found", "Fayl topilmadi.", 404)
     path = await _web_fetch_file(bot, file_id)
     with open(path, "rb") as fh:
-        head = fh.read(16)
+        head = fh.read(1024)
     return web.FileResponse(path, headers={"Content-Type": _web_sniff_type(head, kind),
                                            "Cache-Control": "private, max-age=3600"})
 
@@ -14537,6 +16477,334 @@ async def webapp_api_result(request: web.Request):
     ctx = await _web_auth(request)
     test_id = _web_int(request.match_info["test_id"], "test")
     return web.json_response({"ok": True, "result": await _web_result_view(ctx["user_db_id"], test_id)})
+
+
+# ----- Mini App: ro'yxatdan o'tish, hamyon, to'lov, Speaking, esse (botga qaytish shart emas) -----
+WEB_MAX_AUDIO_BYTES = 10 * 1024 * 1024
+_WEB_TRUSTED = object()   # faqat server o'zi yaratgan ovoz file_id'sini bo'lim natijasiga yozish uchun
+_WEB_ESSAY_UPLOADS: dict[tuple[int, int], list[str]] = {}
+
+
+async def _web_read_multipart(request: web.Request, max_bytes: int, file_label: str = "Fayl") -> tuple[dict, bytes | None, str]:
+    if request.content_length and request.content_length > max_bytes + 64 * 1024:
+        raise WebError("too_big", f"{file_label} juda katta ({max_bytes // 1024 // 1024} MB gacha).", 413)
+    reader = await request.multipart()
+    fields, data, ctype = {}, None, ""
+    while True:
+        part = await reader.next()
+        if part is None:
+            break
+        if part.name == "file":
+            ctype = (part.headers.get("Content-Type") or "").lower()
+            data = bytearray()
+            while True:
+                chunk = await part.read_chunk(64 * 1024)
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if len(data) > max_bytes:
+                    raise WebError("too_big", f"{file_label} juda katta ({max_bytes // 1024 // 1024} MB gacha).", 413)
+        else:
+            fields[part.name] = (await part.text())[:200]
+    return fields, (bytes(data) if data else None), ctype
+
+
+def _web_is_image(data: bytes | None) -> bool:
+    return bool(data) and (data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n"
+                           or (data[:4] == b"RIFF" and data[8:12] == b"WEBP"))
+
+
+@_web_handler
+async def webapp_api_register(request: web.Request):
+    """Ilovaning o'zida ro'yxatdan o'tish (ism + telefon) — botdagi bilan bir xil."""
+    ctx = await _web_auth(request, need_registered=False)
+    bot: Bot = request.app["bot"]
+    body = await _web_body(request)
+    full_name = sanitize_plain_text(str(body.get("full_name") or ""), max_len=100)
+    if len(full_name) < 3:
+        raise WebError("bad_name", "Ism-familiyani to'liq kiriting (kamida 3 harf).")
+    phone = normalize_phone_input(str(body.get("phone") or ""))
+    if not phone:
+        raise WebError("bad_phone", "Telefon raqami noto'g'ri. Masalan: +998901234567")
+    role = 'admin' if ctx["tg_id"] == ADMIN_ID else 'student'
+    async with _web_lock(bot, ctx["tg_id"]):
+        await POOL.execute(
+            "INSERT INTO users (telegram_id, full_name, phone, role, created_ts) VALUES ($1, $2, $3, $4, $5) "
+            "ON CONFLICT (telegram_id) DO UPDATE SET full_name=EXCLUDED.full_name, phone=EXCLUDED.phone, "
+            "created_ts=CASE WHEN COALESCE(users.created_ts,0)=0 THEN EXCLUDED.created_ts ELSE users.created_ts END",
+            ctx["tg_id"], full_name, phone, role, now_ts())
+        fsm = _web_fsm(bot, ctx["tg_id"])
+        if fsm is not None and (await fsm.get_state() or "").startswith("RegistrationState"):
+            await fsm.clear()
+    digits = _phone_digits(phone)
+    if digits:
+        others = await POOL.fetch(
+            "SELECT telegram_id, full_name FROM users WHERE telegram_id<>$1 AND "
+            "RIGHT(REGEXP_REPLACE(COALESCE(phone,''), '[^0-9]', '', 'g'), 9)=$2 LIMIT 5", ctx["tg_id"], digits)
+        if others:
+            me_id = await get_user_db_id(ctx["tg_id"])
+            names = ", ".join(f"{o['full_name'] or '-'} (ID {o['telegram_id']})" for o in others)
+            asyncio.create_task(_report_suspicious(
+                bot, "phone", me_id, None, f"Bu telefon raqami bilan avval ro'yxatdan o'tgan akkaunt(lar): {names}"))
+    try:
+        admin_flag = await is_admin_user(ctx["tg_id"])
+        await bot.send_message(ctx["tg_id"], f"✅ <b>Ro'yxatdan o'tdingiz</b> (Mini App orqali), {_h(full_name)}!",
+                               parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(admin_flag))
+    except (TelegramForbiddenError, TelegramBadRequest):
+        pass
+    return web.json_response({"ok": True})
+
+
+async def _web_wallet_payload(user_db_id: int) -> dict:
+    pend = await _wallet_pending_topup(user_db_id)
+    return {"balance": await wallet_balance(user_db_id),
+            "history": [_wallet_tx_json(r) for r in await _wallet_history(user_db_id, 30)],
+            "pending_topup": int(pend["amount"]) if pend else None,
+            "card": {"card": PAYMENT_CARD, "owner": PAYMENT_OWNER, "phone": PAYMENT_PHONE},
+            "presets": list(WALLET_PRESETS), "min": WALLET_TOPUP_MIN, "max": WALLET_TOPUP_MAX}
+
+
+@_web_handler
+async def webapp_api_wallet(request: web.Request):
+    ctx = await _web_auth(request)
+    return web.json_response({"ok": True, **await _web_wallet_payload(ctx["user_db_id"])})
+
+
+@_web_handler
+async def webapp_api_wallet_topup(request: web.Request):
+    ctx = await _web_auth(request)
+    bot: Bot = request.app["bot"]
+    fields, data, _ct = await _web_read_multipart(request, WEB_MAX_PHOTO_BYTES, "Rasm")
+    if not _web_is_image(data):
+        raise WebError("bad_file", "Chek rasmini (JPG/PNG) yuklang.")
+    amount = _parse_money(fields.get("amount") or "")
+    if not amount or not (WALLET_TOPUP_MIN <= amount <= WALLET_TOPUP_MAX):
+        raise WebError("bad_amount", f"Summa {WALLET_TOPUP_MIN:,} dan {WALLET_TOPUP_MAX:,} so'mgacha bo'lsin."
+                       .replace(",", " "))
+    async with _web_lock(bot, ctx["tg_id"]):
+        res = await wallet_create_topup(bot, ctx["user_db_id"], amount, photo_bytes=data)
+    if not res["ok"]:
+        if res["reason"] == "pending":
+            raise WebError("pending", "Oldingi to'ldirish so'rovingiz hali tekshirilmoqda.", 409)
+        raise WebError("send_failed", "Chekni yuborib bo'lmadi — birozdan keyin qayta urinib ko'ring.", 502)
+    return web.json_response({"ok": True, **await _web_wallet_payload(ctx["user_db_id"])})
+
+
+@_web_handler
+async def webapp_api_test_buy(request: web.Request):
+    """Pullik testni balansdan sotib olish (ilovaning o'zida)."""
+    ctx = await _web_auth(request)
+    bot: Bot = request.app["bot"]
+    await _web_require_subscribed(bot, ctx["tg_id"])
+    body = await _web_body(request)
+    test_id = _web_int(body.get("test_id"), "test")
+    async with _web_lock(bot, ctx["tg_id"]):
+        res = await wallet_buy_test(bot, ctx["user_db_id"], test_id)
+        if res["ok"]:
+            fsm = _web_fsm(bot, ctx["tg_id"])
+            if fsm is not None and await fsm.get_state() == PaymentState.waiting_for_screenshot.state:
+                await fsm.clear()
+    if not res["ok"]:
+        msg = WALLET_BUY_ERRORS.get(res["reason"], "Sotib olib bo'lmadi.")
+        if res["reason"] == "low":
+            msg += f" Balans: {_fmt_money(res['balance'])}, kerak: {_fmt_money(res['price'])}."
+        raise WebError(res["reason"], msg, 409)
+    try:
+        text, kb = _purchase_access_text(res["test"], res["payment_id"], via_wallet=True, balance=res["balance"],
+                                         reminder=res["reminder"])
+        await bot.send_message(ctx["tg_id"], text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except (TelegramForbiddenError, TelegramBadRequest):
+        pass
+    return web.json_response({"ok": True, "balance": res["balance"]})
+
+
+@_web_handler
+async def webapp_api_test_pay(request: web.Request):
+    """Pullik test uchun to'lov chekini ilovadan yuborish (botdagi bilan bir xil oqim)."""
+    ctx = await _web_auth(request)
+    bot: Bot = request.app["bot"]
+    await _web_require_subscribed(bot, ctx["tg_id"])
+    fields, data, _ct = await _web_read_multipart(request, WEB_MAX_PHOTO_BYTES, "Rasm")
+    if not _web_is_image(data):
+        raise WebError("bad_file", "Chek rasmini (JPG/PNG) yuklang.")
+    test_id = _web_int(fields.get("test_id"), "test")
+    user_db_id = ctx["user_db_id"]
+    async with _web_lock(bot, ctx["tg_id"]):
+        t = await POOL.fetchrow("""
+            SELECT id, code, title, price, start_mode, start_ts, start_at, duration,
+                   COALESCE(is_hidden,0) AS is_hidden, COALESCE(is_closed,0) AS is_closed
+            FROM tests WHERE id=$1 AND is_free=0
+        """, test_id)
+        if not t:
+            raise WebError("not_found", "Pullik test topilmadi.", 404)
+        if int(t["is_hidden"]) == 1 or int(t["is_closed"]) == 1:
+            raise WebError("closed", "Bu test hozir sotilmaydi.", 409)
+        if is_scheduled_expired(t["start_mode"], t["start_ts"], t["duration"])[0]:
+            raise WebError("expired", "Bu testning vaqti tugagan — to'lov qabul qilinmaydi.", 409)
+        if await POOL.fetchval("SELECT 1 FROM payments WHERE user_id=$1 AND test_id=$2 AND status='approved'",
+                               user_db_id, test_id):
+            raise WebError("already", "Siz bu testni allaqachon sotib olgansiz.", 409)
+        uname = await POOL.fetchval("SELECT full_name FROM users WHERE id=$1", user_db_id) or "Noma'lum"
+        # Chek avval o'quvchining o'z chatiga (ilovadan yuborilgani belgisi bilan) — Telegram file_id olish uchun
+        try:
+            sent = await bot.send_photo(ctx["tg_id"], BufferedInputFile(data, filename="chek.jpg"),
+                                        caption=f"🧾 To'lov cheki — {t['title']} ({t['code']})")
+        except (TelegramForbiddenError, TelegramBadRequest):
+            raise WebError("bad_file", "Chekni qabul qilib bo'lmadi — boshqa rasm tanlang yoki botni bloklamaganingizni tekshiring.")
+        photo_id = sent.photo[-1].file_id
+        try:
+            payment_id = await POOL.fetchval("""
+                INSERT INTO payments (user_id, test_id, screenshot_id, status, created_at, amount)
+                VALUES ($1, $2, $3, 'pending', $4, $5) RETURNING id
+            """, user_db_id, test_id, photo_id, now_str_local(), int(t["price"] or 0))
+        except asyncpg.UniqueViolationError:
+            raise WebError("pending", "Bu test bo'yicha chekingiz allaqachon tekshirilmoqda.", 409)
+    routing = await _resolve_payment_routing(test_id)
+    share_note = (f"\n\n💡 <i>Bu test oddiy foydalanuvchi — {routing['creator_name']} — tomonidan yaratilgan. "
+                  f"Tasdiqlasangiz, tegishli ulushni o'ziga o'tkazib berishni unutmang.</i>") if routing["share_reminder"] else ""
+    caption = (f"🟡 <b>Yangi to'lov (PENDING)</b> · Mini App\n\n👤 User: {_h(uname)}\n📚 Test: {_h(t['title'])}\n"
+               f"🔑 Kod: <code>{t['code']}</code>\n💰 Summa: {t['price']} so'm\n🆔 Payment ID: <code>{payment_id}</code>"
+               f"{share_note}")
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"appr_{payment_id}")],
+        [InlineKeyboardButton(text="❌ Rad etish (Sabab)", callback_data=f"rejask_{payment_id}")]])
+    for notify_id in dict.fromkeys([routing["notify_tg_id"], ADMIN_ID]):
+        try:
+            await bot.send_photo(notify_id, photo=photo_id, caption=caption, parse_mode=ParseMode.HTML,
+                                 reply_markup=admin_kb)
+            break
+        except (TelegramForbiddenError, TelegramBadRequest):
+            logging.warning(f"To'lov xabarini yuborib bo'lmadi (tg_id={notify_id}, payment={payment_id})")
+    return web.json_response({"ok": True, "payment_id": payment_id})
+
+
+def _web_payment_info(t, routing: dict, balance: int) -> dict:
+    return {"price": int(t["price"] or 0), "balance": balance,
+            "card": {"card": routing["card"], "owner": routing["owner"], "phone": routing["phone"]},
+            "note": PAYMENT_NOTE}
+
+
+@_web_handler
+async def webapp_api_voice(request: web.Request):
+    """🎙 Speaking: ilovada yozilgan ovoz (MP3/WAV/M4A) — bo'lim natijasi sifatida qabul qilinadi."""
+    ctx = await _web_auth(request)
+    bot: Bot = request.app["bot"]
+    fields, data, ctype = await _web_read_multipart(request, WEB_MAX_AUDIO_BYTES, "Audio")
+    if not data or len(data) < 2000:
+        raise WebError("bad_file", "Ovoz yozilmadi yoki juda qisqa — qaytadan yozib ko'ring.")
+    mime = _sniff_audio_mime(data)
+    if mime == "audio/ogg" and not data.startswith(b"OggS"):
+        raise WebError("bad_file", "Audio formati tanilmadi — qaytadan yozib ko'ring.")
+    test_id = _web_int(fields.get("test_id"), "test")
+    section_key = str(fields.get("section_key") or "")
+    async with _web_lock(bot, ctx["tg_id"]):
+        t = await _web_test_row(test_id=test_id)
+        if not t or (t["exam_type"] or "") not in STAGED_EXAM_TYPES:
+            raise WebError("not_found", "Bosqichli test topilmadi.", 404)
+        await _web_resolve_mode(ctx, t, section_key)
+        cfg = _load_skills_cfg(t["skills_cfg"])
+        if cfg["sections"].get(section_key, {}).get("type") != STAGE_TYPE_VOICE:
+            raise WebError("bad_request", "Bu bo'lim ovozli emas.")
+        sess = await get_session(ctx["user_db_id"], test_id, f"stage_{section_key}")
+        if not sess:
+            raise WebError("no_session", "Bo'lim sessiyasi topilmadi — imtihonni qaytadan oching.", 409)
+        if now_ts() > int(sess["start_ts"]) + int(sess["duration_sec"]) + 90:
+            raise WebError("time_over", "Bo'lim vaqti tugagan.", 409)
+        ext = {"audio/mp3": "mp3", "audio/wav": "wav", "audio/aac": "m4a", "audio/webm": "webm",
+               "audio/flac": "flac"}.get(mime, "ogg")
+        sec_name = cfg["sections"][section_key].get("name") or "Speaking"
+        try:
+            if ext == "mp3":
+                sent = await bot.send_audio(ctx["tg_id"], BufferedInputFile(data, filename="speaking.mp3"),
+                                            caption=f"🎙 {sec_name} — javobingiz (Mini App)", title="Speaking")
+                fid, kind = sent.audio.file_id, "audio"
+            else:
+                sent = await bot.send_document(ctx["tg_id"], BufferedInputFile(data, filename=f"speaking.{ext}"),
+                                               caption=f"🎙 {sec_name} — javobingiz (Mini App)")
+                fid, kind = sent.document.file_id, "document"
+        except (TelegramForbiddenError, TelegramBadRequest):
+            raise WebError("bad_file", "Ovozni saqlab bo'lmadi — qaytadan urinib ko'ring.")
+        attempt = await _web_staged_attempt(ctx["user_db_id"], test_id)
+        res = await _web_staged_finish_section(bot, ctx["tg_id"], ctx["user_db_id"], t, attempt["id"], section_key,
+                                               {"voice_id": fid, "voice_kind": kind, "_trusted": _WEB_TRUSTED})
+    return web.json_response({"ok": True, **res})
+
+
+async def _web_essay_row(user_db_id: int, test_id: int):
+    return await POOL.fetchrow("""
+        SELECT r.id, r.essay_status, r.essay_raw, r.essay_ball, r.essay_feedback, r.essay_graded_by,
+               r.essay_criteria, r.essay_text, t.essay_cfg, COALESCE(t.is_closed,0) AS is_closed
+        FROM results r JOIN tests t ON t.id=r.test_id WHERE r.user_id=$1 AND r.test_id=$2 ORDER BY r.id LIMIT 1
+    """, user_db_id, test_id)
+
+
+async def _web_essay_view(user_db_id: int, test_id: int) -> dict | None:
+    r = await _web_essay_row(user_db_id, test_id)
+    cfg = _essay_cfg_of(r["essay_cfg"]) if r else {}
+    if not r or not cfg:
+        return None
+    st = r["essay_status"] or "awaiting"
+    deadline = await _essay_deadline(test_id)
+    can_write = st == "awaiting" and int(r["is_closed"]) == 0 and (not deadline or now_ts() <= deadline)
+    crit = _load_json_dict(r["essay_criteria"])
+    return {"status": st, "status_label": ESSAY_STATUS_LABELS.get(st, st), "prompt": cfg.get("prompt"),
+            "deadline_ts": deadline or None, "can_write": can_write, "rules": MS_ESSAY_RULES, "note": MS_ESSAY_NOTE,
+            "raw": float(r["essay_raw"]) if r["essay_raw"] is not None else None,
+            "ball": float(r["essay_ball"]) if r["essay_ball"] is not None else None,
+            "feedback": r["essay_feedback"], "graded_by": "ai" if r["essay_graded_by"] == "ai" else
+            ("teacher" if r["essay_graded_by"] else None),
+            "criteria": [{"label": label, "score": int(crit.get(key, 0)), "max": mx}
+                         for key, label, mx in MS_ESSAY_CRITERIA] if crit else None,
+            "weight": float(cfg.get("weight") or 0.5), "max_photos": ESSAY_MAX_PHOTOS, "text_max": ESSAY_TEXT_MAX,
+            "server_now": now_ts()}
+
+
+@_web_handler
+async def webapp_api_essay_photo(request: web.Request):
+    ctx = await _web_auth(request)
+    bot: Bot = request.app["bot"]
+    fields, data, _ct = await _web_read_multipart(request, WEB_MAX_PHOTO_BYTES, "Rasm")
+    if not _web_is_image(data):
+        raise WebError("bad_file", "Faqat rasm (JPG/PNG) yuklash mumkin.")
+    test_id = _web_int(fields.get("test_id"), "test")
+    ev = await _web_essay_view(ctx["user_db_id"], test_id)
+    if not ev or not ev["can_write"]:
+        raise WebError("essay_closed", "Esse yozib bo'lmaydi (topshirilgan yoki muddati tugagan).", 409)
+    key = (ctx["user_db_id"], test_id)
+    if len(_WEB_ESSAY_UPLOADS.get(key, [])) >= 12:
+        raise WebError("too_many", "Juda ko'p rasm yuklandi.", 429)
+    try:
+        sent = await bot.send_photo(ctx["tg_id"], BufferedInputFile(data, filename="esse.jpg"),
+                                    caption="✍️ Esse varag'i (Mini App)")
+    except (TelegramForbiddenError, TelegramBadRequest):
+        raise WebError("bad_file", "Rasmni qabul qilib bo'lmadi — boshqa rasm tanlang.")
+    pid = sent.photo[-1].file_id
+    _WEB_ESSAY_UPLOADS.setdefault(key, []).append(pid)
+    return web.json_response({"ok": True, "photo_id": pid})
+
+
+@_web_handler
+async def webapp_api_essay_submit(request: web.Request):
+    ctx = await _web_auth(request)
+    bot: Bot = request.app["bot"]
+    body = await _web_body(request)
+    test_id = _web_int(body.get("test_id"), "test")
+    text = str(body.get("text") or "")[:ESSAY_TEXT_MAX]
+    allowed = set(_WEB_ESSAY_UPLOADS.get((ctx["user_db_id"], test_id), []))
+    photos = [p for p in (body.get("photo_ids") or []) if isinstance(p, str) and p in allowed][:ESSAY_MAX_PHOTOS]
+    async with _web_lock(bot, ctx["tg_id"]):
+        r = await _web_essay_row(ctx["user_db_id"], test_id)
+        if not r:
+            raise WebError("not_found", "Natija topilmadi.", 404)
+        res = await essay_submit(bot, r["id"], text, photos)
+        if not res["ok"]:
+            raise WebError(res["reason"], res["message"], 409)
+        _WEB_ESSAY_UPLOADS.pop((ctx["user_db_id"], test_id), None)
+        fsm = _web_fsm(bot, ctx["tg_id"])
+        if fsm is not None and await fsm.get_state() == EssayState.writing.state:
+            await fsm.clear()
+    return web.json_response({"ok": True, "message": res["message"],
+                              "result": await _web_result_view(ctx["user_db_id"], test_id)})
 
 
 _WEBAPP_PAGE: dict = {}
@@ -14697,6 +16965,14 @@ def build_webapp_application(bot: Bot | None = None) -> web.Application:
     app.router.add_get("/api/result/{test_id}", webapp_api_result)
     app.router.add_post("/api/test/remind", webapp_api_remind)
     app.router.add_get("/api/admin/stats", webapp_api_admin_stats)
+    app.router.add_post("/api/register", webapp_api_register)
+    app.router.add_get("/api/wallet", webapp_api_wallet)
+    app.router.add_post("/api/wallet/topup", webapp_api_wallet_topup)
+    app.router.add_post("/api/test/buy", webapp_api_test_buy)
+    app.router.add_post("/api/test/pay", webapp_api_test_pay)
+    app.router.add_post("/api/staged/voice", webapp_api_voice)
+    app.router.add_post("/api/essay/photo", webapp_api_essay_photo)
+    app.router.add_post("/api/essay/submit", webapp_api_essay_submit)
     return app
 
 
@@ -15304,11 +17580,7 @@ function renderGate(kind, channels) {
                : "Bu sahifa bot chatidagi «Test yechish» menyu tugmasi orqali ochiladi.",
       el("div", {class: "muted small", style: "opacity:.6"}, diag)));
   }
-  if (kind === "reg") {
-    return mount(centerMsg("user", "Avval ro'yxatdan o'ting",
-      "Botga /start yuboring, ism va telefon raqamingizni kiriting. So'ng ilovani qayta oching.",
-      el("button", {class: "btn cta", onclick: openBot}, ic("chat"), "Botga o'tish")));
-  }
+  if (kind === "reg") return renderRegister();
   const box = el("div", {class: "card"});
   (channels || []).forEach(c => box.append(el("div", {class: "list-item"}, el("b", {}, c.title),
     c.url ? el("button", {class: "btn", onclick: () => tg ? tg.openTelegramLink(c.url) : window.open(c.url)}, "A'zo bo'lish") : null)));
@@ -15344,6 +17616,7 @@ function renderHome() {
     el("div", {class: "ico"}, ic("chart")), el("div", {}, el("b", {}, "Admin panel"), el("div", {class: "muted small"}, "Statistika, grafiklar, shubhali faollik")),
     el("span", {class: "go"}, ic("chev")))] : []));
   drawAdmin();
+  const walletBox = el("div", {}, walletEntry());
   if (!S.meTs || Date.now() - S.meTs > 3000) {
     S.meTs = Date.now();
     api("/api/me").then(me => {
@@ -15352,6 +17625,7 @@ function renderHome() {
       if (!me.subscribed) return renderGate("sub", me.channels);
       if (activeBox.isConnected) drawActive(me.active);
       if (adminBox.isConnected) drawAdmin();
+      if (walletBox.isConnected) walletBox.replaceChildren(walletEntry());
     }).catch(() => {});
   }
   const tile = (icon, text) => el("div", {}, ic(icon), text);
@@ -15362,12 +17636,13 @@ function renderHome() {
     el("div", {class: "card lift"},
       el("label", {class: "lbl", for: "code"}, "Test kodi"), inp,
       el("div", {style: "height:12px"}), el("button", {class: "btn block cta", onclick: go}, ic("search"), "Testni ochish")),
-    activeBox, adminBox,
+    activeBox, walletBox, adminBox,
     el("div", {class: "sect"}, "Imkoniyatlar"),
     el("div", {class: "feat"},
       tile("bubbles", "DTM javoblar varaqasi"), tile("calc", "SAT kalkulyator va grafik"),
       tile("pen", "Ochiq savolga matn yoki rasm"), tile("check", "Javoblar avtomatik saqlanadi"),
-      tile("clock", "Taymer va avto-topshirish"), tile("headphones", "Audio va PDF shu yerda"))));
+      tile("clock", "Taymer va avto-topshirish"), tile("headphones", "Audio va PDF shu yerda"),
+      tile("mic", "Speaking — ovoz shu yerda"), tile("card", "Hamyon va to'lov shu yerda"))));
 }
 function setTab(t) {
   S.tab = t;
@@ -15412,7 +17687,8 @@ function renderInfo(r) {
   if (st === "resume") btns.push(el("button", {class: "btn block cta", onclick: () => start(false)}, ic("play"), "Davom ettirish"));
   if (st === "done" || st === "staged_done" || st === "pending_review") btns.push(el("button", {class: "btn block", onclick: () => showResult(t.id)}, ic("chart"), "Natijani ko'rish"));
   if (st === "staged_done" && a.can_retake) btns.push(el("button", {class: "btn block ghost", onclick: () => start(true)}, ic("refresh"), "Qaytadan yechish"));
-  if (st === "need_payment" || st === "payment_rejected" || st === "payment_pending") btns.push(el("button", {class: "btn block", onclick: openBot}, ic("chat"), "Botga o'tish"));
+  const pay = payBox(t, a, () => lookup(t.code));
+  if (pay) body.unshift(pay);
   if (st === "not_started") btns.push(reminderBtn(t, !!a.reminder));
   btns.push(el("button", {class: "btn block ghost", onclick: renderHome}, ic("left"), "Boshqa kod"));
   if (st === "not_started" && a.left) {
@@ -15464,9 +17740,12 @@ function renderOverview(ov) {
   const actions = el("div", {class: "card"});
   if (current) {
     if (current.type === "open_voice") {
-      actions.append(el("p", {style: "margin-top:0"}, el("b", {}, current.name), " bo'limi Telegram'ning ovozli xabari orqali topshiriladi — bu eng qulay va ishonchli usul."),
-        el("p", {class: "muted small"}, "Tugmani bosganingizda bot chatda topshiriqni yuboradi va vaqt boshlanadi. Ovozli javobdan keyin qolgan bo'limlarni chatda yoki shu ilovada (kodni qayta kiritib) davom ettirishingiz mumkin."),
-        el("button", {class: "btn block cta", onclick: () => handoff(t)}, ic("mic"), "Botda ovozli javob berish"));
+      actions.append(el("p", {style: "margin-top:0"}, el("b", {}, current.name), " — javobingizni shu ilovaning o'zida mikrofon orqali yozib topshirasiz."),
+        el("button", {class: "btn block cta", onclick: async () => {
+          if (!await confirmBox(`${current.name} bo'limini boshlaysizmi?`, `Vaqt: ${current.duration_min} daqiqa. Boshlangach taymer to'xtamaydi.`, "Boshlash")) return;
+          openSection(t);
+        }}, ic("mic"), `${current.name} — ilovada yozish`),
+        el("button", {class: "btn block ghost", onclick: () => handoff(t)}, ic("chat"), "Telegram ovozli xabari orqali (botda)"));
     } else {
       actions.append(el("button", {class: "btn block cta", onclick: async () => {
         if (!await confirmBox(`${current.name} bo'limini boshlaysizmi?`, `Vaqt: ${current.duration_min} daqiqa. Boshlangach taymer to'xtamaydi.`, "Boshlash")) return;
@@ -15494,6 +17773,7 @@ async function openSection(t) {
     try { return renderOverview(await api("/api/test/start", {body: {test_id: t.id}, idem: true})); }
     catch (e) { return handleErr(e); }
   }
+  if (p.type === "open_voice") return renderVoice(p);
   if (p.type === "open_text") return renderWriting(p);
   renderSolve(p, p.key);
 }
@@ -16126,7 +18406,8 @@ function renderResult(v) {
     const pend = v.status === "pending_review";
     const big = v.overall_grade != null && !pend ? String(v.overall_grade) : "…";
     kids.push(card(ring(pend ? 0 : (v.percent != null ? v.percent : 0), big),
-      el("div", {class: "muted", style: "text-align:center"}, pend ? "Ustoz (yoki AI) baholayapti — yakuniy natija botga keladi." : "Umumiy natija")));
+      el("div", {class: "muted", style: "text-align:center"}, pend ? "Ustoz (yoki AI) baholayapti — natija tayyor bo'lgach shu yerda ko'rinadi." : "Umumiy natija"),
+      pend ? el("button", {class: "btn block ghost", style: "margin-top:10px", onclick: () => showResult(t.id)}, ic("refresh"), "Yangilash") : null));
     const tb = el("table", {class: "tb"}, el("tr", {}, el("th", {}, "Bo'lim"), el("th", {}, "Natija"), el("th", {}, "Daraja/ball")));
     v.sections.forEach(s => tb.append(el("tr", {}, el("td", {}, s.name),
       el("td", {}, s.total != null ? `${s.score}/${s.total}` : (s.submitted ? "topshirildi" : "—")),
@@ -16138,7 +18419,9 @@ function renderResult(v) {
     if (rasch && !rasch.finalized) kids.push(card(ring(0, "…"),
       el("div", {style: "text-align:center"}, "Rasch ball test yakunlangach hammaga bir vaqtda e'lon qilinadi."), el("div", {class: "muted small", style: "text-align:center"}, rasch.remain_text || "")));
     else if (rasch) kids.push(card(ring(rasch.percent, (rasch.ball != null ? (+rasch.ball).toFixed(1) : "-")),
-      el("div", {class: "muted", style: "text-align:center"}, "Rasch ball (0–75)"), rasch.grade ? el("div", {class: "chips", style: "justify-content:center"}, el("span", {class: "chip acc"}, "Daraja: " + rasch.grade)) : null));
+      el("div", {class: "muted", style: "text-align:center"}, v.essay && rasch.test_ball != null ? "Yakuniy ball: test + esse (0–75)" : "Rasch ball (0–75)"),
+      v.essay && rasch.test_ball != null ? el("div", {class: "kv", style: "margin-top:8px"}, el("span", {}, "Test qismi (Rasch)"), el("b", {}, (+rasch.test_ball).toFixed(1) + " / 75")) : null,
+      rasch.grade ? el("div", {class: "chips", style: "justify-content:center"}, el("span", {class: "chip acc"}, "Daraja: " + rasch.grade)) : null));
     else kids.push(card(ring(v.percent),
       v.grade ? el("div", {class: "chips", style: "justify-content:center"}, el("span", {class: "chip acc"}, gradeLabel(t.exam_type) + v.grade)) : null));
     if (!rasch || rasch.finalized) {
@@ -16149,7 +18432,9 @@ function renderResult(v) {
     } else kids.push(statusBox("", "Javoblaringiz qabul qilindi."));
     if (t.exam_type === "dtm" && v.max) kids.push(el("div", {class: "card"}, el("div", {class: "kv hero"}, el("span", {}, "DTM ball"), el("b", {}, `${(+v.earned).toFixed(1)} / ${(+v.max).toFixed(1)}`)),
       ...(v.subjects || []).map(s => el("div", {class: "kv"}, el("span", {}, `${s.name} (${s.q} savol × ${s.w})`), el("span", {class: "muted"}, `${s.correct} ta · ${(+s.earned).toFixed(1)} ball`)))));
-    if (v.open_pending) kids.push(statusBox("warn", `${v.open_pending} ta ochiq javobingizni ustoz tekshiradi — yakuniy natija botga keladi.`));
+    if (v.open_pending) kids.push(statusBox("warn", `${v.open_pending} ta ochiq javobingizni ustoz tekshiradi — yakuniy natija shu yerda ham ko'rinadi.`));
+    const ec = essayCard(v);
+    if (ec) kids.splice(Math.min(kids.length, 2), 0, ec);
     if (v.review) {
       const grid = el("div", {class: "navgrid"});
       v.review.forEach(it => grid.append(el("button", {class: it.ok == null ? "pend" : it.ok ? "ok" : "bad", onclick: () => {
@@ -16390,6 +18675,420 @@ async function renderAdmin() {
         el("div", {class: "muted small"}, e.details)), el("span", {class: "muted small", style: "white-space:nowrap"}, ago(e.ts))))),
     el("button", {class: "btn block ghost", style: "margin-top:12px", onclick: renderAdmin}, ic("refresh"), "Yangilash")));
   showChart("results");
+}
+
+/* ------------ umumiy: pul, chek yuborish ------------ */
+function money(n) { return Math.round(+n || 0).toLocaleString("ru-RU").replace(/[  ]/g, " ") + " so'm"; }
+function copyText(txt) {
+  try { navigator.clipboard.writeText(String(txt).replace(/\s+/g, "")); toast("Nusxa olindi"); haptic("sel"); }
+  catch (e) { toast(String(txt)); }
+}
+// fields — obyekt yoki obyekt qaytaradigan funksiya (masalan, tanlangan summa bosish paytida o'qiladi)
+function receiptPicker(url, fields, label, onDone, check) {
+  const file = el("input", {type: "file", accept: "image/*", class: "hidden"});
+  file.addEventListener("change", async () => {
+    if (!file.files || !file.files[0]) return;
+    const f = typeof fields === "function" ? fields() : fields;
+    const done = overlay("Chek yuborilmoqda...");
+    try {
+      const blob = await compressImage(file.files[0]);
+      const fd = new FormData();
+      Object.entries(f || {}).forEach(([k, v]) => fd.append(k, String(v)));
+      fd.append("file", blob, "chek.jpg");
+      const r = await api(url, {form: fd, timeout: 90000});
+      done(); haptic("ok"); onDone(r);
+    } catch (e) { done(); handleErr(e); }
+    file.value = "";
+  });
+  return el("div", {}, file, el("button", {class: "btn block", onclick: () => { if (check && !check()) return; file.click(); }},
+    ic("camera"), label));
+}
+function cardRows(card) {
+  return [el("div", {class: "kv"}, el("span", {}, "Karta"),
+            el("button", {class: "btn ghost", style: "padding:6px 10px", onclick: () => copyText(card.card)}, el("b", {}, card.card))),
+          el("div", {class: "kv"}, el("span", {}, "Egasi"), el("span", {}, card.owner)),
+          card.phone ? el("div", {class: "kv"}, el("span", {}, "Telefon"), el("span", {}, card.phone)) : null];
+}
+
+/* ------------ ro'yxatdan o'tish (ilovaning o'zida) ------------ */
+function renderRegister() {
+  stopTick(); showTabs(false); setBack(null);
+  const nm = el("input", {class: "input", id: "rn", placeholder: "Ism Familiya", autocomplete: "name", maxlength: "100"});
+  try {
+    const u = tg && tg.initDataUnsafe && tg.initDataUnsafe.user;
+    if (u) nm.value = [u.first_name, u.last_name].filter(Boolean).join(" ");
+  } catch (e) {}
+  const ph = el("input", {class: "input", id: "rp", placeholder: "+998 90 123 45 67", inputmode: "tel", autocomplete: "tel", maxlength: "20"});
+  const canShare = !!(tg && tg.requestContact && (!tg.isVersionAtLeast || tg.isVersionAtLeast("6.9")));
+  const share = canShare ? el("button", {class: "btn block ghost", onclick: () => {
+    try {
+      tg.requestContact((ok, res) => {
+        const c = res && res.responseUnsafe && res.responseUnsafe.contact;
+        if (ok && c && c.phone_number) { ph.value = (String(c.phone_number).startsWith("+") ? "" : "+") + c.phone_number; toast("Raqam olindi"); haptic("ok"); }
+        else toast("Raqamni qo'lda kiriting");
+      });
+    } catch (e) { toast("Raqamni qo'lda kiriting"); }
+  }}, ic("phone"), "Telegram raqamimni ulashish") : null;
+  const go = async () => {
+    const full_name = nm.value.trim(), phone = ph.value.trim();
+    if (full_name.length < 3) { nm.focus(); return toast("Ism-familiyani to'liq kiriting"); }
+    if (phone.replace(/\D/g, "").length < 7) { ph.focus(); return toast("Telefon raqamini kiriting"); }
+    const done = overlay("Saqlanmoqda...");
+    try { await api("/api/register", {body: {full_name, phone}}); done(); haptic("ok"); lsDel("me:" + S.uid); boot(); }
+    catch (e) { done(); handleErr(e); }
+  };
+  mount(el("div", {class: "screen"},
+    band(brandRow(), el("h1", {}, "Ro'yxatdan o'tish"),
+      el("p", {}, "Bir marta: ism va telefon raqamingiz. Keyin testlar shu yerning o'zida ochiladi.")),
+    el("div", {class: "card lift"},
+      el("label", {class: "lbl", for: "rn"}, "Ism va familiya"), nm, el("div", {style: "height:12px"}),
+      el("label", {class: "lbl", for: "rp"}, "Telefon raqami"), ph,
+      share ? el("div", {style: "height:8px"}) : null, share,
+      el("div", {style: "height:14px"}), el("button", {class: "btn block cta", onclick: go}, ic("check"), "Ro'yxatdan o'tish"))));
+}
+
+/* ------------ pullik test: balansdan yoki chek bilan to'lash ------------ */
+function payBox(t, a, refresh) {
+  const p = a.payment;
+  if (!p) return null;
+  const price = p.price || 0, bal = p.balance || 0;
+  const kids = [el("div", {class: "kv hero"}, el("span", {}, "Narxi"), el("b", {}, money(price))),
+                el("div", {class: "kv"}, el("span", {}, "Hamyon balansi"), el("b", {}, money(bal)))];
+  if (a.state === "payment_pending") {
+    kids.push(el("button", {class: "btn block ghost", onclick: refresh}, ic("refresh"), "Holatni yangilash"));
+  } else {
+    if (bal >= price) {
+      kids.push(el("button", {class: "btn block cta", onclick: async () => {
+        if (!await confirmBox("Balansdan to'laysizmi?", `${money(price)} hamyoningizdan yechiladi va test darhol ochiladi.`, "To'lash")) return;
+        const done = overlay("To'lanmoqda...");
+        try { await api("/api/test/buy", {body: {test_id: t.id}}); done(); haptic("ok"); toast("Test sotib olindi!"); refresh(); }
+        catch (e) { done(); handleErr(e); }
+      }}, ic("check"), `Balansdan to'lash — ${money(price)}`));
+    } else {
+      kids.push(el("button", {class: "btn block", onclick: () => renderWallet(refresh)}, ic("card"),
+        bal > 0 ? `Hamyonni to'ldirish (${money(price - bal)} yetmaydi)` : "Hamyonni to'ldirish"));
+    }
+    kids.push(el("div", {class: "sect", style: "margin:16px 0 6px"}, "Yoki kartaga to'lab, chek yuboring"),
+      ...cardRows(p.card), p.note ? el("p", {class: "muted small"}, p.note) : null,
+      receiptPicker("/api/test/pay", {test_id: t.id}, "Chek rasmini yuborish",
+        () => { toast("Chek yuborildi — admin tasdiqlagach test shu yerda ochiladi", 4000); refresh(); }));
+  }
+  return el("div", {class: "card"}, el("h2", {style: "margin-top:0"}, "To'lov"), ...clean(kids));
+}
+
+/* ------------ hamyon ------------ */
+async function renderWallet(back) {
+  stopTick(); showTabs(false); setBack(back || renderHome);
+  mount(el("div", {class: "center"}, el("div", {class: "spin dark"})));
+  let w;
+  try { w = await api("/api/wallet"); }
+  catch (e) { if (e && e.network) return renderNetError(() => renderWallet(back)); return handleErr(e); }
+  if (S.me) S.me.balance = w.balance;
+  let amount = w.presets[1] || w.presets[0] || 20000;
+  const amtInp = el("input", {class: "input", inputmode: "numeric", placeholder: "Boshqa summa", maxlength: "9"});
+  const chips = el("div", {class: "chips", style: "margin:4px 0 10px"});
+  const drawChips = () => chips.replaceChildren(...w.presets.map(v => el("button", {class: "chip" + (v === amount && !amtInp.value ? " acc" : ""),
+    style: "border:0;cursor:pointer", onclick: () => { amount = v; amtInp.value = ""; drawChips(); }}, money(v))));
+  amtInp.addEventListener("input", () => { amtInp.value = amtInp.value.replace(/\D/g, ""); drawChips(); });
+  drawChips();
+  const curAmount = () => +(amtInp.value || amount);
+  const okAmount = () => {
+    const v = curAmount();
+    if (!v || v < w.min || v > w.max) { toast(`Summa ${money(w.min)} dan ${money(w.max)} gacha bo'lsin`); amtInp.focus(); return false; }
+    return true;
+  };
+  const topup = w.pending_topup
+    ? el("div", {class: "card"}, statusBox("warn", `To'ldirish so'rovingiz (${money(w.pending_topup)}) tekshirilmoqda. Tasdiqlangach balansga tushadi.`),
+        el("button", {class: "btn block ghost", onclick: () => renderWallet(back)}, ic("refresh"), "Yangilash"))
+    : el("div", {class: "card"}, el("h2", {style: "margin-top:0"}, "Hisobni to'ldirish"),
+        el("div", {class: "lbl"}, "1. Summani tanlang"), chips, amtInp,
+        el("div", {class: "lbl", style: "margin-top:14px"}, "2. Shu summani kartaga o'tkazing"), ...clean(cardRows(w.card)),
+        el("div", {class: "lbl", style: "margin-top:14px"}, "3. To'lov chekining rasmini yuboring"),
+        receiptPicker("/api/wallet/topup", () => ({amount: curAmount()}), "Chek rasmini yuborish",
+          () => { toast("Chek yuborildi — admin tasdiqlagach balansga tushadi", 4000); renderWallet(back); }, okAmount));
+  const list = el("div", {});
+  if (!w.history.length) list.append(el("div", {class: "muted", style: "text-align:center;padding:16px 0"}, "Hali amallar yo'q"));
+  const ico = {pending: "clock", approved: "check", rejected: "x"};
+  w.history.forEach(h => list.append(el("div", {class: "list-item"},
+    el("div", {style: "min-width:0"}, el("b", {}, h.label + (h.code ? " · " + h.code : "")),
+      el("div", {class: "muted small"}, new Date(h.ts * 1000).toLocaleString("ru-RU").slice(0, 17) +
+        (h.status === "pending" ? " · tekshirilmoqda" : h.status === "rejected" ? " · rad etilgan" + (h.note ? ": " + h.note : "") : ""))),
+    el("span", {class: "badge", style: h.status === "rejected" ? "opacity:.5;text-decoration:line-through" : ""},
+      (h.amount > 0 ? "+" : "−") + money(Math.abs(h.amount))), ic(ico[h.status] || "info"))));
+  mount(el("div", {class: "screen"},
+    band(el("div", {class: "eyebrow"}, "Hamyon"), el("h1", {}, money(w.balance)),
+      el("p", {}, "Balansdan pullik testlarni chek kutmasdan, bir zumda sotib olasiz.")),
+    topup, el("div", {class: "sect"}, "Tarix"), el("div", {class: "card", style: "margin-top:0;padding-top:4px;padding-bottom:4px"}, list)));
+}
+function walletEntry() {
+  const bal = S.me && S.me.balance != null ? money(S.me.balance) : "";
+  return el("button", {class: "admin-entry", onclick: () => renderWallet()},
+    el("div", {class: "ico gold"}, ic("card")), el("div", {}, el("b", {}, "Hamyon" + (bal ? ": " + bal : "")),
+      el("div", {class: "muted small"}, "To'ldirish va pullik testlarni bir zumda sotib olish")),
+    el("span", {class: "go"}, ic("chev")));
+}
+
+/* ------------ 🎙 Speaking: ilovada ovoz yozish (MP3) ------------ */
+let lameP = null;
+function loadLame() {
+  if (window.lamejs) return Promise.resolve(true);
+  if (lameP) return lameP;
+  lameP = new Promise(res => {
+    const s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.1/lame.min.js";
+    s.onload = () => res(!!window.lamejs);
+    s.onerror = () => { lameP = null; s.remove(); res(false); };
+    document.head.append(s);
+  });
+  return lameP;
+}
+function downsample(buf, rate, target) {
+  const ratio = rate / target, len = Math.floor(buf.length / ratio), out = new Int16Array(len);
+  for (let i = 0; i < len; i++) {
+    const a = Math.floor(i * ratio), b = Math.min(buf.length, Math.floor((i + 1) * ratio));
+    let sum = 0; for (let j = a; j < b; j++) sum += buf[j];
+    const v = b > a ? sum / (b - a) : buf[a] || 0;
+    out[i] = Math.max(-1, Math.min(1, v)) * 0x7fff;
+  }
+  return out;
+}
+function wavBlob(chunks, rate) {
+  const n = chunks.reduce((s, c) => s + c.length, 0);
+  const buf = new ArrayBuffer(44 + n * 2), dv = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, "RIFF"); dv.setUint32(4, 36 + n * 2, true); w(8, "WAVE"); w(12, "fmt "); dv.setUint32(16, 16, true);
+  dv.setUint16(20, 1, true); dv.setUint16(22, 1, true); dv.setUint32(24, rate, true); dv.setUint32(28, rate * 2, true);
+  dv.setUint16(32, 2, true); dv.setUint16(34, 16, true); w(36, "data"); dv.setUint32(40, n * 2, true);
+  let o = 44; chunks.forEach(c => { for (let i = 0; i < c.length; i++, o += 2) dv.setInt16(o, c[i], true); });
+  return new Blob([buf], {type: "audio/wav"});
+}
+async function startRecorder() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw {nomic: true};
+  const stream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true}});
+  const hasLame = await loadLame();
+  const AC = window.AudioContext || window.webkitAudioContext;
+  const ctx = new AC();
+  if (ctx.state === "suspended") { try { await ctx.resume(); } catch (e) {} }
+  const src = ctx.createMediaStreamSource(stream);
+  const proc = ctx.createScriptProcessor(4096, 1, 1);
+  const target = 16000, enc = hasLame ? new lamejs.Mp3Encoder(1, target, 48) : null;
+  const parts = []; let samples = 0, level = 0;
+  proc.onaudioprocess = e => {
+    const inp = e.inputBuffer.getChannelData(0);
+    let peak = 0; for (let i = 0; i < inp.length; i += 16) peak = Math.max(peak, Math.abs(inp[i]));
+    level = peak;
+    const ds = downsample(inp, ctx.sampleRate, target);
+    samples += ds.length;
+    if (enc) { const b = enc.encodeBuffer(ds); if (b.length) parts.push(new Uint8Array(b)); } else parts.push(ds);
+  };
+  src.connect(proc); proc.connect(ctx.destination);
+  return {
+    mp3: !!enc, maxSec: enc ? 600 : 290,
+    seconds: () => samples / target, level: () => level,
+    stop: () => {
+      try { proc.disconnect(); src.disconnect(); } catch (e) {}
+      stream.getTracks().forEach(t => t.stop());
+      try { ctx.close(); } catch (e) {}
+      if (enc) { const b = enc.flush(); if (b.length) parts.push(new Uint8Array(b)); return new Blob(parts, {type: "audio/mpeg"}); }
+      return wavBlob(parts, target);
+    }
+  };
+}
+function renderVoice(p) {
+  stopTick(); showTabs(false);
+  const st = {testId: p.test.id, key: p.key, endTs: p.end_ts, offset: p.server_now - Date.now() / 1000, sent: false};
+  let rec = null, blob = null, recTick = null;
+  S.st = null;
+  if (tg) { try { tg.enableClosingConfirmation(); } catch (e) {} }
+  const cleanup = () => { if (recTick) clearInterval(recTick); recTick = null; if (rec) { try { rec.stop(); } catch (e) {} rec = null; } };
+  setBack(async () => {
+    if (await confirmBox("Bo'limdan chiqasizmi?", "Yozuvingiz topshirilmaydi, vaqt esa ketaveradi. Kodni qayta kiritib davom ettirishingiz mumkin.", "Chiqish")) {
+      cleanup(); renderHome();
+    }
+  });
+  const timer = el("div", {class: "timer", role: "timer"}, "--:--");
+  const status = el("div", {class: "muted", style: "text-align:center;margin:8px 0"}, "Tugmani bosing va javobingizni ovoz chiqarib ayting.");
+  const meter = el("div", {class: "loadbar", style: "margin:10px 0"}, el("i", {style: "width:0%"}));
+  const player = el("div", {});
+  const recBtn = el("button", {class: "btn block cta"}, ic("mic"), "Yozishni boshlash");
+  const sendBtn = el("button", {class: "btn block cta hidden"}, ic("check"), "Javobni topshirish");
+  const redoBtn = el("button", {class: "btn block ghost hidden"}, ic("refresh"), "Qaytadan yozish");
+  const botBtn = el("button", {class: "btn block ghost", onclick: async () => {
+    if (!await confirmBox("Botda javob berasizmi?", "Topshiriq bot chatiga yuboriladi — u yerda Telegram ovozli xabari bilan javob berasiz.", "Botga o'tish")) return;
+    cleanup(); handoff(p.test);
+  }}, ic("chat"), "Telegram ovozli xabari orqali (bot chatida)");
+  const showPreview = () => {
+    player.replaceChildren(el("div", {class: "media"}, el("div", {class: "lbl"}, "Yozuvingiz"),
+      el("audio", {controls: true, src: URL.createObjectURL(blob), preload: "auto"})));
+    sendBtn.classList.remove("hidden"); redoBtn.classList.remove("hidden");
+    recBtn.classList.add("hidden");
+  };
+  const stopRec = () => {
+    if (!rec) return;
+    if (recTick) clearInterval(recTick); recTick = null;
+    const secs = rec.seconds();
+    blob = rec.stop(); rec = null;
+    meter.firstChild.style.width = "0%";
+    if (secs < 2) { blob = null; status.textContent = "Yozuv juda qisqa — qaytadan urinib ko'ring."; recBtn.replaceChildren(ic("mic"), "Yozishni boshlash"); return; }
+    status.textContent = `Yozildi: ${fmtTime(secs)}. Tinglab ko'ring va topshiring.`;
+    showPreview();
+  };
+  recBtn.addEventListener("click", async () => {
+    if (rec) return stopRec();
+    try {
+      recBtn.disabled = true;
+      rec = await startRecorder();
+      recBtn.disabled = false;
+      haptic("medium");
+      recBtn.replaceChildren(ic("check"), "To'xtatish");
+      status.textContent = "Yozilmoqda... 0:00";
+      recTick = setInterval(() => {
+        if (!rec) return;
+        const s = rec.seconds();
+        status.textContent = `Yozilmoqda... ${fmtTime(s)}`;
+        meter.firstChild.style.width = Math.min(100, Math.round(rec.level() * 140)) + "%";
+        if (s >= rec.maxSec) { toast("Maksimal davomiylikka yetdi"); stopRec(); }
+      }, 200);
+    } catch (e) {
+      recBtn.disabled = false; rec = null;
+      status.replaceChildren(statusBox("bad", e && e.nomic ? "Bu qurilmada ilova ichida ovoz yozib bo'lmaydi." :
+        "Mikrofonga ruxsat berilmadi. Telegram sozlamalarida mikrofonga ruxsat bering yoki bot chatida ovozli xabar bilan javob bering."));
+      botBtn.classList.remove("ghost"); botBtn.classList.add("cta");
+    }
+  });
+  redoBtn.addEventListener("click", () => {
+    blob = null; player.replaceChildren(); sendBtn.classList.add("hidden"); redoBtn.classList.add("hidden");
+    recBtn.classList.remove("hidden"); recBtn.replaceChildren(ic("mic"), "Yozishni boshlash");
+    status.textContent = "Tugmani bosing va javobingizni ovoz chiqarib ayting.";
+  });
+  const send = async (auto) => {
+    if (st.sent) return;
+    if (!blob) { if (auto) toast("Vaqt tugadi"); return; }
+    if (!auto && !await confirmBox("Javobni topshirasizmi?", "Topshirgandan keyin qayta yozib bo'lmaydi.", "Topshirish")) return;
+    st.sent = true; stopTick();
+    const done = overlay("Ovoz yuborilmoqda...");
+    try {
+      const fd = new FormData();
+      fd.append("test_id", st.testId); fd.append("section_key", st.key);
+      fd.append("file", blob, blob.type === "audio/mpeg" ? "speaking.mp3" : "speaking.wav");
+      const r = await api("/api/staged/voice", {form: fd, timeout: 180000});
+      done(); haptic("ok");
+      if (tg) { try { tg.disableClosingConfirmation(); } catch (e) {} }
+      if (!r.finished) { toast("Javobingiz topshirildi"); return renderOverview(r.overview); }
+      renderResult(r.result);
+    } catch (e) { done(); st.sent = false; handleErr(e); }
+  };
+  sendBtn.addEventListener("click", () => send(false));
+  mount(el("div", {class: "solve"},
+    el("div", {class: "sbar"}, timer, el("div", {class: "prog"}, el("div", {class: "t"}, p.name))),
+    el("div", {class: "pane active", style: "padding:12px 14px"},
+      el("div", {class: "card", style: "margin-top:0"}, el("div", {class: "lbl"}, "Topshiriq"), el("div", {class: "prompt"}, p.prompt || "")),
+      el("div", {class: "card"}, status, meter, recBtn, player, sendBtn, redoBtn),
+      el("div", {class: "card"}, el("p", {class: "muted small", style: "margin-top:0"}, "Ilovada ovoz yozish ishlamasa:"), botBtn))));
+  const tick = () => {
+    const remain = st.endTs - (Date.now() / 1000 + st.offset);
+    timer.replaceChildren(ic("clock"), fmtTime(remain));
+    timer.className = "timer" + (remain <= 60 ? " crit" : remain <= 300 ? " warn" : "");
+    if (remain <= 0 && !st.sent) { stopTick(); if (rec) stopRec(); if (blob) { toast("Vaqt tugadi — yozuvingiz topshirilmoqda"); send(true); } }
+  };
+  tick(); S.tick = setInterval(tick, 500);
+}
+
+/* ------------ ✍️ Esse (Milliy sertifikat: Ona tili) ------------ */
+function essayCard(v) {
+  const e = v.essay;
+  if (!e) return null;
+  const kids = [el("h2", {style: "margin-top:0"}, "✍️ Esse")];
+  if (e.can_write) {
+    const left = e.deadline_ts ? Math.max(0, e.deadline_ts - (e.server_now || Date.now() / 1000)) : null;
+    kids.push(statusBox("warn", "2-qism — esse hali yozilmagan.", left != null ? el("div", {class: "small", style: "margin-top:4px"}, "Qolgan vaqt: " + fmtTime(left)) : null),
+      el("div", {class: "prompt", style: "margin:10px 0"}, e.prompt),
+      el("button", {class: "btn block cta", onclick: () => renderEssay(v)}, ic("pen"), "Esse yozish"));
+  } else if (e.status === "pending") {
+    kids.push(statusBox("warn", "Esseingiz tekshirilmoqda — baholangach shu yerda ko'rinadi."),
+      el("button", {class: "btn block ghost", onclick: () => showResult(v.test.id)}, ic("refresh"), "Yangilash"));
+  } else if (e.status === "graded") {
+    kids.push(el("div", {class: "kv hero"}, el("span", {}, "Esse balli"), el("b", {}, `${+e.raw}/24 → ${(+e.ball).toFixed(1)}/75`)),
+      el("div", {class: "muted small"}, e.graded_by === "ai" ? "Sun'iy intellekt baholadi" : "Ustoz baholadi"));
+    if (e.criteria) e.criteria.forEach(c => kids.push(el("div", {class: "kv"}, el("span", {}, c.label), el("b", {}, `${c.score}/${c.max}`))));
+    if (e.feedback) kids.push(el("p", {class: "prompt", style: "margin:10px 0 0"}, e.feedback));
+    kids.push(el("p", {class: "muted small"}, e.note || ""));
+  } else if (e.status === "missing") {
+    kids.push(statusBox("bad", "Esse muddatida topshirilmagan — 0 ball."));
+  } else {
+    kids.push(statusBox("", "Esse muddati tugagan."));
+  }
+  return el("div", {class: "card"}, ...clean(kids));
+}
+function renderEssay(v) {
+  const e = v.essay, t = v.test;
+  stopTick(); showTabs(false);
+  const lkey = `essay:${S.uid}:${t.id}`;
+  const draft = lsGet(lkey) || {};
+  const st = {text: draft.text || "", photos: [], urls: [], sent: false,
+              offset: (e.server_now || Date.now() / 1000) - Date.now() / 1000};
+  if (tg) { try { tg.enableClosingConfirmation(); } catch (x) {} }
+  setBack(async () => { if (await confirmBox("Esse oynasidan chiqasizmi?", "Matningiz shu qurilmada saqlanadi.", "Chiqish")) showResult(t.id); });
+  const timer = el("div", {class: "timer", role: "timer"}, "--:--");
+  const ta = el("textarea", {class: "ta big", maxlength: String(e.text_max || 12000), placeholder: "Esseni shu yerga yozing (lotin yozuvida)..."});
+  ta.value = st.text;
+  const words = el("div", {class: "words"});
+  const upd = () => { const w = ta.value.trim() ? ta.value.trim().split(/\s+/).length : 0; words.textContent = `${w} so'z · ${ta.value.length} belgi`; };
+  ta.addEventListener("input", () => { st.text = ta.value; upd(); lsSet(lkey, {text: st.text}); });
+  upd();
+  const photoBox = el("div", {});
+  const drawPhotos = () => {
+    const file = el("input", {type: "file", accept: "image/*", class: "hidden"});
+    file.addEventListener("change", async () => {
+      if (!file.files || !file.files[0]) return;
+      const done = overlay("Rasm yuklanmoqda...");
+      try {
+        const blob = await compressImage(file.files[0]);
+        const fd = new FormData(); fd.append("test_id", t.id); fd.append("file", blob, "esse.jpg");
+        const r = await api("/api/essay/photo", {form: fd, timeout: 90000});
+        st.photos.push(r.photo_id); st.urls.push(URL.createObjectURL(blob)); toast("Varaq biriktirildi"); haptic("ok");
+      } catch (x) { handleErr(x); }
+      done(); drawPhotos();
+    });
+    const max = e.max_photos || 3;
+    photoBox.replaceChildren(...clean([file,
+      st.photos.length < max ? el("button", {class: "btn ghost", onclick: () => file.click()}, ic("camera"),
+        st.photos.length ? "Yana varaq qo'shish" : "Qo'lda yozilgan esse rasmini biriktirish") : null,
+      ...st.urls.map((u, i) => el("div", {style: "position:relative;display:inline-block;margin:8px 8px 0 0"},
+        el("img", {class: "thumb", src: u, alt: `${i + 1}-varaq`}),
+        el("button", {class: "icon-btn", style: "position:absolute;top:4px;right:4px", "aria-label": "Olib tashlash",
+          onclick: () => { st.photos.splice(i, 1); st.urls.splice(i, 1); drawPhotos(); }}, ic("trash"))))]));
+  };
+  drawPhotos();
+  const submit = async (auto) => {
+    if (st.sent) return;
+    if (!st.text.trim() && !st.photos.length) { if (!auto) toast("Avval esse yozing yoki varaq rasmini biriktiring"); return; }
+    if (!auto && !await confirmBox("Esseni topshirasizmi?", "Topshirgandan keyin o'zgartirib bo'lmaydi.", "Topshirish")) return;
+    st.sent = true; stopTick();
+    const done = overlay("Esse topshirilmoqda...");
+    try {
+      const r = await api("/api/essay/submit", {body: {test_id: t.id, text: st.text, photo_ids: st.photos}, timeout: 60000});
+      lsDel(lkey); done(); haptic("ok");
+      if (tg) { try { tg.disableClosingConfirmation(); } catch (x) {} }
+      toast(r.message || "Esse topshirildi", 4500);
+      renderResult(r.result);
+    } catch (x) { done(); st.sent = false; handleErr(x); }
+  };
+  mount(el("div", {class: "solve"},
+    el("div", {class: "sbar"}, timer, el("div", {class: "prog"}, el("div", {class: "t"}, "Esse — " + (t.title || "")))),
+    el("div", {class: "pane active", style: "padding:12px 14px"},
+      el("div", {class: "card", style: "margin-top:0"}, el("div", {class: "lbl"}, "Mavzu"), el("div", {class: "prompt"}, e.prompt),
+        el("p", {class: "muted small", style: "margin-bottom:0"}, e.rules || "")),
+      ta, words, el("div", {style: "height:10px"}), photoBox),
+    el("div", {class: "sfoot"}, el("button", {class: "btn cta", onclick: () => submit(false)}, ic("check"), "Esseni topshirish"))));
+  const tick = () => {
+    if (!e.deadline_ts) { timer.replaceChildren(ic("clock"), "—"); return; }
+    const remain = e.deadline_ts - (Date.now() / 1000 + st.offset);
+    timer.replaceChildren(ic("clock"), fmtTime(remain));
+    timer.className = "timer" + (remain <= 60 ? " crit" : remain <= 300 ? " warn" : "");
+    if (remain <= 0 && !st.sent) { stopTick(); toast("Vaqt tugadi — esse topshirilmoqda"); submit(true); }
+  };
+  tick(); S.tick = setInterval(tick, 500);
 }
 
 /* ------------ SAT: kalkulyator ------------ */
@@ -16691,6 +19390,7 @@ async def main():
     # ✅ WEBAPP_URL bo'sh bo'lsa tugma ko'rinmaydi — portni ham ochib qo'yish shart emas.
     if WEBAPP_URL:
         asyncio.create_task(run_webapp_server(bot))
+        asyncio.create_task(_web_warm_cache(bot))
 
     global FSM_STORAGE
     fsm_storage = PostgresStorage()
