@@ -375,10 +375,62 @@ def is_valid_code(code: str) -> bool:
     return bool(re.fullmatch(r"[A-Z0-9\-_]{3,20}", code))
 
 
+# ✅ Javob kalitini qulay kiritish: katta/kichik/aralash harflar (abcd, ABCD,
+# AbCd), ajratgichlar bilan (a,b,c / a b c), raqamli ko'rinishda (1a2b3c,
+# 1A 2B, 1-a, 1)A, 1.a; har biri alohida qatorda ham) va kirill klaviaturasida
+# tasodifan yozilgan bir xil ko'rinishli harflar (А В С Е) — hammasi bir xil
+# "abc..." kalitga aylanadi. Raqamli ko'rinishda savollar istalgan tartibda
+# yozilishi mumkin; tushib qolgan yoki ikki marta yozilgan savol aniq aytiladi.
+_KEY_HOMOGLYPHS = str.maketrans("аАвВсСеЕхХ", "aabbcceexx")
+_KEY_SEP_RE = re.compile(r"[\s,;.\-_/|:=()\[\]]+")
+_KEY_PAIR_RE = re.compile(r"(\d{1,3})\s*[.)\-:=\]]*\s*([a-fx*])", re.IGNORECASE)
+
+
+def _parse_numbered_answers(s: str) -> tuple[str | None, str | None]:
+    pairs = _KEY_PAIR_RE.findall(s)
+    rest = _KEY_SEP_RE.sub("", _KEY_PAIR_RE.sub("", s))
+    if rest:
+        return None, f"tushunarsiz qism bor: «{rest[:15]}»"
+    if not pairs:
+        return None, "savol raqami va javob topilmadi"
+    got: dict[int, str] = {}
+    for n_s, letter in pairs:
+        n, letter = int(n_s), letter.lower()
+        if n < 1:
+            return None, "savol raqami 1 dan boshlanishi kerak"
+        if n in got and got[n] != letter:
+            return None, f"{n}-savolga ikki xil javob yozilgan ({got[n].upper()} va {letter.upper()})"
+        got[n] = letter
+    missing = [i for i in range(1, max(got) + 1) if i not in got]
+    if missing:
+        nums = ", ".join(map(str, missing[:10])) + (" ..." if len(missing) > 10 else "")
+        return None, f"quyidagi savollar javobi yozilmagan: {nums}"
+    return "".join(got[i] for i in range(1, max(got) + 1)), None
+
+
 def normalize_answers(ans: str) -> str:
-    ans = (ans or "").strip().lower()
-    ans = re.sub(r"\s+", "", ans)
-    return ans
+    s = (ans or "").translate(_KEY_HOMOGLYPHS)
+    if any(ch.isdigit() for ch in s):
+        key, _err = _parse_numbered_answers(s)
+        return key if key is not None else "!"   # "!" — yaroqsiz (is_answer_string_valid rad etadi)
+    return _KEY_SEP_RE.sub("", s).lower()
+
+
+ANSWER_KEY_FORMATS_HINT = ("Qulay ko'rinishda yozing: <code>abcd...</code>, <code>ABCD...</code>, "
+                           "<code>1a2b3c...</code> yoki <code>1-A 2-B 3-C</code> (bo'sh joy, vergul — farqi yo'q).")
+
+
+def answer_key_error(raw: str) -> str:
+    """Kalit nega qabul qilinmaganini aniq aytadi (foydalanuvchiga ko'rsatish uchun)."""
+    s = (raw or "").translate(_KEY_HOMOGLYPHS)
+    if any(ch.isdigit() for ch in s):
+        _key, err = _parse_numbered_answers(s)
+        if err:
+            return f"⚠️ Kalitni o'qib bo'lmadi: {_h(err)}.\n{ANSWER_KEY_FORMATS_HINT}"
+    bad = sorted({c for c in _KEY_SEP_RE.sub("", s).lower() if c not in "abcdefx*"})
+    extra = f" Ortiqcha belgi(lar): <b>{_h(' '.join(bad[:8]))}</b>." if bad else ""
+    return (f"⚠️ Kalit faqat <b>A–F</b> harflaridan (ochiq savol uchun <code>x</code>) iborat bo'lsin.{extra}\n"
+            f"{ANSWER_KEY_FORMATS_HINT}")
 
 
 def is_answer_string_valid(ans: str) -> bool:
@@ -5787,8 +5839,7 @@ async def staged_build_text(message: Message, state: FSMContext) -> None:
         qcount = int((data.get("stage_pending_qcount")) or spec.get("qcount") or 0)
         answers = normalize_answers(text)
         if not is_answer_string_valid(answers):
-            return await message.answer(
-                "⚠️ Javob kaliti faqat A-F harflaridan iborat bo'lishi kerak. Qayta kiriting:")
+            return await message.answer(answer_key_error(text), parse_mode=ParseMode.HTML)
         if len(answers) != qcount:
             return await message.answer(
                 f"⚠️ Javoblar soni {qcount} ta bo'lishi kerak, siz {len(answers)} ta yubordingiz. Qayta kiriting:")
@@ -8738,9 +8789,8 @@ async def submit_answers_text(message: Message, state: FSMContext, bot: Bot):
     user_ans = normalize_answers(message.text)
 
     if not is_answer_string_valid(user_ans):
-        await message.answer(
-            "⚠️ Javoblar faqat <b>A, B, C, D, E, F</b> harflaridan iborat bo'lsin. Masalan: <code>abcdabcd...</code>",
-            parse_mode=ParseMode.HTML)
+        await message.answer(answer_key_error(message.text or "").replace("Kalit", "Javoblar", 1),
+                             parse_mode=ParseMode.HTML)
         return
 
     # ✅ Testda ochiq (variantsiz) savollar bo'lsa, ularning javobini matn
@@ -11486,7 +11536,7 @@ async def anticheat_b_answers(message: Message, state: FSMContext):
     qcount, a_key = int(t["questions_count"] or 0), normalize_answers(t["answers"] or "")
     val = normalize_answers(message.text or "")
     if not is_answer_string_valid(val):
-        return await message.answer("⚠️ Kalit faqat A-F harflaridan (ochiq savol uchun x) iborat bo'lsin. Qayta yuboring:")
+        return await message.answer(answer_key_error(message.text or ""), parse_mode=ParseMode.HTML)
     if len(val) != qcount:
         return await message.answer(f"⚠️ Javoblar soni {qcount} ta bo'lishi kerak, siz {len(val)} ta yubordingiz:")
     xs = open_question_positions(val)
@@ -11937,7 +11987,7 @@ async def staged_edit_text(message: Message, state: FSMContext) -> None:
         val = normalize_answers(text)
         qcount = int(section.get("qcount") or 0)
         if not is_answer_string_valid(val):
-            return await message.answer("⚠️ Faqat A-F yoki x harflaridan iborat bo'lsin:")
+            return await message.answer(answer_key_error(text), parse_mode=ParseMode.HTML)
         if len(val) != qcount:
             return await message.answer(
                 f"⚠️ Aynan {qcount} ta belgi bo'lishi kerak, siz {len(val)} ta yubordingiz:")
@@ -13044,8 +13094,9 @@ async def _nav_show_answers(answerable, state: FSMContext) -> None:
     qcount = int(data.get("questions_count") or 30)
     await answerable.answer(
         f"9-qadam (oxirgi): <b>javoblar kalitini kiriting.</b>\n"
-        f"Aynan <b>{qcount} ta</b> harf, bo'shliqsiz, savollar tartibida.\n"
-        f"Faqat <b>A, B, C, D, E, F</b> harflaridan foydalaning (masalan: <code>abcdabcd...</code>)\n\n"
+        f"Aynan <b>{qcount} ta</b> javob, savollar tartibida, <b>A–F</b> harflari bilan.\n"
+        f"Istalgan ko'rinishda yozing: <code>abcd...</code>, <code>ABCD...</code>, <code>1a2b3c...</code> "
+        f"yoki <code>1-A 2-B 3-C</code> — katta-kichik harf, bo'sh joy va vergul farqi yo'q.\n\n"
         f"<i>Variantsiz (ochiq) savol bo'lsa, o'sha o'rniga <code>x</code> harfini qo'ying — "
         f"o'quvchi shu savolga matn bilan javob yozadi, avtomatik baholanmaydi, "
         f"siz alohida ko'rib chiqasiz.</i>",
@@ -13077,10 +13128,7 @@ async def save_test(message: Message, state: FSMContext, bot: Bot):
     qcount = int(data.get("questions_count") or 30)
 
     if not is_answer_string_valid(answers):
-        await message.answer(
-            "⚠️ Javob kaliti faqat <b>A, B, C, D, E, F</b> harflaridan iborat bo'lishi kerak "
-            "(interaktiv tugmalar shulardan iborat). Qayta yuboring:",
-            parse_mode=ParseMode.HTML)
+        await message.answer(answer_key_error(message.text or ""), parse_mode=ParseMode.HTML)
         return
 
     if len(answers) != qcount:
