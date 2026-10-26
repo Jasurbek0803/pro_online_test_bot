@@ -11021,8 +11021,12 @@ async def stats_item_analysis(callback: CallbackQuery):
         for s in hard[:8]:
             line = f"• {s['q']}-savol — <b>{s['p'] * 100:.0f}%</b> to'g'ri"
             ch, n = _top_wrong(s)
-            if ch and s["key"] != "x":
-                line += f" · ko'pchilik «{_h(ch)}» ni tanlagan ({_pct(n, s['n'])}), to'g'ri «{_h(s['key'])}»"
+            if s["key"] != "x":
+                line += f" (to'g'ri «{_h(s['key'])}»)"
+                if ch:
+                    line += f" · eng ko'p tanlangan xato: «{_h(ch)}» ({_pct(n, s['n'])})"
+                if s["blank"]:
+                    line += f" · belgilanmagan: {_pct(s['blank'], s['n'])}"
             text += line + "\n"
 
     suspects = []
