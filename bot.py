@@ -2219,6 +2219,20 @@ async def init_db(db):
                      ("test_ball", "REAL")):
         await _ensure_column(db, "results", col, typ)
 
+    # ✅ Ustozlarga to'lovlar: pul platforma kartasiga tushgan sotuvlar kimniki
+    await _ensure_column(db, "payments", "owed_to", "BIGINT")
+    await _ensure_column(db, "payments", "payout_id", "INTEGER")
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS teacher_payouts (
+            id SERIAL PRIMARY KEY,
+            teacher_tg BIGINT NOT NULL,
+            amount BIGINT NOT NULL,
+            n_sales INTEGER NOT NULL,
+            created_ts BIGINT DEFAULT 0,
+            paid_by BIGINT
+        )
+    """)
+
     # ✅ Hamyon (balans): to'ldirish, balansdan xarid, admin tuzatishi tarixi
     await _ensure_column(db, "users", "balance", "BIGINT DEFAULT 0")
     await _ensure_column(db, "payments", "method", "TEXT DEFAULT 'receipt'")
@@ -2986,7 +3000,7 @@ NAV_CB_PREFIXES = (
     "rasch_menu", "xl_menu", "trange_menu", "trange_t_", "trange_r_", "live_sessions", "users_menu",
     "userprofile_", "finance_report", "edittest_start", "acmenu_", "hidetest_menu",
     "today_digest", "tests_ranking", "ch_manage", "closetest_menu", "alltests_menu", "admin_list",
-    "mycreatestat_", "ogtests", "ogl_", "oga_", "skg_pending_", "raschrep_", "wallet_",
+    "mycreatestat_", "ogtests", "ogl_", "oga_", "skg_pending_", "raschrep_", "wallet_", "payout_",
 )
 # Sahifalash: shu ekranning o'zi, "orqaga" tarixiga yangi qadam qo'shilmaydi.
 NAV_PAGE_PREFIXES = ("ulp_", "tlp_", "stagepart_")
@@ -4254,6 +4268,7 @@ async def _resolve_payment_routing(test_id: int) -> dict:
             "notify_tg_id": creator_id,
             "share_reminder": False,
             "creator_name": creator_name,
+            "creator_id": creator_id,
         }
 
     plat = await _platform_payment_details()
@@ -4264,6 +4279,7 @@ async def _resolve_payment_routing(test_id: int) -> dict:
         "notify_tg_id": ADMIN_ID,
         "share_reminder": bool(creator_id) and not creator_is_admin,
         "creator_name": creator_name,
+        "creator_id": creator_id,
     }
 
 
@@ -4506,6 +4522,7 @@ async def process_screenshot(message: Message, state: FSMContext, bot: Bot):
         await message.answer("🟡 Sizda shu test bo‘yicha pending to‘lov bor.")
         await state.clear()
         return
+    await _mark_payment_owed(payment_id, test_id)
 
     uname_row = await POOL.fetchrow("SELECT full_name FROM users WHERE id=$1", user_db_id)
     uname = uname_row["full_name"] if uname_row else "Noma'lum"
@@ -9736,6 +9753,131 @@ def _warm_file_later(bot, file_id: str | None) -> None:
     asyncio.create_task(_job())
 
 
+# ===================== USTOZLARGA TO'LOVLAR (DAROMAD HISOBI) =====================
+# ✅ Pul platforma (asosiy admin) kartasiga tushgan, lekin test boshqa
+# ustozniki bo'lgan sotuvlar — hamyondan xarid yoki o'z kartasi sozlanmagan
+# ustoz testiga chek — payments.owed_to'da qayd etiladi. Asosiy admin
+# "💰 Ustozlarga to'lovlar"da kimga qancha o'tkazishi kerakligini ko'radi,
+# o'tkazgach "✅ To'landi" bilan belgilaydi (ustozga xabar boradi).
+def _owed_to_for(routing: dict) -> int | None:
+    cid = routing.get("creator_id")
+    if cid and int(cid) != ADMIN_ID and routing.get("notify_tg_id") == ADMIN_ID:
+        return int(cid)
+    return None
+
+
+async def _mark_payment_owed(payment_id: int, test_id: int) -> None:
+    owed = _owed_to_for(await _resolve_payment_routing(test_id))
+    if owed:
+        await POOL.execute("UPDATE payments SET owed_to=$1 WHERE id=$2", owed, payment_id)
+
+
+_PAYOUT_SUM = "COALESCE(SUM(COALESCE(p.amount, t.price)),0)"
+
+
+async def _teacher_earnings(teacher_tg: int) -> tuple[int, int]:
+    """(kutilayotgan, to'langan) — ustoz profili uchun."""
+    pending = await POOL.fetchval(f"""
+        SELECT {_PAYOUT_SUM} FROM payments p JOIN tests t ON t.id=p.test_id
+        WHERE p.owed_to=$1 AND p.status='approved' AND p.payout_id IS NULL
+    """, teacher_tg)
+    paid = await POOL.fetchval("SELECT COALESCE(SUM(amount),0) FROM teacher_payouts WHERE teacher_tg=$1", teacher_tg)
+    return int(pending or 0), int(paid or 0)
+
+
+@router.callback_query(F.data == "payout_menu")
+async def payout_menu(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return await callback.answer("Bu bo'lim faqat asosiy admin uchun.", show_alert=True)
+    rows = await POOL.fetch(f"""
+        SELECT p.owed_to, MAX(u.full_name) AS name, COUNT(*) AS n, {_PAYOUT_SUM} AS s
+        FROM payments p JOIN tests t ON t.id=p.test_id LEFT JOIN users u ON u.telegram_id=p.owed_to
+        WHERE p.status='approved' AND p.owed_to IS NOT NULL AND p.payout_id IS NULL
+        GROUP BY p.owed_to ORDER BY s DESC
+    """)
+    paid = await POOL.fetchrow("SELECT COALESCE(SUM(amount),0) AS s, COUNT(*) AS n FROM teacher_payouts")
+    text = ("💰 <b>Ustozlarga to'lovlar</b>\n\n"
+            "<i>Pul sizning kartangizga tushgan, lekin test boshqa ustozniki bo'lgan sotuvlar: hamyondan xaridlar "
+            "va o'z kartasini sozlamagan ustozlar testlari. O'z kartasi bor adminlar chek orqali to'lovni "
+            "to'g'ridan-to'g'ri oladi — ularning testlari faqat hamyondan sotilganda shu yerga tushadi.</i>\n\n")
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    if rows:
+        total = sum(int(r["s"]) for r in rows)
+        for r in rows:
+            name = _h(r["name"] or str(r["owed_to"]))
+            text += f"• {name} — {r['n']} ta sotuv, <b>{_fmt_money(r['s'])}</b>\n"
+            kb.inline_keyboard.append([InlineKeyboardButton(
+                text=f"👤 {r['name'] or r['owed_to']} — {_fmt_money(r['s'])}"[:60], callback_data=f"payout_{r['owed_to']}")])
+        text += f"\n<b>Jami o'tkazilishi kerak: {_fmt_money(total)}</b>\n"
+    else:
+        text += "✅ Hozircha hech kimga qarzingiz yo'q.\n"
+    if int(paid["n"]):
+        text += f"\n📜 Oldin to'langan: {_fmt_money(paid['s'])} ({paid['n']} marta)"
+    await callback.message.answer(text, parse_mode=ParseMode.HTML,
+                                  reply_markup=kb if kb.inline_keyboard else None)
+
+
+@router.callback_query(F.data.startswith("payout_"))
+async def payout_detail(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return await callback.answer("Bu bo'lim faqat asosiy admin uchun.", show_alert=True)
+    teacher = int(callback.data.split("_")[1])
+    rows = await POOL.fetch("""
+        SELECT p.id, COALESCE(p.amount, t.price) AS amount, COALESCE(p.method,'receipt') AS method,
+               COALESCE(p.approved_at, p.created_at) AS dt, t.code, t.title, u.full_name AS student
+        FROM payments p JOIN tests t ON t.id=p.test_id LEFT JOIN users u ON u.id=p.user_id
+        WHERE p.owed_to=$1 AND p.status='approved' AND p.payout_id IS NULL ORDER BY p.id
+    """, teacher)
+    name = await POOL.fetchval("SELECT full_name FROM users WHERE telegram_id=$1", teacher) or str(teacher)
+    if not rows:
+        return await callback.message.answer(f"✅ {_h(name)} ga qarzingiz yo'q.", parse_mode=ParseMode.HTML)
+    total = sum(int(r["amount"] or 0) for r in rows)
+    lines = [f"• {_h(r['dt'] or '')[:16]} · <code>{_h(r['code'])}</code> · "
+             f"{'👛 hamyon' if r['method'] == 'wallet' else '🧾 chek'} · {_h(r['student'] or '-')} — "
+             f"<b>{_fmt_money(r['amount'])}</b>" for r in rows[-30:]]
+    more = f"\n<i>… va yana {len(rows) - 30} ta</i>" if len(rows) > 30 else ""
+    max_id = max(int(r["id"]) for r in rows)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text=f"✅ {_fmt_money(total)} to'landi deb belgilash", callback_data=f"payoutok_{teacher}_{max_id}")]])
+    await callback.message.answer(
+        f"👤 <b>{_h(name)}</b> — to'lanmagan sotuvlar ({len(rows)} ta)\n\n" + "\n".join(lines) + more +
+        f"\n\n💰 <b>Jami: {_fmt_money(total)}</b>\n\n<i>Pulni ustozga o'tkazgach, pastdagi tugmani bosing — "
+        f"ustozga xabar boradi.</i>", parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("payoutok_"))
+async def payout_mark_paid(callback: CallbackQuery, bot: Bot):
+    if callback.from_user.id != ADMIN_ID:
+        return await callback.answer("Bu bo'lim faqat asosiy admin uchun.", show_alert=True)
+    _, t_s, max_s = callback.data.split("_")
+    teacher, max_id = int(t_s), int(max_s)
+    async with POOL.acquire() as con:
+        async with con.transaction():
+            row = await con.fetchrow(f"""
+                SELECT COUNT(*) AS n, {_PAYOUT_SUM} AS s FROM payments p JOIN tests t ON t.id=p.test_id
+                WHERE p.owed_to=$1 AND p.status='approved' AND p.payout_id IS NULL AND p.id<=$2
+            """, teacher, max_id)
+            if not int(row["n"]):
+                await _close_buttons(callback, "ℹ️ <b>Allaqachon belgilangan.</b>")
+                return await callback.answer("Bu sotuvlar allaqachon to'langan deb belgilangan.", show_alert=True)
+            pid = await con.fetchval(
+                "INSERT INTO teacher_payouts (teacher_tg, amount, n_sales, created_ts, paid_by) "
+                "VALUES ($1,$2,$3,$4,$5) RETURNING id", teacher, int(row["s"]), int(row["n"]), now_ts(),
+                callback.from_user.id)
+            await con.execute("""
+                UPDATE payments SET payout_id=$1
+                WHERE owed_to=$2 AND status='approved' AND payout_id IS NULL AND id<=$3
+            """, pid, teacher, max_id)
+    await _close_buttons(callback, f"✅ <b>To'landi deb belgilandi</b> ({_h(now_str_local())})")
+    try:
+        await bot.send_message(
+            teacher, f"💰 <b>Sizga to'lov o'tkazildi</b>\n\n{int(row['n'])} ta sotuv uchun: "
+                     f"<b>{_fmt_money(row['s'])}</b>\n\n<i>Batafsil: «👤 Profilim» → daromad.</i>",
+            parse_mode=ParseMode.HTML)
+    except (TelegramForbiddenError, TelegramBadRequest):
+        await callback.message.answer("⚠️ Ustozga xabar yetkazilmadi (botni bloklagan bo'lishi mumkin).")
+
+
 # ===================== HAMYON (BALANS) =====================
 # ✅ O'quvchi hamyonini bir marta (chek bilan) to'ldiradi, admin tasdiqlaydi —
 # keyin pullik testlarni chek kutmasdan, bir zumda balansdan sotib oladi.
@@ -10088,6 +10230,11 @@ async def wallet_buy_test(bot: Bot | None, user_db_id: int, test_id: int) -> dic
     if is_scheduled_expired(t["start_mode"], t["start_ts"], t["duration"])[0]:
         return {"ok": False, "reason": "expired"}
     price = max(0, int(t["price"] or 0))
+    owed = _owed_to_for(await _resolve_payment_routing(test_id))
+    if not owed:
+        # o'z kartasi bor admin testi — hamyon puli baribir platforma kartasida, demak unga qarzdorsiz
+        cid = await POOL.fetchval("SELECT creator_id FROM tests WHERE id=$1", test_id)
+        owed = int(cid) if cid and int(cid) != ADMIN_ID else None
     async with POOL.acquire() as con:
         async with con.transaction():
             # foydalanuvchi qatori qulflanadi — bir vaqtdagi ikki bosish ikki marta yechmaydi
@@ -10105,8 +10252,8 @@ async def wallet_buy_test(bot: Bot | None, user_db_id: int, test_id: int) -> dic
                                          price, user_db_id)
             now_s = now_str_local()
             pid = await con.fetchval(
-                "INSERT INTO payments (user_id, test_id, status, created_at, approved_at, amount, method) "
-                "VALUES ($1,$2,'approved',$3,$3,$4,'wallet') RETURNING id", user_db_id, test_id, now_s, price)
+                "INSERT INTO payments (user_id, test_id, status, created_at, approved_at, amount, method, owed_to) "
+                "VALUES ($1,$2,'approved',$3,$3,$4,'wallet',$5) RETURNING id", user_db_id, test_id, now_s, price, owed)
             await con.execute(
                 "INSERT INTO wallet_tx (user_id, kind, amount, status, test_id, created_ts, decided_ts, note) "
                 "VALUES ($1,'purchase',$2,'approved',$3,$4,$4,$5)", user_db_id, -price, test_id, now_ts(),
@@ -10129,7 +10276,7 @@ async def _wallet_notify_purchase(bot: Bot, user_db_id: int, t, price: int) -> N
         note = ""
         if routing["share_reminder"] or routing["notify_tg_id"] != ADMIN_ID:
             note = (f"\n\n💡 <i>Test egasi — {_h(routing['creator_name'])}. Pul platforma hamyonida: "
-                    f"tegishli ulushni o'ziga o'tkazib berishni unutmang.</i>")
+                    f"summa «📊 Statistika» → «💰 Ustozlarga to'lovlar» hisobiga yozildi.</i>")
         text = (f"👛 <b>Balansdan sotib olindi</b>\n\n👤 {_h(u['full_name'] if u else '?')}\n"
                 f"📚 {_h(t['title'])} (<code>{t['code']}</code>)\n💰 {_fmt_money(price)}{note}")
         for tg in dict.fromkeys([ADMIN_ID, routing["notify_tg_id"]]):
@@ -10581,6 +10728,8 @@ async def admin_stats(message: Message):
         [InlineKeyboardButton(text="💾 Zaxira nusxa olish (backup)", callback_data="backup_now"),
          InlineKeyboardButton(text="📥 Zaxiradan tiklash", callback_data="restore_start")],
     ])
+    if message.from_user.id == ADMIN_ID:
+        kb.inline_keyboard.insert(3, [InlineKeyboardButton(text="💰 Ustozlarga to'lovlar", callback_data="payout_menu")])
 
     text = (
         f"<b>📊 Admin Statistika Paneli</b>\n\n"
@@ -14304,10 +14453,10 @@ async def certificate_daemon(bot: Bot):
 # ===================== MA'LUMOTLAR BAZASI ZAXIRA NUSXASI (BACKUP) =====================
 BACKUP_TABLES = [
     "users", "tests", "payments", "results", "sessions", "required_channels", "user_limits",
-    "staged_attempts", "retake_grants", "test_reminders", "suspicious_events", "wallet_tx",
+    "staged_attempts", "retake_grants", "test_reminders", "suspicious_events", "wallet_tx", "teacher_payouts",
 ]
 # Eski zaxira fayllarida bo'lmagan jadvallar (ular bo'lmasa ham tiklash ishlaydi)
-BACKUP_OPTIONAL_TABLES = {"retake_grants", "test_reminders", "suspicious_events", "wallet_tx"}
+BACKUP_OPTIONAL_TABLES = {"retake_grants", "test_reminders", "suspicious_events", "wallet_tx", "teacher_payouts"}
 
 
 async def _run_db_backup(bot: Bot, requester_tg_id: int | None = None):
@@ -14378,7 +14527,7 @@ async def backup_now(callback: CallbackQuery, bot: Bot):
 # amal bo'lgani uchun har doim aniq tasdiqlash bosqichidan o'tadi.
 _TABLES_WITH_SERIAL_ID = [
     "users", "tests", "payments", "results", "sessions", "required_channels", "staged_attempts",
-    "suspicious_events", "wallet_tx",
+    "suspicious_events", "wallet_tx", "teacher_payouts",
 ]
 
 
@@ -14873,6 +15022,7 @@ async def profile_menu(message: Message, state: FSMContext):
         f"Ism: <b>{fname}</b>\n"
         f"Telefon: <b>{phone}</b>\n"
         f"👛 Balans: <b>{_fmt_money(row['balance'])}</b>\n"
+        f"{await _earnings_line(message.from_user.id)}"
         f"{card_block}\n"
         f"<i>Quyidagilar ixtiyoriy — xohlasangiz to'ldiring:</i>\n"
         f"Viloyat: <b>{region}</b>\n"
@@ -14883,6 +15033,14 @@ async def profile_menu(message: Message, state: FSMContext):
         parse_mode=ParseMode.HTML,
         reply_markup=kb
     )
+
+
+async def _earnings_line(tg_id: int) -> str:
+    pending, paid = await _teacher_earnings(tg_id)
+    if not pending and not paid:
+        return ""
+    return (f"💰 Testlaringizdan daromad (platforma orqali): kutilmoqda <b>{_fmt_money(pending)}</b>, "
+            f"to'langan <b>{_fmt_money(paid)}</b>\n")
 
 
 def _region_picker_kb() -> InlineKeyboardMarkup:
@@ -16817,6 +16975,7 @@ async def webapp_api_test_pay(request: web.Request):
             """, user_db_id, test_id, photo_id, now_str_local(), int(t["price"] or 0))
         except asyncpg.UniqueViolationError:
             raise WebError("pending", "Bu test bo'yicha chekingiz allaqachon tekshirilmoqda.", 409)
+    await _mark_payment_owed(payment_id, test_id)
     routing = await _resolve_payment_routing(test_id)
     share_note = (f"\n\n💡 <i>Bu test oddiy foydalanuvchi — {routing['creator_name']} — tomonidan yaratilgan. "
                   f"Tasdiqlasangiz, tegishli ulushni o'ziga o'tkazib berishni unutmang.</i>") if routing["share_reminder"] else ""
