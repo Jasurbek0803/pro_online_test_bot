@@ -2185,6 +2185,9 @@ async def init_db(db):
             created_ts BIGINT DEFAULT 0
         )
     """)
+    # ✅ Admin Mini App'da "Tozalash" bosganda yozuvlar o'chirilmaydi — faqat
+    # ro'yxatdan yashiriladi (zaxira nusxada iz qoladi).
+    await _ensure_column(db, "suspicious_events", "dismissed", "INTEGER DEFAULT 0")
 
     # ✅ O'quvchi testdan menyuga chiqib ketsa, belgilagan javoblari shu yerda
     # saqlanadi — testga qaytganda (vaqt qolgan bo'lsa) davom ettiradi.
@@ -3000,7 +3003,7 @@ NAV_CB_PREFIXES = (
     "rasch_menu", "xl_menu", "trange_menu", "trange_t_", "trange_r_", "live_sessions", "users_menu",
     "userprofile_", "finance_report", "edittest_start", "acmenu_", "hidetest_menu",
     "today_digest", "tests_ranking", "ch_manage", "closetest_menu", "alltests_menu", "admin_list",
-    "mycreatestat_", "ogtests", "ogl_", "oga_", "skg_pending_", "raschrep_", "wallet_", "payout_",
+    "mycreatestat_", "ogtests", "ogl_", "oga_", "skg_pending_", "raschrep_", "wallet_", "payout_", "st_",
 )
 # Sahifalash: shu ekranning o'zi, "orqaga" tarixiga yangi qadam qo'shilmaydi.
 NAV_PAGE_PREFIXES = ("ulp_", "tlp_", "stagepart_")
@@ -10679,74 +10682,466 @@ async def reject_with_reason(message: Message, state: FSMContext, bot: Bot):
 
 
 # ===================== ADMIN: STATS + EXCEL EXPORT =====================
+# ✅ Statistika paneli bo'limlarga ajratilgan: bugun, oxirgi 7 kun (oldingi 7
+# kunga nisbatan o'zgarish), auditoriya (qancha odam test topshirgan/qaytgan),
+# testlar, pul va adminni kutayotgan ishlar. Batafsil tahlil alohida
+# ekranlarda: kunlik dinamika, savollar tahlili, ustozlar, auditoriya.
+def _day_start(days_ago: int = 0) -> datetime:
+    return datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_ago)
+
+
+def _ts_str(dt: datetime) -> str:
+    # results.date / payments.*_at shu ko'rinishda saqlanadi — satr sifatida solishtiriladi
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def _pct(part, whole) -> str:
+    whole = int(whole or 0)
+    return f"{int(part or 0) * 100 / whole:.0f}%" if whole else "0%"
+
+
+def _trend(cur, prev) -> str:
+    """Oldingi davrga nisbatan o'zgarish: ▲ 25% / ▼ 10% / ≈."""
+    cur, prev = float(cur or 0), float(prev or 0)
+    if prev == 0:
+        return " <i>(yangi)</i>" if cur else ""
+    diff = (cur - prev) * 100 / prev
+    if abs(diff) < 1:
+        return " <i>(≈)</i>"
+    return f" <i>({'▲' if diff > 0 else '▼'} {abs(diff):.0f}%)</i>"
+
+
+async def _period_stats(since: datetime, until: datetime) -> dict:
+    s, u = _ts_str(since), _ts_str(until)
+    users = await POOL.fetchval(
+        "SELECT COUNT(*) FROM users WHERE created_ts >= $1 AND created_ts < $2 AND COALESCE(full_name,'')<>''",
+        int(since.timestamp()), int(until.timestamp()))
+    r = await POOL.fetchrow("SELECT COUNT(*) AS n, COUNT(DISTINCT user_id) AS a, AVG(percent) AS p "
+                            "FROM results WHERE date >= $1 AND date < $2", s, u)
+    revenue = await POOL.fetchval("""
+        SELECT COALESCE(SUM(COALESCE(p.amount, t.price)),0) FROM payments p JOIN tests t ON t.id=p.test_id
+        WHERE p.status='approved' AND COALESCE(p.approved_at, p.created_at) >= $1
+          AND COALESCE(p.approved_at, p.created_at) < $2""", s, u)
+    return {"users": int(users or 0), "results": int(r["n"] or 0), "active": int(r["a"] or 0),
+            "avg": float(r["p"]) if r["p"] is not None else None, "revenue": int(revenue or 0)}
+
+
+async def _admin_pending_counts() -> dict:
+    row = await POOL.fetchrow("""
+        SELECT (SELECT COUNT(*) FROM payments WHERE status='pending') AS payments,
+               (SELECT COUNT(*) FROM wallet_tx WHERE kind='topup' AND status='pending') AS topups,
+               (SELECT COUNT(*) FROM results WHERE COALESCE(open_pending,0)>0) AS open_answers,
+               (SELECT COUNT(*) FROM results WHERE essay_status='pending') AS essays,
+               (SELECT COUNT(*) FROM staged_attempts WHERE status='pending_review') AS staged
+    """)
+    return {k: int(row[k] or 0) for k in ("payments", "topups", "open_answers", "essays", "staged")}
+
+
+async def _admin_audience() -> dict:
+    row = await POOL.fetchrow("""
+        WITH per_user AS (SELECT user_id, COUNT(*) AS n, MAX(date) AS last FROM results GROUP BY user_id)
+        SELECT (SELECT COUNT(*) FROM users) AS started,
+               (SELECT COUNT(*) FROM users WHERE COALESCE(full_name,'')<>'') AS registered,
+               (SELECT COUNT(*) FROM per_user) AS tested,
+               (SELECT COUNT(*) FROM per_user WHERE n >= 2) AS returned,
+               (SELECT COUNT(*) FROM per_user WHERE n >= 5) AS loyal,
+               (SELECT COUNT(*) FROM per_user WHERE last >= $1) AS active30,
+               (SELECT COUNT(*) FROM per_user WHERE last < $1) AS dormant
+    """, _ts_str(_day_start(29)))
+    return {k: int(row[k] or 0) for k in row.keys()}
+
+
 @router.message(F.text == BTN_ADMIN_STATS)
 async def admin_stats(message: Message):
     if not await is_admin_user(message.from_user.id):
         return
 
-    users_count = await POOL.fetchval("SELECT COUNT(*) FROM users")
-    tests_count = await POOL.fetchval("SELECT COUNT(*) FROM tests")
-    free_count = await POOL.fetchval("SELECT COUNT(*) FROM tests WHERE is_free=1")
-    paid_count = await POOL.fetchval("SELECT COUNT(*) FROM tests WHERE is_free=0")
+    today, yesterday = _day_start(0), _day_start(1)
+    now = datetime.now(TZ)
+    st_today = await _period_stats(today, now + timedelta(minutes=1))
+    st_yday = await _period_stats(yesterday, today)
+    week = await _period_stats(_day_start(6), now + timedelta(minutes=1))
+    prev_week = await _period_stats(_day_start(13), _day_start(6))
+    aud = await _admin_audience()
+    pend = await _admin_pending_counts()
 
-    pending_count = await POOL.fetchval("SELECT COUNT(*) FROM payments WHERE status='pending'")
-    approved_count = await POOL.fetchval("SELECT COUNT(*) FROM payments WHERE status='approved'")
-    rejected_count = await POOL.fetchval("SELECT COUNT(*) FROM payments WHERE status='rejected'")
-
-    overall_avg = float(await POOL.fetchval("SELECT COALESCE(AVG(percent), 0) FROM results") or 0.0)
-
-    best = await POOL.fetchrow("""
-        SELECT u.full_name, t.code, t.title, r.percent, r.date
-        FROM results r
-        JOIN users u ON u.id=r.user_id
-        JOIN tests t ON t.id=r.test_id
-        ORDER BY r.percent DESC
-        LIMIT 1
+    tests = await POOL.fetchrow("""
+        SELECT COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE is_free=1) AS free,
+               COUNT(*) FILTER (WHERE is_free=0) AS paid,
+               COUNT(*) FILTER (WHERE COALESCE(is_hidden,0)=0 AND COALESCE(is_closed,0)=0) AS active,
+               COUNT(*) FILTER (WHERE COALESCE(is_hidden,0)=1) AS hidden,
+               COUNT(*) FILTER (WHERE COALESCE(is_closed,0)=1) AS closed,
+               COUNT(DISTINCT creator_id) AS teachers
+        FROM tests
     """)
+    rev_expr = "COALESCE(SUM(COALESCE(p.amount, t.price)),0)"
+    revenue_total = await POOL.fetchval(
+        f"SELECT {rev_expr} FROM payments p JOIN tests t ON t.id=p.test_id WHERE p.status='approved'")
+    revenue_month = await POOL.fetchval(f"""
+        SELECT {rev_expr} FROM payments p JOIN tests t ON t.id=p.test_id
+        WHERE p.status='approved' AND COALESCE(p.approved_at, p.created_at) >= $1""",
+        _ts_str(today.replace(day=1)))
+    sales = await POOL.fetchrow("""
+        SELECT COUNT(*) FILTER (WHERE status='approved') AS ok,
+               COUNT(*) FILTER (WHERE status='rejected') AS rej FROM payments""")
+    wallet = await POOL.fetchrow("""
+        SELECT (SELECT COALESCE(SUM(amount),0) FROM wallet_tx WHERE kind='topup' AND status='approved') AS topped,
+               (SELECT COALESCE(SUM(balance),0) FROM users) AS balances""")
 
-    total_revenue = await POOL.fetchval("""
-        SELECT COALESCE(SUM(COALESCE(p.amount, t.price)), 0)
-        FROM payments p JOIN tests t ON t.id=p.test_id WHERE p.status='approved'
-    """)
+    def _avg(v):
+        return f"{v:.1f}%" if v is not None else "—"
+
+    text = (
+        f"📊 <b>Admin statistika</b>\n<i>{_h(now_str_local())} holatiga</i>\n\n"
+        f"📅 <b>Bugun</b> <i>(qavsda — kecha)</i>\n"
+        f"🆕 Yangi a'zolar: <b>{st_today['users']}</b> ({st_yday['users']})\n"
+        f"📝 Topshirilgan testlar: <b>{st_today['results']}</b> ({st_yday['results']})\n"
+        f"🧑‍🎓 Test yechgan o'quvchilar: <b>{st_today['active']}</b> ({st_yday['active']})\n"
+        f"💰 Tushum: <b>{_fmt_money(st_today['revenue'])}</b> ({_fmt_money(st_yday['revenue'])})\n\n"
+        f"📆 <b>Oxirgi 7 kun</b> <i>(oldingi 7 kunga nisbatan)</i>\n"
+        f"🆕 Yangi a'zolar: <b>{week['users']}</b>{_trend(week['users'], prev_week['users'])}\n"
+        f"📝 Topshirilgan testlar: <b>{week['results']}</b>{_trend(week['results'], prev_week['results'])}\n"
+        f"🧑‍🎓 Faol o'quvchilar: <b>{week['active']}</b>{_trend(week['active'], prev_week['active'])}\n"
+        f"📈 O'rtacha natija: <b>{_avg(week['avg'])}</b> <i>(oldin {_avg(prev_week['avg'])})</i>\n"
+        f"💰 Tushum: <b>{_fmt_money(week['revenue'])}</b>{_trend(week['revenue'], prev_week['revenue'])}\n\n"
+        f"👥 <b>Auditoriya</b>\n"
+        f"Ro'yxatdan o'tgan: <b>{aud['registered']}</b> <i>(botni ochgan: {aud['started']})</i>\n"
+        f"Kamida 1 ta test yechgan: <b>{aud['tested']}</b> ({_pct(aud['tested'], aud['registered'])})\n"
+        f"Qaytib kelgan (2+ test): <b>{aud['returned']}</b> ({_pct(aud['returned'], aud['tested'])})\n"
+        f"Hali test yechmagan: <b>{max(0, aud['registered'] - aud['tested'])}</b>\n"
+        f"30 kunda faol: <b>{aud['active30']}</b> · 30+ kun kelmagan: <b>{aud['dormant']}</b>\n\n"
+        f"📚 <b>Testlar: {tests['total']}</b> (🆓 {tests['free']} / 🧾 {tests['paid']})\n"
+        f"Faol: <b>{tests['active']}</b> · yashirin: {tests['hidden']} · yakunlangan: {tests['closed']}\n"
+        f"👨‍🏫 Test yaratganlar: <b>{tests['teachers']}</b>\n\n"
+        f"💰 <b>Pul</b>\n"
+        f"Test sotuvlari: <b>{_fmt_money(revenue_total)}</b> ({sales['ok']} ta) · shu oy: "
+        f"<b>{_fmt_money(revenue_month)}</b>\n"
+        f"👛 Hamyonlarga tushgan: <b>{_fmt_money(wallet['topped'])}</b> · "
+        f"foydalanuvchilar balansida: <b>{_fmt_money(wallet['balances'])}</b>\n"
+    )
+    if message.from_user.id == ADMIN_ID:
+        owed = await POOL.fetchval(f"""
+            SELECT {_PAYOUT_SUM} FROM payments p JOIN tests t ON t.id=p.test_id
+            WHERE p.status='approved' AND p.owed_to IS NOT NULL AND p.payout_id IS NULL""")
+        if owed:
+            text += f"👨‍🏫 Ustozlarga o'tkazilishi kerak: <b>{_fmt_money(owed)}</b>\n"
+
+    todo = [(pend["payments"], "🧾 To'lov cheklari"), (pend["topups"], "👛 Hamyon to'ldirish cheklari"),
+            (pend["open_answers"], "✍️ Ochiq javobli natijalar"), (pend["essays"], "📝 Esselar"),
+            (pend["staged"], "🎓 Bosqichli imtihon baholash")]
+    todo = [f"{label}: <b>{n}</b>" for n, label in todo if n]
+    text += "\n⏳ <b>Sizni kutayotgan ishlar</b>\n" + ("\n".join(todo) if todo else "✅ Hammasi bajarilgan")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📤 Excel eksport (test bo‘yicha)", callback_data="xl_menu"),
-         InlineKeyboardButton(text="⚡ Rasch hisobot", callback_data="rasch_menu")],
-        [InlineKeyboardButton(text="⏱ Vaqt oralig'ida natijalar", callback_data="trange_menu"),
-         InlineKeyboardButton(text="🟢 Hozir faol foydalanuvchilar", callback_data="live_sessions")],
-        [InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="users_menu"),
-         InlineKeyboardButton(text="🔍 Foydalanuvchi qidirish", callback_data="user_search")],
-        [InlineKeyboardButton(text="📢 Xabar yuborish (barchaga)", callback_data="broadcast_start"),
-         InlineKeyboardButton(text="💰 Moliyaviy hisobot", callback_data="finance_report")],
-        [InlineKeyboardButton(text="✏️ Testni tahrirlash", callback_data="edittest_start"),
-         InlineKeyboardButton(text="⏸ Testni yashirish/qaytarish", callback_data="hidetest_menu")],
-        [InlineKeyboardButton(text="📚 Barcha testlar (kim yaratgan)", callback_data="alltests_menu")],
+        [InlineKeyboardButton(text="📈 Kunlik dinamika", callback_data="st_trend"),
+         InlineKeyboardButton(text="🔬 Savollar tahlili", callback_data="st_items")],
+        [InlineKeyboardButton(text="👨‍🏫 Ustozlar faolligi", callback_data="st_teachers"),
+         InlineKeyboardButton(text="🗺 Auditoriya", callback_data="st_audience")],
         [InlineKeyboardButton(text="📅 Bugungi hisobot", callback_data="today_digest"),
          InlineKeyboardButton(text="🏆 Testlar reytingi", callback_data="tests_ranking")],
+        [InlineKeyboardButton(text="⏱ Vaqt oralig'ida natijalar", callback_data="trange_menu"),
+         InlineKeyboardButton(text="🟢 Hozir faol foydalanuvchilar", callback_data="live_sessions")],
+        [InlineKeyboardButton(text="📤 Excel eksport (test bo‘yicha)", callback_data="xl_menu"),
+         InlineKeyboardButton(text="⚡ Rasch hisobot", callback_data="rasch_menu")],
+        [InlineKeyboardButton(text="💰 Moliyaviy hisobot", callback_data="finance_report")],
+        [InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="users_menu"),
+         InlineKeyboardButton(text="🔍 Foydalanuvchi qidirish", callback_data="user_search")],
+        [InlineKeyboardButton(text="📚 Barcha testlar (kim yaratgan)", callback_data="alltests_menu")],
+        [InlineKeyboardButton(text="✏️ Testni tahrirlash", callback_data="edittest_start"),
+         InlineKeyboardButton(text="⏸ Testni yashirish/qaytarish", callback_data="hidetest_menu")],
         [InlineKeyboardButton(text="🛑 Testlarni yakunlash/qayta ochish", callback_data="closetest_menu")],
         [InlineKeyboardButton(text="✍️ Tekshirilmagan ochiq javoblar", callback_data="ogtests")],
+        [InlineKeyboardButton(text="📢 Xabar yuborish (barchaga)", callback_data="broadcast_start")],
         [InlineKeyboardButton(text="💾 Zaxira nusxa olish (backup)", callback_data="backup_now"),
          InlineKeyboardButton(text="📥 Zaxiradan tiklash", callback_data="restore_start")],
     ])
     if message.from_user.id == ADMIN_ID:
-        kb.inline_keyboard.insert(3, [InlineKeyboardButton(text="💰 Ustozlarga to'lovlar", callback_data="payout_menu")])
-
-    text = (
-        f"<b>📊 Admin Statistika Paneli</b>\n\n"
-        f"👥 Userlar: <b>{users_count}</b>\n"
-        f"📚 Testlar: <b>{tests_count}</b> (🆓 {free_count} / 🧾 {paid_count})\n\n"
-        f"🟡 Pending: <b>{pending_count}</b>\n"
-        f"✅ Approved (sotilgan): <b>{approved_count}</b>\n"
-        f"❌ Rejected: <b>{rejected_count}</b>\n\n"
-        f"💰 Umumiy tushum: <b>{int(total_revenue):,}".replace(",", " ") + " so'm</b>\n"
-        f"📈 Umumiy o‘rtacha o‘zlashtirish: <b>{overall_avg:.1f}%</b>\n"
-    )
-
-    if best:
-        uname, code, title, pct, dt = best["full_name"], best["code"], best["title"], best["percent"], best["date"]
-        text += f"\n🏅 Eng yuqori natija: <b>{uname}</b>\n🔑 <code>{code}</code> {title} — <b>{float(pct):.1f}%</b> ({dt})\n"
+        kb.inline_keyboard[5].append(InlineKeyboardButton(text="💰 Ustozlarga to'lovlar", callback_data="payout_menu"))
 
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+WEEKDAYS_UZ = ("Dushanba", "Seshanba", "Chorshanba", "Payshanba", "Juma", "Shanba", "Yakshanba")
+
+
+@router.callback_query(F.data == "st_trend")
+async def stats_trend(callback: CallbackQuery):
+    if not await is_admin_user(callback.from_user.id):
+        return
+    days = 14
+    d = await _admin_stats(days)
+    daily = d["daily"]
+    peak = max([x["results"] for x in daily] + [1])
+    lines = []
+    for x in daily:
+        bar = "▇" * round(x["results"] * 8 / peak) if x["results"] else "·"
+        avg = f"{x['avg']:.0f}%" if x["results"] else "  —"
+        lines.append(f"{x['d'][5:]} {x['users']:>5} {x['results']:>4} {avg:>4} {bar}")
+    tot_u = sum(x["users"] for x in daily)
+    tot_r = sum(x["results"] for x in daily)
+    tot_rev = sum(x["revenue"] for x in daily)
+    text = (f"📈 <b>Kunlik dinamika</b> (oxirgi {days} kun)\n\n"
+            f"<pre>Sana  Yangi Test O'rt\n" + _h("\n".join(lines)) + "</pre>\n"
+            f"<i>Yangi — ro'yxatdan o'tganlar, Test — topshirilgan testlar, O'rt — o'rtacha natija</i>\n\n"
+            f"Jami {days} kun: 🆕 <b>{tot_u}</b> a'zo · 📝 <b>{tot_r}</b> test · 💰 <b>{_fmt_money(tot_rev)}</b>\n")
+    rev_days = [x for x in daily if x["revenue"]]
+    if rev_days:
+        text += "💰 Tushum bo'lgan kunlar: " + ", ".join(
+            f"{x['d'][5:]} — {_fmt_money(x['revenue'])}" for x in rev_days[-7:]) + "\n"
+
+    since30 = _ts_str(_day_start(29))
+    hours = await POOL.fetch("""
+        SELECT SUBSTRING(date, 12, 2) AS h, COUNT(*) AS n FROM results
+        WHERE date >= $1 AND LENGTH(date) >= 13 GROUP BY 1 ORDER BY n DESC LIMIT 3""", since30)
+    wdays = await POOL.fetch("""
+        SELECT EXTRACT(ISODOW FROM to_date(LEFT(date, 10), 'YYYY-MM-DD'))::int AS wd, COUNT(*) AS n FROM results
+        WHERE date >= $1 GROUP BY 1 ORDER BY n DESC""", since30)
+    n30 = sum(int(r["n"]) for r in wdays)
+    if n30:
+        text += "\n🕐 <b>Eng faol soatlar</b> (30 kun): " + ", ".join(
+            f"{r['h']}:00–{(int(r['h']) + 1) % 24:02d}:00 ({_pct(r['n'], n30)})" for r in hours if (r["h"] or "").isdigit())
+        text += "\n📅 <b>Eng faol kunlar</b>: " + ", ".join(
+            f"{WEEKDAYS_UZ[int(r['wd']) - 1]} ({_pct(r['n'], n30)})" for r in wdays[:3])
+        text += "\n<i>💡 Yangi test yoki olimpiadani shu vaqtlarda e'lon qilsangiz, ko'proq odam qatnashadi.</i>"
+    await callback.message.answer(text, parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data == "st_items")
+async def stats_items_menu(callback: CallbackQuery):
+    if not await is_admin_user(callback.from_user.id):
+        return
+    rows = await POOL.fetch(f"""
+        SELECT t.id, t.code, t.title, COUNT(r.id) AS n, MAX(r.date) AS last
+        FROM tests t JOIN results r ON r.test_id=t.id
+        WHERE COALESCE(t.exam_type,'simple') NOT IN ({",".join(f"'{x}'" for x in STAGED_EXAM_TYPES)})
+          AND r.user_answers IS NOT NULL
+        GROUP BY t.id, t.code, t.title ORDER BY last DESC LIMIT 30""")
+    if not rows:
+        return await callback.message.answer("🔬 Tahlil qilish uchun hali hech kim test yechmagan.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text=f"🔬 {r['code']} — {r['title'] or ''}"[:48] + f" ({r['n']})", callback_data=f"st_item_{r['id']}")]
+        for r in rows])
+    await callback.message.answer(
+        "🔬 <b>Savollar tahlili</b>\n\nQaysi savollar eng qiyin bo'lgani, o'quvchilar qaysi noto'g'ri variantni "
+        "ko'p tanlagani va kalitda xato bo'lishi mumkin bo'lgan savollar ko'rsatiladi.\n\nTestni tanlang:",
+        parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+def _item_stats(key: str, answer_rows: list) -> list[dict]:
+    """Har bir savol bo'yicha: nechta javob, to'g'ri, belgilanmagan, noto'g'ri
+    variantlar taqsimoti va ajratish ko'rsatkichi (kuchli va zaif o'quvchilar
+    farqi). answer_rows: [(user_answers, open_grades_dict), ...]."""
+    qn = len(key)
+    stats = [{"q": i + 1, "key": key[i], "n": 0, "ok": 0, "blank": 0, "wrong": {}} for i in range(qn)]
+    vectors = []
+    for ans, grades in answer_rows:
+        vec = []
+        for i in range(qn):
+            s = stats[i]
+            if key[i] == "x":
+                g = grades.get(str(i + 1))
+                if g is None:
+                    vec.append(None)
+                    continue
+                ok = int(g) == 1
+            else:
+                ch = ans[i] if i < len(ans) else "*"
+                ok = ch == key[i]
+                if ch == "*":
+                    s["blank"] += 1
+                elif not ok:
+                    s["wrong"][ch] = s["wrong"].get(ch, 0) + 1
+            s["n"] += 1
+            s["ok"] += ok
+            vec.append(ok)
+        vectors.append(vec)
+    # ajratish: eng yaxshi 27% va eng zaif 27% o'quvchilar to'g'ri javob ulushi farqi
+    if len(vectors) >= 20:
+        ranked = sorted(vectors, key=lambda v: sum(1 for x in v if x), reverse=True)
+        k = max(1, round(len(ranked) * 0.27))
+        top, bottom = ranked[:k], ranked[-k:]
+        for i in range(qn):
+            t = [v[i] for v in top if v[i] is not None]
+            b = [v[i] for v in bottom if v[i] is not None]
+            if t and b:
+                stats[i]["disc"] = sum(t) / len(t) - sum(b) / len(b)
+    for s in stats:
+        s["p"] = s["ok"] / s["n"] if s["n"] else None
+    return stats
+
+
+@router.callback_query(F.data.startswith("st_item_"))
+async def stats_item_analysis(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    test_id = int(parts[2])
+    variant = parts[3] if len(parts) > 3 and parts[3] in ("a", "b") else "a"
+    t = await POOL.fetchrow("SELECT id, code, title, exam_type, creator_id, questions_count, answers, "
+                            "open_ref_answers, b_answers, b_open_ref_answers FROM tests WHERE id=$1", test_id)
+    if not t:
+        return await callback.answer("Test topilmadi.", show_alert=True)
+    if t["creator_id"] != callback.from_user.id and not await is_admin_user(callback.from_user.id):
+        return await callback.answer("Bu test sizga tegishli emas!", show_alert=True)
+    if (t["exam_type"] or "simple") in STAGED_EXAM_TYPES:
+        return await callback.answer("Bosqichli imtihonlar uchun savollar tahlili hozircha yo'q.", show_alert=True)
+
+    key = normalize_answers(_variant_fields(t, variant)[0] or "")[:int(t["questions_count"] or 0)]
+    rows = await POOL.fetch("""
+        SELECT user_answers, open_grades FROM results
+        WHERE test_id=$1 AND user_answers IS NOT NULL AND COALESCE(variant,'a')=$2""", test_id, variant)
+    answer_rows = [(normalize_answers(r["user_answers"] or ""), _load_json_dict(r["open_grades"])) for r in rows]
+    head = f"🔬 <b>Savollar tahlili</b> — <code>{_h(t['code'])}</code> {_h(t['title'] or '')}"
+    if t["b_answers"]:
+        head += f" · <b>{variant.upper()} variant</b>"
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    if t["b_answers"]:
+        other = "b" if variant == "a" else "a"
+        kb.inline_keyboard.append([InlineKeyboardButton(
+            text=f"🔁 {other.upper()} variantni ko'rish", callback_data=f"st_item_{test_id}_{other}")])
+    if not key or not answer_rows:
+        return await callback.message.answer(head + "\n\nBu test (variant) bo'yicha hali javoblar yo'q.",
+                                             parse_mode=ParseMode.HTML, reply_markup=kb if kb.inline_keyboard else None)
+
+    stats = _item_stats(key, answer_rows)
+    scored = [s for s in stats if s["p"] is not None]
+    hard = sorted([s for s in scored if s["p"] < 0.3], key=lambda s: s["p"])
+    easy = [s for s in scored if s["p"] >= 0.7]
+    text = (head + f"\n\nTahlil qilingan ishlar: <b>{len(answer_rows)}</b> · savollar: <b>{len(key)}</b>\n"
+            f"🟩 Oson (70%+ topgan): <b>{len(easy)}</b> · 🟨 o'rtacha: <b>{len(scored) - len(easy) - len(hard)}</b> · "
+            f"🟥 qiyin (30% dan kam): <b>{len(hard)}</b>\n")
+
+    def _top_wrong(s):
+        if not s["wrong"]:
+            return None, 0
+        ch, n = max(s["wrong"].items(), key=lambda kv: kv[1])
+        return ch, n
+
+    if hard:
+        text += "\n🟥 <b>Eng qiyin savollar</b>\n"
+        for s in hard[:8]:
+            line = f"• {s['q']}-savol — <b>{s['p'] * 100:.0f}%</b> to'g'ri"
+            ch, n = _top_wrong(s)
+            if ch and s["key"] != "x":
+                line += f" · ko'pchilik «{_h(ch)}» ni tanlagan ({_pct(n, s['n'])}), to'g'ri «{_h(s['key'])}»"
+            text += line + "\n"
+
+    suspects = []
+    for s in scored:
+        ch, n = _top_wrong(s)
+        if s["n"] >= 5 and s["key"] != "x" and ch and n / s["n"] >= 0.5 and s["p"] < 0.3:
+            suspects.append(f"• {s['q']}-savol: {_pct(n, s['n'])} «{_h(ch)}» ni tanlagan, kalitda «{_h(s['key'])}»")
+        elif s.get("disc") is not None and s["disc"] <= -0.2:
+            suspects.append(f"• {s['q']}-savol: kuchli o'quvchilar zaiflardan <b>kamroq</b> topgan — "
+                            f"savol yoki kalit chalkash bo'lishi mumkin")
+    if suspects:
+        text += "\n⚠️ <b>Kalitni tekshirib ko'ring</b>\n" + "\n".join(suspects[:8]) + "\n"
+
+    blanks = sorted([s for s in stats if s["n"] and s["blank"] / s["n"] >= 0.3], key=lambda s: -s["blank"])
+    if blanks:
+        text += "\n⬜ <b>Ko'p belgilanmay qolgan</b>: " + ", ".join(
+            f"{s['q']} ({_pct(s['blank'], s['n'])})" for s in blanks[:8]) + "\n"
+
+    if easy:
+        text += "\n🟩 <b>Eng oson</b>: " + ", ".join(
+            f"{s['q']} ({s['p'] * 100:.0f}%)" for s in sorted(easy, key=lambda s: -s["p"])[:8]) + "\n"
+
+    cells = []
+    for s in stats:
+        mark = "—" if s["p"] is None else f"{s['p'] * 100:.0f}%"
+        cells.append(f"{s['q']:>3} {mark:>4}")
+    grid = "\n".join(" │".join(cells[i:i + 4]) for i in range(0, len(cells), 4))
+    tail = "\n📋 <b>Har bir savol</b> (to'g'ri topganlar ulushi):\n<pre>" + _h(grid) + "</pre>"
+    if len(text) + len(tail) < 4000:
+        text += tail
+    await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb if kb.inline_keyboard else None)
+
+
+@router.callback_query(F.data == "st_teachers")
+async def stats_teachers(callback: CallbackQuery):
+    if not await is_admin_user(callback.from_user.id):
+        return
+    since30 = _ts_str(_day_start(29))
+    rows = await POOL.fetch("""
+        SELECT t.creator_id, MAX(u.full_name) AS name, MAX(u.role) AS role,
+               COUNT(DISTINCT t.id) AS tests, COUNT(r.id) AS results, COUNT(DISTINCT r.user_id) AS students,
+               COUNT(r.id) FILTER (WHERE r.date >= $1) AS results30, AVG(r.percent) AS avgp,
+               COUNT(r.id) FILTER (WHERE COALESCE(r.open_pending,0)>0 OR r.essay_status='pending') AS todo,
+               MAX(r.date) AS last
+        FROM tests t LEFT JOIN users u ON u.telegram_id=t.creator_id LEFT JOIN results r ON r.test_id=t.id
+        WHERE t.creator_id IS NOT NULL
+        GROUP BY t.creator_id ORDER BY results30 DESC, results DESC LIMIT 15""", since30)
+    if not rows:
+        return await callback.message.answer("👨‍🏫 Hali hech kim test yaratmagan.")
+    revenue = {int(r["creator_id"]): int(r["s"] or 0) for r in await POOL.fetch("""
+        SELECT t.creator_id, SUM(COALESCE(p.amount, t.price)) AS s FROM payments p JOIN tests t ON t.id=p.test_id
+        WHERE p.status='approved' AND t.creator_id IS NOT NULL GROUP BY t.creator_id""")}
+    text = "👨‍🏫 <b>Ustozlar faolligi</b> <i>(oxirgi 30 kundagi faollik bo'yicha)</i>\n"
+    for i, r in enumerate(rows, 1):
+        cid = int(r["creator_id"])
+        who = _h(r["name"] or str(cid))
+        if cid == callback.from_user.id:
+            who += " (siz)"
+        elif cid == ADMIN_ID or r["role"] == "admin":
+            who += " · admin"
+        avg = f"{float(r['avgp']):.0f}%" if r["avgp"] is not None else "—"
+        item = (f"\n{i}. <b>{who}</b>\n"
+                 f"   📚 {r['tests']} test · 🧑‍🎓 {r['students']} o'quvchi · 📝 {r['results']} natija "
+                 f"(30 kunda {r['results30']})\n"
+                 f"   📈 o'rtacha {avg}")
+        if revenue.get(cid):
+            item += f" · 💰 {_fmt_money(revenue[cid])}"
+        if r["todo"]:
+            item += f" · ✍️ tekshirilmagan: <b>{r['todo']}</b>"
+        if r["last"]:
+            item += f"\n   🕐 oxirgi natija: {_h(r['last'])}"
+        if len(text) + len(item) > 4000:
+            break
+        text += item + "\n"
+    await callback.message.answer(text, parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data == "st_audience")
+async def stats_audience(callback: CallbackQuery):
+    if not await is_admin_user(callback.from_user.id):
+        return
+    aud = await _admin_audience()
+    reg = aud["registered"]
+    text = (
+        "🗺 <b>Auditoriya</b>\n\n"
+        "🔻 <b>Voronka</b> (botga kirgandan sodiq o'quvchigacha)\n"
+        f"Botni ochgan: <b>{aud['started']}</b>\n"
+        f"Ro'yxatdan o'tgan: <b>{reg}</b> ({_pct(reg, aud['started'])})\n"
+        f"1+ test yechgan: <b>{aud['tested']}</b> ({_pct(aud['tested'], reg)})\n"
+        f"2+ test yechgan: <b>{aud['returned']}</b> ({_pct(aud['returned'], reg)})\n"
+        f"5+ test yechgan: <b>{aud['loyal']}</b> ({_pct(aud['loyal'], reg)})\n"
+        f"<i>💡 30+ kun kelmagan {aud['dormant']} kishini «📢 Xabar yuborish» orqali yangi test bilan "
+        f"qaytarish mumkin.</i>\n"
+    )
+    regions = await POOL.fetch("""
+        SELECT COALESCE(NULLIF(TRIM(region),''), '—') AS k, COUNT(*) AS n FROM users
+        WHERE COALESCE(full_name,'')<>'' GROUP BY 1 ORDER BY n DESC""")
+    known = [r for r in regions if r["k"] != "—"]
+    if known:
+        text += "\n📍 <b>Hududlar</b>\n" + "\n".join(
+            f"{_h(r['k'])} — <b>{r['n']}</b> ({_pct(r['n'], reg)})" for r in known[:10])
+        unknown = sum(int(r["n"]) for r in regions if r["k"] == "—")
+        if unknown:
+            text += f"\n<i>Hududini ko'rsatmagan: {unknown}</i>"
+        text += "\n"
+    grades = await POOL.fetch("""
+        SELECT TRIM(grade) AS k, COUNT(*) AS n FROM users
+        WHERE COALESCE(TRIM(grade),'')<>'' AND COALESCE(full_name,'')<>'' GROUP BY 1 ORDER BY n DESC LIMIT 8""")
+    if grades:
+        text += "\n🎒 <b>Sinflar</b>: " + ", ".join(
+            f"{_h(r['k'])}{'-sinf' if r['k'].isdigit() else ''} — {r['n']}" for r in grades) + "\n"
+    top = await POOL.fetch("""
+        SELECT u.full_name, COUNT(*) AS n, AVG(r.percent) AS p FROM results r JOIN users u ON u.id=r.user_id
+        WHERE r.date >= $1 GROUP BY u.id, u.full_name ORDER BY n DESC, p DESC LIMIT 10""", _ts_str(_day_start(29)))
+    if top:
+        text += "\n🏅 <b>Eng faol o'quvchilar</b> (30 kun)\n" + "\n".join(
+            f"{i}. {_h(r['full_name'] or '-')} — {r['n']} test, o'rtacha {float(r['p'] or 0):.0f}%"
+            for i, r in enumerate(top, 1))
+    await callback.message.answer(text, parse_mode=ParseMode.HTML)
 
 
 @router.callback_query(F.data == "rasch_menu")
@@ -13647,6 +14042,8 @@ async def creator_test_stat_cb(callback: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📤 Excel eksport", callback_data=f"xl_{test_id}")]
     ])
+    if participants and exam_type not in STAGED_EXAM_TYPES:
+        kb.inline_keyboard[0].append(InlineKeyboardButton(text="🔬 Savollar tahlili", callback_data=f"st_item_{test_id}"))
     if exam_type == 'rasch':
         kb.inline_keyboard.append([InlineKeyboardButton(text="⚡ Rasch hisobot", callback_data=f"raschrep_{test_id}")])
         if _essay_cfg_of(await POOL.fetchval("SELECT essay_cfg FROM tests WHERE id=$1", test_id)):
@@ -16435,6 +16832,20 @@ async def webapp_api_admin_stats(request: web.Request):
     return web.json_response({"ok": True, **await _admin_stats()})
 
 
+@_web_handler
+async def webapp_api_admin_events_clear(request: web.Request):
+    """Shubhali faollik ro'yxatini tozalash: admin ko'rgan (upto_id gacha)
+    yozuvlar yashiriladi; shu orada kelgan yangilari ro'yxatda qoladi."""
+    ctx = await _web_auth(request)
+    if not await is_admin_user(ctx["tg_id"]):
+        raise WebError("forbidden", "Bu bo'lim faqat adminlar uchun.", 403)
+    body = await _web_body(request)
+    upto = _web_int(body.get("upto_id"), "upto_id")
+    res = await POOL.execute(
+        "UPDATE suspicious_events SET dismissed=1 WHERE id<=$1 AND COALESCE(dismissed,0)=0", upto)
+    return web.json_response({"ok": True, "cleared": int(res.split()[-1])})
+
+
 async def _admin_stats(days: int = 14) -> dict:
     now = datetime.now(TZ)
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -16463,11 +16874,10 @@ async def _admin_stats(days: int = 14) -> dict:
             SELECT {rev_expr} FROM payments p JOIN tests t ON t.id=p.test_id
             WHERE p.status='approved' AND COALESCE(p.approved_at, p.created_at) >= $1""", today_str) or 0),
     }
-    pending = {
-        "payments": await POOL.fetchval("SELECT COUNT(*) FROM payments WHERE status='pending'"),
-        "open_answers": await POOL.fetchval("SELECT COUNT(*) FROM results WHERE COALESCE(open_pending,0)>0"),
-        "staged": await POOL.fetchval("SELECT COUNT(*) FROM staged_attempts WHERE status='pending_review'"),
-    }
+    pending = await _admin_pending_counts()
+    week_end = now + timedelta(minutes=1)
+    week = await _period_stats(_day_start(6), week_end)
+    prev_week = await _period_stats(_day_start(13), _day_start(6))
 
     labels = [(start_day + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
     u_rows = await POOL.fetch("""
@@ -16496,11 +16906,14 @@ async def _admin_stats(days: int = 14) -> dict:
         LEFT JOIN results r ON r.test_id=t.id
         WHERE t.creator_id IS NOT NULL GROUP BY t.creator_id ORDER BY results DESC, tests DESC LIMIT 5""")
     events = await POOL.fetch("""
-        SELECT e.kind, e.details, e.created_ts, u.full_name, t.code
+        SELECT e.id, e.kind, e.details, e.created_ts, u.full_name, t.code
         FROM suspicious_events e LEFT JOIN users u ON u.id=e.user_id LEFT JOIN tests t ON t.id=e.test_id
-        ORDER BY e.id DESC LIMIT 15""")
+        WHERE COALESCE(e.dismissed,0)=0 ORDER BY e.id DESC LIMIT 15""")
+    events_total = await POOL.fetchval("SELECT COUNT(*) FROM suspicious_events WHERE COALESCE(dismissed,0)=0")
     return {
+        "events_total": int(events_total or 0), "events_max_id": max((int(e["id"]) for e in events), default=0),
         "totals": totals, "today": today_s, "pending": pending, "daily": daily,
+        "week": week, "prev_week": prev_week, "audience": await _admin_audience(),
         "top_tests": [{"code": r["code"], "title": r["title"], "n": int(r["n"]), "avg": round(float(r["p"] or 0), 1)}
                       for r in top_tests],
         "top_teachers": [{"name": r["name"], "tests": int(r["tests"]), "results": int(r["results"])}
@@ -17282,6 +17695,7 @@ def build_webapp_application(bot: Bot | None = None) -> web.Application:
     app.router.add_get("/api/result/{test_id}", webapp_api_result)
     app.router.add_post("/api/test/remind", webapp_api_remind)
     app.router.add_get("/api/admin/stats", webapp_api_admin_stats)
+    app.router.add_post("/api/admin/events/clear", webapp_api_admin_events_clear)
     app.router.add_post("/api/register", webapp_api_register)
     app.router.add_get("/api/ping", webapp_api_ping)
     app.router.add_post("/api/clientlog", webapp_api_clientlog)
@@ -18996,6 +19410,26 @@ function barChart(series, key, color) {
   bars += `<text x="${L}" y="${H - 4}" font-size="9" fill="var(--hint)">${lbl(0)}</text><text x="${W - R}" y="${H - 4}" text-anchor="end" font-size="9" fill="var(--hint)">${lbl(n - 1)}</text>`;
   return el("div", {html: `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img">${bars}</svg>`});
 }
+function clearEventsBtn(d) {
+  // ikki bosqichli tasdiq: birinchi bosish so'raydi, 4 soniya ichida ikkinchisi tozalaydi
+  const label = `Ro'yxatni tozalash (${d.events_total})`;
+  let armed = false, timer = null;
+  const b = el("button", {class: "btn block ghost", style: "margin:10px 0 8px"}, label);
+  b.onclick = async () => {
+    if (!armed) {
+      armed = true; b.textContent = "Tozalansinmi? Tasdiqlash uchun yana bosing"; b.classList.add("danger");
+      timer = setTimeout(() => { armed = false; b.textContent = label; b.classList.remove("danger"); }, 4000);
+      return;
+    }
+    clearTimeout(timer); b.disabled = true; b.textContent = "Tozalanmoqda...";
+    try {
+      const r = await api("/api/admin/events/clear", {body: {upto_id: d.events_max_id}});
+      toast(`${r.cleared} ta yozuv tozalandi`);
+      renderAdmin();
+    } catch (e) { b.disabled = false; armed = false; b.textContent = label; b.classList.remove("danger"); handleErr(e); }
+  };
+  return b;
+}
 async function renderAdmin() {
   stopTick(); showTabs(false); setBack(renderHome);
   mount(el("div", {class: "center"}, el("div", {class: "spin dark"}), el("div", {class: "muted"}, "Statistika yuklanmoqda...")));
@@ -19016,8 +19450,20 @@ async function renderAdmin() {
   Object.keys(charts).forEach(k => chartSeg.append(el("button", {"data-k": k, onclick: () => showChart(k)}, charts[k][0].split(" ")[0])));
   const pend = [];
   if (P.payments) pend.push(statusBox("warn", `${P.payments} ta to'lov tasdiqlanishini kutmoqda`));
+  if (P.topups) pend.push(statusBox("warn", `${P.topups} ta hamyon to'ldirish cheki tasdiqlanishini kutmoqda`));
   if (P.open_answers) pend.push(statusBox("warn", `${P.open_answers} ta natijada ochiq javob tekshirilmagan`));
+  if (P.essays) pend.push(statusBox("warn", `${P.essays} ta esse baholanishini kutmoqda`));
   if (P.staged) pend.push(statusBox("warn", `${P.staged} ta bosqichli imtihon baholanishini kutmoqda`));
+  const W = d.week || {}, PW = d.prev_week || {}, A = d.audience || {};
+  const trend = (c, p) => {
+    if (!p) return c ? el("span", {class: "small", style: "color:var(--ok)"}, " yangi") : "";
+    const x = Math.round((c - p) * 100 / p);
+    if (!x) return el("span", {class: "muted small"}, " ≈");
+    return el("span", {class: "small", style: `color:var(${x > 0 ? "--ok" : "--bad"})`}, ` ${x > 0 ? "▲" : "▼"} ${Math.abs(x)}%`);
+  };
+  const kvT = (label, v, c, p) => el("div", {class: "kv"}, el("span", {}, label), el("b", {}, v, trend(c, p)));
+  const pctOf = (a, b) => b ? Math.round(a * 100 / b) + "%" : "0%";
+  const avgTxt = v => v == null ? "—" : v.toFixed(1) + "%";
   if (!pend.length) pend.push(statusBox("ok", "Kutilayotgan ish yo'q"));
   const list = (rows, fn) => rows.length ? rows.map(fn) : [el("div", {class: "muted", style: "padding:12px 0"}, "Ma'lumot yo'q")];
   const evName = {fast: "Juda tez yechildi", phone: "Bir telefonda bir nechta akkaunt"};
@@ -19034,6 +19480,20 @@ async function renderAdmin() {
       el("div", {class: "kv"}, el("span", {}, "Jami tushum"), el("b", {}, fmtSum(T.revenue_total))),
       el("div", {class: "kv"}, el("span", {}, "Test yaratuvchilar"), el("b", {}, T.teachers))),
     el("div", {class: "sect"}, "Kutilayotgan ishlar"), el("div", {class: "card", style: "margin-top:0"}, ...pend),
+    el("div", {class: "sect"}, "Oxirgi 7 kun"), el("div", {class: "card", style: "margin-top:0"},
+      el("div", {class: "muted small", style: "margin-bottom:6px"}, "Oldingi 7 kunga nisbatan o'zgarish"),
+      kvT("Yangi a'zolar", W.users, W.users, PW.users),
+      kvT("Topshirilgan testlar", W.results, W.results, PW.results),
+      kvT("Faol o'quvchilar", W.active, W.active, PW.active),
+      el("div", {class: "kv"}, el("span", {}, "O'rtacha natija"), el("b", {}, avgTxt(W.avg), el("span", {class: "muted small"}, ` (oldin ${avgTxt(PW.avg)})`))),
+      kvT("Tushum", fmtSum(W.revenue || 0), W.revenue, PW.revenue)),
+    el("div", {class: "sect"}, "Auditoriya"), el("div", {class: "card", style: "margin-top:0"},
+      el("div", {class: "kv"}, el("span", {}, "Ro'yxatdan o'tgan"), el("b", {}, A.registered)),
+      el("div", {class: "kv"}, el("span", {}, "Kamida 1 ta test yechgan"), el("b", {}, `${A.tested} (${pctOf(A.tested, A.registered)})`)),
+      el("div", {class: "kv"}, el("span", {}, "Qaytib kelgan (2+ test)"), el("b", {}, `${A.returned} (${pctOf(A.returned, A.tested)})`)),
+      el("div", {class: "kv"}, el("span", {}, "30 kunda faol"), el("b", {}, A.active30)),
+      el("div", {class: "kv"}, el("span", {}, "30+ kun kelmagan"), el("b", {}, A.dormant)),
+      el("div", {class: "muted small", style: "margin-top:8px"}, "Batafsil tahlil (savollar tahlili, ustozlar, hududlar) — botdagi «📊 Statistika (Admin)» bo'limida.")),
     el("div", {class: "sect"}, "So'nggi 14 kun"), el("div", {class: "card", style: "margin-top:0"}, chartSeg, tabsBox),
     el("div", {class: "sect"}, "Eng faol testlar (14 kun)"), el("div", {class: "card", style: "margin-top:0;padding-top:4px;padding-bottom:4px"},
       ...list(d.top_tests, t => el("div", {class: "list-item"}, el("div", {style: "min-width:0"}, el("b", {}, t.title), el("div", {class: "muted small"}, `${t.code} · o'rtacha ${t.avg}%`)), el("span", {class: "badge"}, t.n)))),
@@ -19042,7 +19502,8 @@ async function renderAdmin() {
     el("div", {class: "sect"}, "Shubhali faollik"), el("div", {class: "card", style: "margin-top:0;padding-top:4px;padding-bottom:4px"},
       ...list(d.events, e => el("div", {class: "list-item", style: "align-items:flex-start"}, el("div", {style: "min-width:0"},
         el("b", {style: "color:var(--bad)"}, evName[e.kind] || e.kind), el("div", {class: "small"}, [e.user, e.code].filter(Boolean).join(" · ")),
-        el("div", {class: "muted small"}, e.details)), el("span", {class: "muted small", style: "white-space:nowrap"}, ago(e.ts))))),
+        el("div", {class: "muted small"}, e.details)), el("span", {class: "muted small", style: "white-space:nowrap"}, ago(e.ts)))),
+      d.events.length ? clearEventsBtn(d) : null),
     el("button", {class: "btn block ghost", style: "margin-top:12px", onclick: renderAdmin}, ic("refresh"), "Yangilash")));
   showChart("results");
 }
