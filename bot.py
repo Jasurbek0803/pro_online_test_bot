@@ -4256,14 +4256,27 @@ async def _resolve_payment_routing(test_id: int) -> dict:
             "creator_name": creator_name,
         }
 
+    plat = await _platform_payment_details()
     return {
-        "card": PAYMENT_CARD,
-        "owner": PAYMENT_OWNER,
-        "phone": PAYMENT_PHONE,
+        "card": plat["card"],
+        "owner": plat["owner"],
+        "phone": plat["phone"],
         "notify_tg_id": ADMIN_ID,
         "share_reminder": bool(creator_id) and not creator_is_admin,
         "creator_name": creator_name,
     }
+
+
+async def _platform_payment_details() -> dict:
+    """Umumiy (platforma) to'lov kartasi: asosiy admin «👤 Profilim» orqali
+    karta kiritgan bo'lsa — o'sha, aks holda .env'dagi PAYMENT_CARD. Avval
+    profilda yangilangan karta hamyon va boshqa ustozlar testlarida chiqmasdi."""
+    row = await POOL.fetchrow(
+        "SELECT payment_card, payment_owner, payment_phone FROM users WHERE telegram_id=$1", ADMIN_ID)
+    if row and (row["payment_card"] or "").strip():
+        return {"card": row["payment_card"], "owner": row["payment_owner"] or PAYMENT_OWNER,
+                "phone": row["payment_phone"] or PAYMENT_PHONE}
+    return {"card": PAYMENT_CARD, "owner": PAYMENT_OWNER, "phone": PAYMENT_PHONE}
 
 
 @router.message(F.text == BTN_PAID)
@@ -9849,12 +9862,13 @@ async def wallet_topup_cb(callback: CallbackQuery):
 async def _wallet_ask_receipt(answerable, state: FSMContext, amount: int):
     await state.set_state(WalletState.receipt)
     await state.update_data(wallet_amount=amount)
+    plat = await _platform_payment_details()
     await answerable.answer(
         f"💳 <b>{_fmt_money(amount)}</b> — hamyonni to'ldirish\n\n"
         f"1) Shu summani kartaga o'tkazing:\n"
-        f"💳 Karta: <code>{PAYMENT_CARD}</code>\n"
-        f"👤 Ega: <b>{_h(PAYMENT_OWNER)}</b>\n"
-        f"📞 Telefon: <code>{PAYMENT_PHONE}</code>\n\n"
+        f"💳 Karta: <code>{_h(plat['card'])}</code>\n"
+        f"👤 Ega: <b>{_h(plat['owner'])}</b>\n"
+        f"📞 Telefon: <code>{_h(plat['phone'])}</code>\n\n"
         f"2) To'lov chekining <b>rasmini (skrinshot)</b> shu yerga yuboring.\n\n"
         f"Admin tasdiqlagach summa balansingizga tushadi.",
         parse_mode=ParseMode.HTML,
@@ -16704,7 +16718,7 @@ async def _web_wallet_payload(user_db_id: int) -> dict:
     return {"balance": await wallet_balance(user_db_id),
             "history": [_wallet_tx_json(r) for r in await _wallet_history(user_db_id, 30)],
             "pending_topup": int(pend["amount"]) if pend else None,
-            "card": {"card": PAYMENT_CARD, "owner": PAYMENT_OWNER, "phone": PAYMENT_PHONE},
+            "card": await _platform_payment_details(),
             "presets": list(WALLET_PRESETS), "min": WALLET_TOPUP_MIN, "max": WALLET_TOPUP_MAX}
 
 
