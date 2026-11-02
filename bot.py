@@ -7,6 +7,7 @@ from reportlab.lib.utils import ImageReader
 import asyncio
 import contextlib
 import html
+import io
 import json
 import logging
 import math
@@ -30,6 +31,7 @@ import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
 from openpyxl import Workbook
+from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 
 from aiogram import Bot, Dispatcher, Router, F
@@ -48,7 +50,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import BaseStorage, StorageKey, StateType
 from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
-from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest, TelegramNetworkError
 from aiogram.utils.callback_answer import CallbackAnswerMiddleware
 from aiogram.client.session.middlewares.base import BaseRequestMiddleware
 from aiogram.methods import (AnswerCallbackQuery, EditMessageText, EditMessageCaption, EditMessageReplyMarkup,
@@ -826,7 +828,7 @@ CERT_TEMPLATES = {
         "secondary": HexColor("#12235c"),
     },
 }
-DEFAULT_CERT_TEMPLATE = "gold"
+DEFAULT_CERT_TEMPLATE = "minimal:0"
 
 
 def _laurel_leaf(c, x, y, angle_deg, length, width, color):
@@ -949,7 +951,7 @@ def _draw_corner_ornament(c, x, y, quad, size=34, color=GOLD):
     c.restoreState()
 
 
-def make_certificate_pdf(
+def _make_certificate_classic(
         full_name: str,
         subject: str,
         test_code: str,
@@ -963,7 +965,7 @@ def make_certificate_pdf(
         out_path: str = "certificate.pdf",
         academy_name: str | None = None,
         signee_name: str | None = None,
-        template: str = DEFAULT_CERT_TEMPLATE,
+        template: str = "gold",
 ):
     """Tantanavor, albom yo'nalishdagi (landscape) premium sertifikat.
 
@@ -971,7 +973,7 @@ def make_certificate_pdf(
     standart) sertifikat sozlamalari; har bir test o'zining sozlamalari bilan
     boshqa ko'rinishda sertifikat chiqarishi mumkin.
     """
-    tpl = CERT_TEMPLATES.get(template) or CERT_TEMPLATES[DEFAULT_CERT_TEMPLATE]
+    tpl = CERT_TEMPLATES.get(template) or CERT_TEMPLATES["gold"]
     PRIMARY = tpl["primary"]
     TRIM = tpl["trim"]
     TRIM_LIGHT = tpl["trim_light"]
@@ -1146,6 +1148,417 @@ def make_certificate_pdf(
     c.setFont("Times-Bold", 9.5)
     c.drawCentredString(w / 2, 44, f"Sertifikat kodi: {test_code}-{(full_name or 'X').strip()[:1].upper()}")
 
+    c.showPage()
+    c.save()
+
+
+# ===================== ZAMONAVIY SERTIFIKATLAR =====================
+# ✅ 5 ta zamonaviy dizayn, har birida 3 ta rang. Test yaratuvchisi «🎓 Sertifikat
+# sozlamalari»da tanlaydi; tests.cert_template'da "dizayn:rang" ko'rinishida
+# saqlanadi (masalan "minimal:0"). Eski "gold/green/blue" qiymatlari —
+# klassik dizayn, ular avvalgidek chiqadi.
+CERT_FONT_DIR = _env("CERT_FONT_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts"))
+_CERT_FONT_FILES = {
+    "PF-B": "PlayfairDisplay-Bold.ttf", "PF-I": "PlayfairDisplay-MediumItalic.ttf",
+    "MS-R": "Montserrat-Regular.ttf", "MS-SB": "Montserrat-SemiBold.ttf", "MS-XB": "Montserrat-ExtraBold.ttf",
+    "CG-B": "CormorantGaramond-Bold.ttf", "CG-I": "CormorantGaramond-SemiBoldItalic.ttf",
+    "DS-R": "DMSerifDisplay-Regular.ttf", "DS-I": "DMSerifDisplay-Italic.ttf",
+    "PP-SB": "Poppins-SemiBold.ttf", "PP-B": "Poppins-Bold.ttf",
+}
+# shriftda harf (masalan kirillcha) bo'lmasa — o'xshash shrift bilan yoziladi
+_CERT_FONT_FALLBACK = {
+    "PF-B": ["CG-B", "MS-XB"], "PF-I": ["CG-I", "MS-SB"], "DS-R": ["CG-B", "MS-XB"], "DS-I": ["CG-I", "MS-SB"],
+    "PP-SB": ["MS-SB"], "PP-B": ["MS-XB"], "CG-B": ["MS-XB"], "CG-I": ["MS-SB"],
+}
+_CERT_FONT_BUILTIN = {"PF-B": "Times-Bold", "PF-I": "Times-Italic", "CG-B": "Times-Bold", "CG-I": "Times-Italic",
+                      "DS-R": "Times-Roman", "DS-I": "Times-Italic", "MS-R": "Helvetica", "MS-SB": "Helvetica-Bold",
+                      "MS-XB": "Helvetica-Bold", "PP-SB": "Helvetica-Bold", "PP-B": "Helvetica-Bold"}
+_CERT_DEJAVU = ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
+_CERT_FONTS: dict[str, tuple[str, set] | None] = {}
+
+
+def _cert_font_info(key: str):
+    """(reportlab shrift nomi, belgilar to'plami) yoki None — bir marta ro'yxatga olinadi."""
+    if key in _CERT_FONTS:
+        return _CERT_FONTS[key]
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    info = None
+    path = (os.path.join(CERT_FONT_DIR, _CERT_FONT_FILES[key]) if key in _CERT_FONT_FILES
+            else {"DJ-R": _CERT_DEJAVU[0], "DJ-B": _CERT_DEJAVU[1]}.get(key, ""))
+    if path and os.path.exists(path):
+        try:
+            font = TTFont(f"cert-{key}", path)
+            pdfmetrics.registerFont(font)
+            info = (f"cert-{key}", set(font.face.charToGlyph))
+        except Exception:
+            logging.exception(f"Sertifikat shrifti yuklanmadi: {path}")
+    _CERT_FONTS[key] = info
+    return info
+
+
+def _cert_norm(text) -> str:
+    # o'zbekcha ʻ ʼ belgilarini hamma shriftda bor ‘ ’ ga almashtiramiz
+    return str(text or "").replace("ʻ", "‘").replace("ʼ", "’")
+
+
+def _cert_font(key: str, text: str) -> str:
+    need = {ord(ch) for ch in text if not ch.isspace()}
+    for k in [key] + _CERT_FONT_FALLBACK.get(key, []) + (["DJ-B"] if key.endswith(("B", "SB")) else ["DJ-R"]):
+        info = _cert_font_info(k)
+        if info and need <= info[1]:
+            return info[0]
+    info = _cert_font_info(key)
+    return info[0] if info else _CERT_FONT_BUILTIN.get(key, "Helvetica")
+
+
+def _ct(c, text, key, size, x, y, color, align="l", cs=0.0, maxw=None, minsize=None) -> float:
+    """Matn chizadi (align: l/c/r, cs — harflar orasi), maxw'ga sig'maguncha kichraytiradi."""
+    text = _cert_norm(text)
+    font = _cert_font(key, text)
+
+    def width(sz):
+        return c.stringWidth(text, font, sz) + cs * max(len(text) - 1, 0)
+
+    if maxw:
+        floor = minsize or size * 0.55
+        while size > floor and width(size) > maxw:
+            size -= 0.5
+    tw = width(size)
+    x0 = x - tw / 2 if align == "c" else (x - tw if align == "r" else x)
+    c.setFillColor(HexColor(color) if isinstance(color, str) else color)
+    c.setFont(font, size)
+    c.drawString(x0, y, text, charSpace=cs) if cs else c.drawString(x0, y, text)
+    return tw
+
+
+def _ct_wrap(c, text, key, size, x, y, color, maxw, leading, max_lines=3, align="c") -> float:
+    """Ko'p qatorli matn; sig'masa shrift kichrayadi. Oxirgi qator ostidagi y qaytadi."""
+    from reportlab.lib.utils import simpleSplit
+    text = _cert_norm(text)
+    font = _cert_font(key, text)
+    lines = simpleSplit(text, font, size, maxw)
+    while len(lines) > max_lines and size > 9:
+        size -= 0.5
+        leading = leading * 0.97
+        lines = simpleSplit(text, font, size, maxw)
+    for ln in lines[:max_lines]:
+        _ct(c, ln, key, size, x, y, color, align=align)
+        y -= leading
+    return y
+
+
+def _cert_logo(c, x, y, size) -> bool:
+    try:
+        if CERT_LOGO_PATH and os.path.exists(CERT_LOGO_PATH):
+            c.drawImage(ImageReader(CERT_LOGO_PATH), x, y, width=size, height=size, mask="auto",
+                        preserveAspectRatio=True)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _cert_date(s: str) -> str:
+    try:
+        return datetime.strptime(str(s)[:10], "%Y-%m-%d").strftime("%d.%m.%Y")
+    except (TypeError, ValueError):
+        return str(s or "")
+
+
+def _cert_pct(p: float) -> str:
+    return (f"{float(p or 0):.1f}".rstrip("0").rstrip(".")) + "%"
+
+
+def _cert_ctx(full_name, subject, test_code, test_title, exam_date_str, percent, correct_count, total_questions,
+              rasch_ball, grade, academy_name, signee_name) -> dict:
+    total = int(total_questions or 0)
+    score = f"{int(correct_count or 0)} / {total}" if total > 0 else ""
+    return {
+        "name": smart_title(full_name or "Noma'lum"),
+        "title": (test_title or subject or "Test").strip(),
+        "date": _cert_date(exam_date_str),
+        "pct": _cert_pct(percent),
+        "score": score,
+        "grade": (grade or "").strip(),
+        "rasch": f"Rasch ball: {float(rasch_ball):.1f}" if rasch_ball is not None else "",
+        "academy": (academy_name or ACADEMY_NAME).strip(),
+        "signee": (signee_name or "Administratsiya").strip(),
+        "code": f"№ {test_code}-{(full_name or 'X').strip()[:1].upper()}",
+    }
+
+
+def _cert_result_phrase(d: dict) -> str:
+    res = d["score"] + (f" ({d['pct']})" if d["score"] else d["pct"])
+    if d["grade"]:
+        res += f", {d['grade']} daraja"
+    return res
+
+
+def _cert_minimal(c, w, h, d, accent):
+    ink, grey = "#1c2230", "#6b7280"
+    c.setFillColor(HexColor("#ffffff"))
+    c.rect(0, 0, w, h, fill=1, stroke=0)
+    c.setFillColor(HexColor(accent))
+    c.rect(0, h - 8, w, 8, fill=1, stroke=0)
+    c.setStrokeColor(HexColor(accent))
+    c.setLineWidth(1)
+    c.rect(22, 22, w - 44, h - 44, fill=0, stroke=1)
+    # sarlavha: o'quv markazi nomi (logo fayli bo'lsa — uning yonida)
+    label = d["academy"].upper()
+    lw = c.stringWidth(_cert_norm(label), _cert_font("MS-SB", label), 10.5) + 3 * len(label)
+    gx = w / 2 - (30 + 12 + lw) / 2
+    if _cert_logo(c, gx, h - 98, 30):
+        _ct(c, label, "MS-SB", 10.5, gx + 42, h - 87, grey, cs=3)
+    else:
+        _ct(c, label, "MS-SB", 10.5, w / 2, h - 87, grey, align="c", cs=3, maxw=600)
+    _ct(c, "SERTIFIKAT", "PF-B", 46, w / 2, h - 158, ink, align="c", cs=6)
+    _ct(c, "Ushbu sertifikat taqdim etiladi", "MS-R", 12.5, w / 2, h - 186, grey, align="c")
+    _ct(c, d["name"], "PF-I", 42, w / 2, h - 240, accent, align="c", maxw=620)
+    c.setStrokeColor(HexColor("#d9dce3"))
+    c.line(w / 2 - 160, h - 256, w / 2 + 160, h - 256)
+    _ct_wrap(c, f"«{d['title']}» testida muvaffaqiyatli qatnashib, yuqori natija qayd etgani uchun",
+             "MS-R", 13, w / 2, h - 288, "#4b5563", maxw=560, leading=20)
+    # pastki qator: sana — natija doirasi — mas'ul shaxs
+    _ct(c, d["date"], "MS-SB", 14, 88, 118, ink)
+    _ct(c, "Sana", "MS-R", 10, 88, 102, grey)
+    _ct(c, d["signee"], "MS-SB", 14, w - 88, 118, ink, align="r", maxw=230)
+    _ct(c, "Mas'ul shaxs", "MS-R", 10, w - 88, 102, grey, align="r")
+    c.setStrokeColor(HexColor(accent))
+    c.setLineWidth(2)
+    c.circle(w / 2, 122, 52, fill=0, stroke=1)
+    _ct(c, d["pct"], "PF-B", 28, w / 2, 122, ink, align="c", maxw=90)
+    sub = " · ".join(x for x in (d["score"], d["grade"]) if x)
+    _ct(c, sub, "MS-R", 10, w / 2, 104, grey, align="c", maxw=90)
+    foot = " · ".join(x for x in (d["code"], d["rasch"]) if x)
+    _ct(c, foot, "MS-R", 8.5, w / 2, 44, "#9aa0ab", align="c", cs=0.5)
+
+
+def _cert_panel(c, w, h, d, panel):
+    ink = "#14213d"
+    c.setFillColor(HexColor("#ffffff"))
+    c.rect(0, 0, w, h, fill=1, stroke=0)
+    c.setFillColor(HexColor(panel))
+    c.rect(0, 0, 230, h, fill=1, stroke=0)
+    top = h - 128 if _cert_logo(c, 32, h - 100, 56) else h - 62
+    after = _ct_wrap(c, d["academy"].upper(), "MS-SB", 11, 32, top, "#ffffff", maxw=166, leading=16, max_lines=3,
+                     align="l")
+    c.setFillColor(HexColor("#f2b632"))
+    c.rect(32, after + 4, 36, 3, fill=1, stroke=0)  # oxirgi qator ostida qisqa oltin chiziq
+    y = 52
+    for label, val, key, size, color in (("Sana", d["date"], "MS-SB", 14, "#ffffff"),
+                                         ("To'g'ri javoblar", d["score"], "MS-SB", 17, "#ffffff"),
+                                         ("Daraja", d["grade"], "MS-SB", 17, "#ffffff"),
+                                         ("Natija", d["pct"], "MS-XB", 28, "#f2b632")):
+        if not val:
+            continue
+        _ct(c, val, key, size, 32, y, color, maxw=166)
+        _ct(c, label, "MS-R", 9.5, 32, y + size + 4, "#c9d2e8")
+        y += size + 34
+    x0 = 286
+    _ct(c, "YUTUQ SERTIFIKATI", "MS-XB", 11, x0, h - 76, "#f2a900", cs=4)
+    _ct(c, "SERTIFIKAT", "MS-XB", 50, x0, h - 130, ink, cs=1, maxw=500)
+    _ct(c, "Ushbu sertifikat bilan taqdirlanadi", "MS-R", 13, x0, h - 182, "#5b6475")
+    _ct(c, d["name"], "MS-XB", 34, x0, h - 224, panel, maxw=500)
+    c.setFillColor(HexColor("#f2b632"))
+    c.roundRect(x0, h - 246, 90, 4, 2, fill=1, stroke=0)
+    _ct_wrap(c, f"«{d['title']}» testida muvaffaqiyatli qatnashib, bilim va intiluvchanlik namunasini "
+                f"ko'rsatgani uchun.", "MS-R", 13, x0, h - 280, "#4a5568", maxw=480, leading=21, align="l")
+    c.setStrokeColor(HexColor("#c7ccd6"))
+    c.setLineWidth(1)
+    c.line(x0, 96, x0 + 190, 96)
+    _ct(c, d["signee"], "MS-SB", 13, x0, 78, ink, maxw=260)
+    _ct(c, "Mas'ul shaxs", "MS-R", 10, x0, 63, "#6b7280")
+    foot = " · ".join(x for x in (d["code"], d["rasch"]) if x)
+    _ct(c, foot, "MS-R", 8.5, w - 52, 63, "#9aa0ab", align="r")
+
+
+def _cert_geo(c, w, h, d, colors):
+    c1, c2 = colors
+    ink, grey = "#0f1b33", "#64708a"
+    c.setFillColor(HexColor("#f7f9fc"))
+    c.rect(0, 0, w, h, fill=1, stroke=0)
+    for cx, cy, size, col, alpha in ((10, h - 10, 300, c1, 1), (140, h - 20, 160, c2, 0.9),
+                                     (w - 10, 10, 300, c1, 1), (w - 140, 10, 140, c2, 0.9)):
+        c.saveState()
+        c.translate(cx, cy)
+        c.rotate(45)
+        c.setFillColor(HexColor(col))
+        c.setFillAlpha(alpha)
+        c.rect(-size / 2, -size / 2, size, size, fill=1, stroke=0)
+        c.restoreState()
+    c.setFillColor(HexColor("#c3cad8"))
+    for row in range(4):
+        for col in range(5):
+            c.circle(w - 48 - 61 + 2.5 + col * 14, h - 42.5 - row * 14, 2.5, fill=1, stroke=0)
+    _ct(c, d["academy"].upper(), "MS-SB", 11, w / 2, h - 80, grey, align="c", cs=4, maxw=520)
+    _ct(c, "SERTIFIKAT", "PP-B", 48, w / 2, h - 134, ink, align="c", cs=3)
+    _ct(c, "YUTUQ UCHUN", "PP-SB", 13, w / 2, h - 158, c1, align="c", cs=6)
+    _ct(c, "Ushbu sertifikat taqdim etiladi", "MS-R", 12, w / 2, h - 196, grey, align="c")
+    _ct(c, d["name"], "PP-SB", 36, w / 2, h - 238, ink, align="c", maxw=560)
+    _ct_wrap(c, f"«{d['title']}» testida {_cert_result_phrase(d)} natija ko'rsatgani uchun",
+             "MS-R", 12.5, w / 2, h - 270, "#4a5568", maxw=520, leading=20)
+    for cx, val, label in ((280, d["date"], "Sana"), (w - 280, d["signee"], "Mas'ul shaxs")):
+        _ct(c, val, "MS-SB", 13, cx, 100, ink, align="c", maxw=200)
+        c.setStrokeColor(HexColor(c2))
+        c.setLineWidth(2)
+        c.line(cx - 75, 91, cx + 75, 91)
+        _ct(c, label, "MS-R", 10, cx, 77, grey, align="c")
+    foot = " · ".join(x for x in (d["code"], d["rasch"]) if x)
+    _ct(c, foot, "MS-R", 8.5, w / 2, 48, "#8a93a6", align="c")
+
+
+def _cert_academic(c, w, h, d, ink):
+    text, grey = "#23201a", "#7a6f5c"
+    c.setFillColor(HexColor("#fbf8f1"))
+    c.rect(0, 0, w, h, fill=1, stroke=0)
+    c.setStrokeColor(HexColor(ink))
+    c.setLineWidth(2)
+    c.rect(20, 20, w - 40, h - 40, fill=0, stroke=1)
+    c.setLineWidth(1)
+    c.rect(27, 27, w - 54, h - 54, fill=0, stroke=1)
+    _ct(c, d["academy"].upper(), "MS-SB", 10.5, w / 2, h - 82, grey, align="c", cs=5, maxw=600)
+    tw = _ct(c, "Sertifikat", "CG-B", 54, w / 2, h - 142, ink, align="c", cs=4)
+    c.setStrokeColor(HexColor(ink))
+    c.setLineWidth(1)
+    c.line(w / 2 - tw / 2 - 86, h - 128, w / 2 - tw / 2 - 16, h - 128)
+    c.line(w / 2 + tw / 2 + 16, h - 128, w / 2 + tw / 2 + 86, h - 128)
+    _ct(c, "Ushbu hujjat bilan tasdiqlanadiki", "MS-R", 13, w / 2, h - 178, grey, align="c")
+    _ct(c, d["name"], "CG-I", 46, w / 2, h - 228, text, align="c", maxw=620)
+    _ct_wrap(c, f"«{d['title']}» test sinovida qatnashib, {_cert_result_phrase(d)} natija qayd etdi.",
+             "MS-R", 13, w / 2, h - 262, "#4d463a", maxw=540, leading=21)
+    col_w = (w - 54 - 160) / 3
+    cxs = [27 + 80 + col_w * (i + 0.5) for i in range(3)]
+    for cx, val, label in ((cxs[0], d["date"], "Sana"), (cxs[2], d["signee"], "Mas'ul shaxs")):
+        _ct(c, val, "MS-SB", 13, cx, 108, text, align="c", maxw=190)
+        c.setStrokeColor(HexColor("#8c8170"))
+        c.line(cx - 70, 100, cx + 70, 100)
+        _ct(c, label, "MS-R", 10, cx, 86, grey, align="c")
+    c.setFillColor(HexColor(ink))
+    c.circle(cxs[1], 108, 46, fill=1, stroke=0)
+    c.setStrokeColor(HexColor("#e8dcc0"))
+    c.setDash(3, 2)
+    c.circle(cxs[1], 108, 40, fill=0, stroke=1)
+    c.setDash()
+    big, small = (d["grade"], "DARAJA") if d["grade"] and len(d["grade"]) <= 4 else (d["pct"], "NATIJA")
+    _ct(c, big, "CG-B", 26, cxs[1], 108, "#f3ead2", align="c", maxw=70)
+    _ct(c, small, "MS-SB", 7.5, cxs[1], 94, "#f3ead2", align="c", cs=2)
+    foot = " · ".join(x for x in (d["code"], d["rasch"]) if x)
+    _ct(c, foot, "MS-R", 8.5, w / 2, 42, "#8c8170", align="c")
+
+
+def _cert_leaf(c, w, h, d, c1):
+    text, grey = "#17312a", "#5b7069"
+    c.setFillColor(HexColor("#f3f8f4"))
+    c.rect(0, 0, w, h, fill=1, stroke=0)
+    for cx, cy, r, alpha in ((w - 90, h - 60, 180, 0.12), (60, 30, 170, 0.09)):
+        c.saveState()
+        c.setFillColor(HexColor(c1))
+        c.setFillAlpha(alpha)
+        c.circle(cx, cy, r, fill=1, stroke=0)
+        c.restoreState()
+    # dafna novdasi
+    X0, Y0 = w / 2 - 35, h - 50
+    c.setStrokeColor(HexColor(c1))
+    c.setLineWidth(1.6)
+    c.setLineCap(1)
+    for x1, y1, x2, y2, x3, y3, x4, y4 in ((35, 38, 22, 30, 14, 20, 12, 6), (35, 38, 48, 30, 56, 20, 58, 6)):
+        p = c.beginPath()
+        p.moveTo(X0 + x1, Y0 - y1)
+        p.curveTo(X0 + x2, Y0 - y2, X0 + x3, Y0 - y3, X0 + x4, Y0 - y4)
+        c.drawPath(p, fill=0, stroke=1)
+    for ax, ay, bx, by in ((18, 22, 10, 19), (15, 14, 8, 9), (24, 29, 17, 29),
+                           (52, 22, 60, 19), (55, 14, 62, 9), (46, 29, 53, 29)):
+        c.line(X0 + ax, Y0 - ay, X0 + bx, Y0 - by)
+    _ct(c, d["academy"].upper(), "MS-SB", 10.5, w / 2, h - 112, c1, align="c", cs=5, maxw=600)
+    _ct(c, "Sertifikat", "DS-R", 56, w / 2, h - 168, text, align="c")
+    _ct(c, "Ushbu sertifikat faxr bilan taqdim etiladi", "MS-R", 13, w / 2, h - 196, grey, align="c")
+    _ct(c, d["name"], "DS-I", 44, w / 2, h - 246, c1, align="c", maxw=620)
+    _ct_wrap(c, f"«{d['title']}» testida {_cert_result_phrase(d)} natija ko'rsatgani uchun.",
+             "MS-R", 13, w / 2, h - 278, "#4a5f58", maxw=520, leading=21)
+    _ct(c, d["date"], "MS-SB", 13, 80, 96, text)
+    _ct(c, d["signee"], "MS-SB", 13, w - 80, 96, text, align="r", maxw=210)
+    c.setStrokeColor(HexColor("#9bb3aa"))
+    c.setLineWidth(1)
+    c.line(80, 88, 230, 88)
+    c.line(w - 230, 88, w - 80, 88)
+    _ct(c, "Sana", "MS-R", 10, 80, 74, grey)
+    _ct(c, "Mas'ul shaxs", "MS-R", 10, w - 80, 74, grey, align="r")
+    pill = d["pct"] + (f" · {d['grade']} daraja" if d["grade"] else (f" · {d['score']}" if d["score"] else ""))
+    pw = c.stringWidth(_cert_norm(pill), _cert_font("MS-SB", pill), 14) + 44
+    c.setFillColor(HexColor(c1))
+    c.roundRect(w / 2 - pw / 2, 74, pw, 34, 17, fill=1, stroke=0)
+    _ct(c, pill, "MS-SB", 14, w / 2, 86, "#ffffff", align="c")
+    foot = " · ".join(x for x in (d["code"], d["rasch"]) if x)
+    _ct(c, foot, "MS-R", 8.5, w / 2, 44, grey, align="c")
+
+
+CERT_DESIGNS = {
+    "minimal": {"label": "Minimal oq-oltin", "draw": _cert_minimal,
+                "colors": [("Oltin", "#b8902f"), ("Ko'k", "#1f4fa3"), ("Zumrad", "#0f766e")]},
+    "panel": {"label": "Ko'k panel", "draw": _cert_panel,
+              "colors": [("To'q ko'k", "#1b2f6b"), ("Firuza", "#0f5f5c"), ("Olcha", "#5b1f4a")]},
+    "geo": {"label": "Geometrik", "draw": _cert_geo,
+            "colors": [("Ko'k", ("#1d4ed8", "#38bdf8")), ("Firuza", ("#0f766e", "#2dd4bf")),
+                       ("Binafsha", ("#7c3aed", "#f59e0b"))]},
+    "academic": {"label": "Akademik zamonaviy", "draw": _cert_academic,
+                 "colors": [("To'q ko'k", "#1f3a5f"), ("Bordo", "#6b1d2a"), ("Yashil", "#2f4f3a")]},
+    "leaf": {"label": "Yashil yengil", "draw": _cert_leaf,
+             "colors": [("Yashil", "#1f7a5a"), ("Moviy", "#0e7490"), ("Terrakota", "#9a3412")]},
+    "classic": {"label": "Klassik", "draw": None,
+                "colors": [("Oltin", "gold"), ("Yashil", "green"), ("Ko'k", "blue")]},
+}
+
+
+def parse_cert_template(tpl: str | None) -> tuple[str, int]:
+    """"minimal:1" -> ("minimal", 1); eski "gold/green/blue" -> ("classic", i)."""
+    tpl = (tpl or DEFAULT_CERT_TEMPLATE).strip()
+    if tpl in CERT_TEMPLATES:
+        return "classic", list(CERT_TEMPLATES).index(tpl)
+    design, _, ci = tpl.partition(":")
+    if design not in CERT_DESIGNS:
+        return parse_cert_template(DEFAULT_CERT_TEMPLATE)
+    ci = int(ci) if ci.isdigit() else 0
+    return design, ci if 0 <= ci < len(CERT_DESIGNS[design]["colors"]) else 0
+
+
+def cert_template_label(tpl: str | None) -> str:
+    design, ci = parse_cert_template(tpl)
+    meta = CERT_DESIGNS[design]
+    return f"{meta['label']} · {meta['colors'][ci][0]}"
+
+
+def make_certificate_pdf(
+        full_name: str,
+        subject: str,
+        test_code: str,
+        test_title: str,
+        exam_date_str: str,
+        percent: float = 0.0,
+        correct_count: int = 0,
+        total_questions: int = 0,
+        rasch_ball: float | None = None,
+        grade: str | None = None,
+        out_path: str = "certificate.pdf",
+        academy_name: str | None = None,
+        signee_name: str | None = None,
+        template: str = DEFAULT_CERT_TEMPLATE,
+):
+    """Sertifikat PDF: tanlangan dizayn va rang bilan (albom yo'nalishi, A4)."""
+    design, ci = parse_cert_template(template)
+    meta = CERT_DESIGNS[design]
+    if meta["draw"] is None:
+        return _make_certificate_classic(
+            full_name, subject, test_code, test_title, exam_date_str, percent=percent,
+            correct_count=correct_count, total_questions=total_questions, rasch_ball=rasch_ball, grade=grade,
+            out_path=out_path, academy_name=academy_name, signee_name=signee_name, template=meta["colors"][ci][1])
+    d = _cert_ctx(full_name, subject, test_code, test_title, exam_date_str, percent, correct_count,
+                  total_questions, rasch_ball, grade, academy_name, signee_name)
+    page = landscape(A4)
+    c = canvas.Canvas(out_path, pagesize=page)
+    c.setTitle(f"Sertifikat — {_cert_norm(d['name'])}")
+    w, h = page
+    meta["draw"](c, w, h, d, meta["colors"][ci][1])
     c.showPage()
     c.save()
 
@@ -2131,7 +2544,9 @@ async def init_db(db):
     # uzatilganda hal qilinadi).
     await _ensure_column(db, "tests", "cert_academy_name", "TEXT")
     await _ensure_column(db, "tests", "cert_signee_name", "TEXT")
-    await _ensure_column(db, "tests", "cert_template", "TEXT DEFAULT 'gold'")
+    await _ensure_column(db, "tests", "cert_template", "TEXT DEFAULT 'minimal:0'")
+    # ✅ yangi testlar zamonaviy dizayn bilan boshlanadi; eski testlar o'z dizaynida qoladi
+    await db.execute("ALTER TABLE tests ALTER COLUMN cert_template SET DEFAULT 'minimal:0'")
 
     # ✅ Bosqichli imtihon (DTM 5-fan / IELTS 4-ko'nikma) sozlamalari — JSON:
     # {"kind": "dtm_staged"|"ielts4", "order": [...], "sections": {key: {...}}}
@@ -11216,32 +11631,78 @@ def _xlsx_safe(val):
     return s
 
 
+# ✅ Excel eksport fonda tayyorlanadi: tugma darhol javob beradi, fayl tayyor
+# bo'lguncha ustoz botdan bemalol foydalanaveradi (avval fayl yig'ilib
+# Telegram'ga yuklanguncha tugma "aylanib" turar va shu foydalanuvchining
+# boshqa bosishlari ham navbatda kutardi — "bot qotdi" tuyulardi).
+_XL_RUNNING: set[tuple[int, int]] = set()
+
+
 @router.callback_query(F.data.startswith("xl_"))
 async def xl_export(callback: CallbackQuery, bot: Bot):
     test_id = int(callback.data.split("_")[1])
     user_tg_id = callback.from_user.id
-    is_admin = await is_admin_user(user_tg_id)
 
     c_row = await POOL.fetchrow("SELECT creator_id FROM tests WHERE id=$1", test_id)
-    is_creator = c_row and c_row["creator_id"] == user_tg_id
-
-    if not (is_admin or is_creator):
+    if not c_row:
+        return await callback.answer("Test topilmadi.", show_alert=True)
+    if c_row["creator_id"] != user_tg_id and not await is_admin_user(user_tg_id):
         return await callback.answer("Sizda ruxsat yo'q!", show_alert=True)
 
-    row = await POOL.fetchrow("SELECT exam_type FROM tests WHERE id=$1", test_id)
-    if row:
-        et = (row["exam_type"] or "simple")
-        if et == "rasch":
-            await finalize_rush_for_test_if_ready(test_id, bot=bot)
+    key = (user_tg_id, test_id)
+    if key in _XL_RUNNING:
+        return await callback.answer("⏳ Excel hali tayyorlanmoqda — bir oz kuting.")
+    _XL_RUNNING.add(key)
+    await callback.answer("⏳ Excel tayyorlanmoqda — bir necha soniyada yuboriladi.")
+    asyncio.create_task(_xl_export_job(bot, user_tg_id, test_id))
 
+
+async def _xl_export_job(bot: Bot, user_tg_id: int, test_id: int) -> None:
+    try:
+        try:
+            await bot.send_chat_action(user_tg_id, "upload_document")
+        except Exception:
+            pass
+        built = await _xl_build(test_id, bot)
+        if not built:
+            await bot.send_message(user_tg_id, "Test topilmadi.")
+            return
+        data, filename, code, title, n = built
+        for attempt in range(3):
+            try:
+                await bot.send_document(
+                    chat_id=user_tg_id, document=BufferedInputFile(data, filename=filename),
+                    caption=f"📤 Excel tayyor: <code>{_h(code)}</code> — <b>{_h(title)}</b>\n👥 Natijalar: <b>{n}</b>",
+                    parse_mode=ParseMode.HTML)
+                return
+            except TelegramNetworkError:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(2 + attempt * 3)
+    except (TelegramForbiddenError, TelegramBadRequest):
+        pass
+    except Exception:
+        logging.exception(f"Excel eksport xatosi (test={test_id}, user={user_tg_id})")
+        try:
+            await bot.send_message(user_tg_id, "⚠️ Excel faylni yuborib bo'lmadi (internet uzildi). "
+                                                "Iltimos, tugmani qayta bosing.")
+        except Exception:
+            pass
+    finally:
+        _XL_RUNNING.discard((user_tg_id, test_id))
+
+
+async def _xl_build(test_id: int, bot: Bot):
+    """(xlsx baytlari, fayl nomi, kod, nomi, natijalar soni) yoki None."""
     t = await POOL.fetchrow("""
         SELECT code, title, is_free, price, duration, questions_count, start_mode, start_at, exam_type,
-               open_ref_answers, b_answers, b_open_ref_answers
+               answers, open_ref_answers, b_answers, b_open_ref_answers
         FROM tests WHERE id=$1
     """, test_id)
-
     if not t:
-        return await callback.message.answer("Test topilmadi.")
+        return None
+    if (t["exam_type"] or "simple") == "rasch":
+        await finalize_rush_for_test_if_ready(test_id, bot=bot)
 
     code, title, is_free, price, duration, qcount, start_mode, start_at, et2 = (
         t["code"], t["title"], t["is_free"], t["price"], t["duration"], t["questions_count"],
@@ -11252,13 +11713,15 @@ async def xl_export(callback: CallbackQuery, bot: Bot):
         SELECT u.full_name, u.phone, u.telegram_id,
                r.score, r.total_questions, r.percent,
                r.rasch_ball, r.rasch_percent, r.grade,
-               r.open_text_answers, r.date, COALESCE(r.variant,'a') AS variant
+               r.open_text_answers, r.date, COALESCE(r.variant,'a') AS variant,
+               r.user_answers, r.open_grades
         FROM results r
         JOIN users u ON u.id=r.user_id
         WHERE r.test_id=$1
         ORDER BY r.percent DESC, r.id ASC
     """, test_id)
     has_b = bool(t["b_answers"] or "")
+    is_rasch = (et2 or "simple") == "rasch"
 
     pays = await POOL.fetch("""
         SELECT u.full_name, u.phone, u.telegram_id,
@@ -11270,27 +11733,20 @@ async def xl_export(callback: CallbackQuery, bot: Bot):
     """, test_id)
 
     wb = Workbook()
-    ws_info = wb.active
-    ws_info.title = "TestInfo"
+    ws_res = wb.active
+    ws_res.title = "Natijalar"
+    ws_res.append(["O'rin", "F.I.Sh.", "Telefon", "Telegram ID", "To'g'ri", "Savollar", "Foiz"]
+                  + (["Rasch ball", "Rasch foiz"] if is_rasch else []) + ["Daraja", "Ochiq javoblar", "Sana"]
+                  + (["Variant"] if has_b else []))
 
-    ws_info.append(["Field", "Value"])
-    ws_info.append(["Code", code])
-    ws_info.append(["Title", _xlsx_safe(title)])
-    ws_info.append(["Type", "FREE" if int(is_free) == 1 else "PAID"])
-    ws_info.append(["Price", int(price) if price is not None else 0])
-    ws_info.append(["Duration(min)", int(duration)])
-    ws_info.append(["Questions", int(qcount)])
-    ws_info.append(["ExamType", (et2 or "simple")])
-    ws_info.append(["StartMode", start_mode or "normal"])
-    ws_info.append(["StartAt", start_at or ""])
+    ws_ans = None
+    if (et2 or "simple") not in STAGED_EXAM_TYPES and int(qcount or 0) > 0:
+        ws_ans = wb.create_sheet("Javoblar")
+        ws_ans.append(["F.I.Sh."] + [f"{i}" for i in range(1, int(qcount) + 1)])
+        ok_counts = [0] * int(qcount)
+        n_counts = [0] * int(qcount)
 
-    ws_res = wb.create_sheet("Results")
-    ws_res.append([
-        "FullName", "Phone", "TelegramID", "Score", "Total", "Percent", "RaschBall", "RaschPercent", "Grade",
-        "OpenAnswers", "Date"
-    ] + (["Variant"] if has_b else []))
-
-    for r in results:
+    for rank, r in enumerate(results, 1):
         test_open_refs = _load_json_dict(_variant_fields(t, r["variant"])[1])
         open_txt = ""
         if r["open_text_answers"]:
@@ -11300,41 +11756,86 @@ async def xl_export(callback: CallbackQuery, bot: Bot):
                 for k, v in open_map.items():
                     text_val, photo_id = _open_answer_preview(v)
                     shown = text_val if text_val else ("[rasm — botda ko'ring]" if photo_id else "-")
-                    parts.append(f"Q{k}: {shown} (kutilgan: {test_open_refs.get(k, '-')})")
+                    parts.append(f"{k}-savol: {shown} (kutilgan: {test_open_refs.get(k, '-')})")
                 open_txt = " | ".join(parts)
             except json.JSONDecodeError:
                 open_txt = ""
-        ws_res.append([_xlsx_safe(r["full_name"]), _xlsx_safe(r["phone"]), r["telegram_id"], r["score"],
-                        r["total_questions"], r["percent"], r["rasch_ball"], r["rasch_percent"], r["grade"],
-                        _xlsx_safe(open_txt), r["date"]] + ([r["variant"].upper()] if has_b else []))
+        ws_res.append([rank, _xlsx_safe(r["full_name"]), _xlsx_safe(r["phone"]), r["telegram_id"], r["score"],
+                       r["total_questions"], round(float(r["percent"] or 0), 1)]
+                      + ([r["rasch_ball"], r["rasch_percent"]] if is_rasch else [])
+                      + [r["grade"], _xlsx_safe(open_txt), r["date"]] + ([r["variant"].upper()] if has_b else []))
 
-    ws_pay = wb.create_sheet("Payments")
-    ws_pay.append(["FullName", "Phone", "TelegramID", "Status", "CreatedAt", "RejectReason", "StartedAt"])
-    for p in pays:
-        ws_pay.append([_xlsx_safe(p["full_name"]), _xlsx_safe(p["phone"]), p["telegram_id"], p["status"],
-                        p["created_at"], _xlsx_safe(p["reject_reason"]), p["started_at"]])
+        if ws_ans is not None:
+            key = normalize_answers(_variant_fields(t, r["variant"])[0] or "")
+            ua = normalize_answers(r["user_answers"] or "")
+            grades = _load_json_dict(r["open_grades"])
+            cells = []
+            for i in range(int(qcount)):
+                if i >= len(key):
+                    cells.append("")
+                    continue
+                if key[i] == "x":
+                    g = grades.get(str(i + 1))
+                    mark = "?" if g is None else ("+" if int(g) == 1 else "−")
+                else:
+                    ch = ua[i] if i < len(ua) else "*"
+                    mark = "·" if ch == "*" else ("+" if ch == key[i] else "−")
+                if mark in ("+", "−", "·"):
+                    n_counts[i] += 1
+                    ok_counts[i] += mark == "+"
+                cells.append(mark)
+            ws_ans.append([_xlsx_safe(r["full_name"])] + cells)
 
-    for ws in [ws_info, ws_res, ws_pay]:
+    if ws_ans is not None and results:
+        ws_ans.append(["To'g'ri topganlar, %"] + [round(ok_counts[i] * 100 / n_counts[i]) if n_counts[i] else ""
+                                                  for i in range(int(qcount))])
+        ws_ans.append([])
+        ws_ans.append(["+ to'g'ri · − xato · · belgilanmagan · ? ochiq javob tekshirilmagan"])
+
+    ws_info = wb.create_sheet("Test haqida")
+    ws_info.append(["Maydon", "Qiymat"])
+    ws_info.append(["Kod", code])
+    ws_info.append(["Nomi", _xlsx_safe(title)])
+    ws_info.append(["Turi", "Tekin" if int(is_free) == 1 else "Pullik"])
+    ws_info.append(["Narxi", int(price) if price is not None else 0])
+    ws_info.append(["Vaqt (daqiqa)", int(duration or 0)])
+    ws_info.append(["Savollar", int(qcount or 0)])
+    ws_info.append(["Imtihon turi", (et2 or "simple")])
+    ws_info.append(["Boshlanish", start_at or "istalgan vaqtda"])
+    ws_info.append(["Qatnashganlar", len(results)])
+    if results:
+        ws_info.append(["O'rtacha foiz", round(sum(float(r["percent"] or 0) for r in results) / len(results), 1)])
+
+    sheets = [ws_res, ws_info] + ([ws_ans] if ws_ans is not None else [])
+    if pays:
+        ws_pay = wb.create_sheet("To'lovlar")
+        ws_pay.append(["F.I.Sh.", "Telefon", "Telegram ID", "Holat", "Yuborilgan", "Rad etish sababi", "Boshlagan"])
+        for p in pays:
+            ws_pay.append([_xlsx_safe(p["full_name"]), _xlsx_safe(p["phone"]), p["telegram_id"], p["status"],
+                           p["created_at"], _xlsx_safe(p["reject_reason"]), p["started_at"]])
+        sheets.append(ws_pay)
+
+    bold = Font(bold=True)
+    for ws in sheets:
+        for cell in ws[1]:
+            cell.font = bold
+        ws.freeze_panes = "B2" if ws is ws_ans else "A2"
         for col in range(1, ws.max_column + 1):
-            max_len = 0
             col_letter = get_column_letter(col)
-            for cell in ws[col_letter]:
-                val = "" if cell.value is None else str(cell.value)
-                max_len = max(max_len, len(val))
+            if ws is ws_ans and col > 1:
+                ws.column_dimensions[col_letter].width = 4
+                continue
+            max_len = max((len(str(c.value)) for c in ws[col_letter] if c.value is not None), default=0)
             ws.column_dimensions[col_letter].width = min(max_len + 2, 40)
 
-    safe_code = re.sub(r"[^A-Z0-9\-_]+", "_", code.upper())
-    filename = f"test_stats_{safe_code}.xlsx"
-    tmp_dir = tempfile.gettempdir()
-    path = os.path.join(tmp_dir, filename)
-    await asyncio.to_thread(wb.save, path)  # katta faylda bot "qotib" qolmasligi uchun
+    def _save() -> bytes:
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
 
-    await bot.send_document(
-        chat_id=callback.from_user.id,
-        document=FSInputFile(path),
-        caption=f"📤 Excel eksport tayyor.\n🔑 <code>{code}</code> — <b>{title}</b>",
-        parse_mode=ParseMode.HTML
-    )
+    data = await asyncio.to_thread(_save)  # katta faylda bot "qotib" qolmasligi uchun
+    safe_code = re.sub(r"[^A-Z0-9\-_]+", "_", (code or "TEST").upper())
+    return data, f"natijalar_{safe_code}.xlsx", code, title, len(results)
 
 
 @router.callback_query(F.data.startswith("raschrep_"))
@@ -13841,10 +14342,11 @@ async def _cert_settings_entry_check(user_tg_id: int, test_id: int) -> bool:
 
 
 async def _nav_show_certcfg_academy(answerable, state: FSMContext) -> None:
+    cur = (await state.get_data()).get("certcfg_academy") or ACADEMY_NAME
     await answerable.answer(
         f"🎓 <b>1/3 — O'quv markazi nomi</b>\n\n"
         f"Sertifikatda ko'rinadigan nomni kiriting.\n"
-        f"O'zgartirmaslik uchun <code>-</code> yuboring (standart: <b>{ACADEMY_NAME}</b>):",
+        f"O'zgartirmaslik uchun <code>-</code> yuboring (hozir: <b>{_h(cur)}</b>):",
         parse_mode=ParseMode.HTML,
         reply_markup=nav_kb(include_back=True)
     )
@@ -13857,15 +14359,23 @@ async def certcfg_start(callback: CallbackQuery, state: FSMContext):
     if not await _cert_settings_entry_check(callback.from_user.id, test_id):
         return await callback.answer("Bu testga huquqingiz yo'q!", show_alert=True)
 
-    await state.update_data(certcfg_test_id=test_id, nav_stack=[])
+    # ✅ joriy sozlamalar oldindan yuklanadi — "-" yuborilsa o'zgarmay qoladi
+    cur = await POOL.fetchrow("SELECT cert_academy_name, cert_signee_name, cert_template FROM tests WHERE id=$1",
+                              test_id)
+    await state.update_data(certcfg_test_id=test_id, nav_stack=[],
+                            certcfg_academy=cur["cert_academy_name"] if cur else None,
+                            certcfg_signee=cur["cert_signee_name"] if cur else None,
+                            certcfg_template=cur["cert_template"] if cur else None)
     await _nav_show_certcfg_academy(callback.message, state)
 
 
 async def _nav_show_certcfg_signee(answerable, state: FSMContext) -> None:
+    cur = (await state.get_data()).get("certcfg_signee")
     await answerable.answer(
         "🎓 <b>2/3 — Mas'ul shaxs</b>\n\n"
         "Sertifikatda «Mas'ul shaxs» sifatida yoziladigan ism-familiyani kiriting.\n"
-        "O'zgartirmaslik uchun <code>-</code> yuboring (standart: sizning ismingiz):",
+        f"O'zgartirmaslik uchun <code>-</code> yuboring "
+        f"(hozir: <b>{_h(cur) if cur else 'test yaratuvchisining ismi'}</b>):",
         parse_mode=ParseMode.HTML,
         reply_markup=nav_kb(include_back=True)
     )
@@ -13901,74 +14411,129 @@ async def certcfg_got_signee(message: Message, state: FSMContext, bot: Bot):
     if val and val != "-":
         await state.update_data(certcfg_signee=val)
     await _nav_push(state, "base", "certcfg_signee")
-
     data = await state.get_data()
-    test_id = data.get("certcfg_test_id")
-    academy = data.get("certcfg_academy")
-    signee = data.get("certcfg_signee")
-    if not signee:
-        my_uid = await get_user_db_id(message.from_user.id)
-        signee = await get_user_full_name(my_uid) if my_uid else None
-
-    await message.answer("⏳ <b>3/3 — Namunalar tayyorlanmoqda...</b>", parse_mode=ParseMode.HTML)
-
-    tmp_dir = tempfile.gettempdir()
-    sample_msg_ids: list[int] = []
-    for tpl_key, tpl_meta in CERT_TEMPLATES.items():
-        pdf_path = os.path.join(tmp_dir, f"certpreview_{test_id}_{tpl_key}.pdf")
-        make_certificate_pdf(
-            full_name="Ism Familiya",
-            subject="Namunaviy fan",
-            test_code="NAMUNA-01",
-            test_title="Namunaviy test",
-            exam_date_str=now_str_local(),
-            percent=92.0, correct_count=23, total_questions=25,
-            rasch_ball=64.5, grade="A",
-            academy_name=academy, signee_name=signee, template=tpl_key,
-            out_path=pdf_path,
-        )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"✅ {tpl_meta['label']} — shuni tanlash",
-                                  callback_data=f"certcfg_pick_{test_id}_{tpl_key}")]
-        ])
-        sent = await bot.send_document(
-            chat_id=message.from_user.id,
-            document=FSInputFile(pdf_path),
-            caption=tpl_meta["label"],
-            reply_markup=kb
-        )
-        sample_msg_ids.append(sent.message_id)
-
-    await message.answer("👆 Yoqqan ko'rinishni yuqoridagi 3 ta namunadan tanlang.")
-    # tanlov qilingach 3 ta namunadagi tugmalarning hammasi yopiladi
-    await state.update_data(certcfg_sample_msgs=sample_msg_ids)
+    await _certcfg_design_menu(message, int(data.get("certcfg_test_id")), data.get("certcfg_template"))
     await state.set_state(CertConfigState.waiting_template)
 
 
-@router.callback_query(CertConfigState.waiting_template, F.data.startswith("certcfg_pick_"))
-async def certcfg_pick(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    parts = callback.data.split("_")
-    test_id, tpl_key = int(parts[2]), parts[3]
+# ✅ 3-qadam: dizayn ro'yxati -> tanlangan dizayn namunasi (PDF) rang
+# tugmalari bilan -> "✅ Shuni tanlash". Har bir namuna haqiqiy test nomi va
+# ustoz kiritgan markaz/mas'ul shaxs bilan chiziladi; yangi namuna
+# yuborilganda oldingisi o'chiriladi (chat to'lib ketmaydi).
+async def _certcfg_design_menu(answerable, test_id: int, current_tpl: str | None) -> None:
+    cur_design, _ci = parse_cert_template(current_tpl)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=("✅ " if key == cur_design else "🎨 ") + f"{i}. {meta['label']}",
+                              callback_data=f"certcfg_d_{test_id}_{key}")]
+        for i, (key, meta) in enumerate(CERT_DESIGNS.items(), 1)])
+    await answerable.answer(
+        "🎓 <b>3/3 — Sertifikat dizayni</b>\n\n"
+        f"Hozirgi: <b>{_h(cert_template_label(current_tpl))}</b>\n\n"
+        "Dizaynni bosing — namunasi (PDF) keladi, unda rangini ham tanlaysiz.",
+        parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def _certcfg_values(state: FSMContext, test_id: int) -> tuple[str | None, str | None]:
+    """Namuna va saqlash uchun markaz nomi va mas'ul shaxs (holat yo'qolgan bo'lsa — bazadan)."""
+    data = await state.get_data()
+    if data.get("certcfg_test_id") == test_id:
+        return data.get("certcfg_academy"), data.get("certcfg_signee")
+    row = await POOL.fetchrow("SELECT cert_academy_name, cert_signee_name FROM tests WHERE id=$1", test_id)
+    return (row["cert_academy_name"], row["cert_signee_name"]) if row else (None, None)
+
+
+async def _certcfg_send_preview(callback: CallbackQuery, state: FSMContext, bot: Bot, test_id: int,
+                                design: str, ci: int) -> None:
+    academy, signee = await _certcfg_values(state, test_id)
+    t = await POOL.fetchrow("SELECT title, subject, code, creator_id FROM tests WHERE id=$1", test_id)
+    if not t:
+        return await callback.answer("Test topilmadi.", show_alert=True)
+    academy, signee, _tpl = await _resolve_cert_settings(academy, signee, None, t["creator_id"])
+    await callback.answer("⏳ Namuna tayyorlanmoqda...")
+    tpl = f"{design}:{ci}"
+    pdf_path = os.path.join(tempfile.gettempdir(), f"certpreview_{test_id}_{callback.from_user.id}.pdf")
+    await asyncio.to_thread(
+        make_certificate_pdf, full_name="Ism Familiya", subject=t["subject"] or "Fan", test_code=t["code"],
+        test_title=t["title"] or "Test", exam_date_str=now_str_local(), percent=90.0, correct_count=27,
+        total_questions=30, grade=None, academy_name=academy, signee_name=signee, template=tpl, out_path=pdf_path)
+    meta = CERT_DESIGNS[design]
+    color_row = [InlineKeyboardButton(text=("● " if i == ci else "") + name,
+                                      callback_data=f"certcfg_c_{test_id}_{design}_{i}")
+                 for i, (name, _v) in enumerate(meta["colors"])]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        color_row,
+        [InlineKeyboardButton(text="✅ Shuni tanlash", callback_data=f"certcfg_pick_{test_id}_{tpl}")],
+        [InlineKeyboardButton(text="🎨 Boshqa dizaynlar", callback_data=f"certcfg_menu_{test_id}")],
+    ])
+    data = await state.get_data()
+    old_mid = data.get("certcfg_preview_mid")
+    sent = await bot.send_document(
+        chat_id=callback.from_user.id, document=FSInputFile(pdf_path, filename="sertifikat_namuna.pdf"),
+        caption=f"🎓 Namuna: <b>{_h(cert_template_label(tpl))}</b>\n<i>Rangini pastdagi tugmalardan tanlang.</i>",
+        parse_mode=ParseMode.HTML, reply_markup=kb)
+    await state.update_data(certcfg_preview_mid=sent.message_id)
+    if old_mid and old_mid != sent.message_id:
+        try:
+            await bot.delete_message(callback.from_user.id, old_mid)
+        except Exception:
+            pass
+
+
+@router.callback_query(F.data.startswith("certcfg_d_"))
+async def certcfg_design(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    _, _, tid, design = callback.data.split("_", 3)
+    test_id = int(tid)
+    if design not in CERT_DESIGNS:
+        return await callback.answer("Bu dizayn topilmadi.", show_alert=True)
     if not await _cert_settings_entry_check(callback.from_user.id, test_id):
         return await callback.answer("Bu testga huquqingiz yo'q!", show_alert=True)
+    cur_design, cur_ci = parse_cert_template((await state.get_data()).get("certcfg_template"))
+    await _certcfg_send_preview(callback, state, bot, test_id, design, cur_ci if cur_design == design else 0)
 
+
+@router.callback_query(F.data.startswith("certcfg_c_"))
+async def certcfg_color(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    parts = callback.data.split("_")
+    test_id, design, ci = int(parts[2]), parts[3], int(parts[4])
+    if design not in CERT_DESIGNS or not 0 <= ci < len(CERT_DESIGNS[design]["colors"]):
+        return await callback.answer("Bu rang topilmadi.", show_alert=True)
+    if not await _cert_settings_entry_check(callback.from_user.id, test_id):
+        return await callback.answer("Bu testga huquqingiz yo'q!", show_alert=True)
+    await _certcfg_send_preview(callback, state, bot, test_id, design, ci)
+
+
+@router.callback_query(F.data.startswith("certcfg_menu_"))
+async def certcfg_menu(callback: CallbackQuery, state: FSMContext):
+    test_id = int(callback.data.split("_")[2])
+    if not await _cert_settings_entry_check(callback.from_user.id, test_id):
+        return await callback.answer("Bu testga huquqingiz yo'q!", show_alert=True)
     data = await state.get_data()
-    academy = data.get("certcfg_academy")
-    signee = data.get("certcfg_signee")
+    cur = data.get("certcfg_template") if data.get("certcfg_test_id") == test_id else \
+        await POOL.fetchval("SELECT cert_template FROM tests WHERE id=$1", test_id)
+    await _certcfg_design_menu(callback.message, test_id, cur)
 
+
+@router.callback_query(F.data.startswith("certcfg_pick_"))
+async def certcfg_pick(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    _, _, tid, tpl = callback.data.split("_", 3)
+    test_id = int(tid)
+    if not await _cert_settings_entry_check(callback.from_user.id, test_id):
+        return await callback.answer("Bu testga huquqingiz yo'q!", show_alert=True)
+    design, ci = parse_cert_template(tpl)
+    tpl = f"{design}:{ci}" if design != "classic" else list(CERT_TEMPLATES)[ci]
+
+    academy, signee = await _certcfg_values(state, test_id)
     await POOL.execute(
         "UPDATE tests SET cert_academy_name=$1, cert_signee_name=$2, cert_template=$3 WHERE id=$4",
-        academy, signee, tpl_key, test_id
+        academy, signee, tpl, test_id
     )
-    await state.clear()
-    # ✅ 3 ta namunadagi "shuni tanlash" tugmalari yopiladi; tanlangani belgilanadi
+    data = await state.get_data()
+    if data.get("certcfg_test_id") == test_id:
+        await state.clear()
     await _close_buttons(callback, "✅ <b>Tanlandi</b>")
-    for mid in data.get("certcfg_sample_msgs") or []:
-        if mid != (callback.message.message_id if callback.message else None):
-            await _close_markup_by_id(bot, callback.from_user.id, mid)
     await callback.answer("✅ Saqlandi!", show_alert=False)
     await callback.message.answer(
-        f"✅ <b>Sertifikat sozlamalari saqlandi:</b> {CERT_TEMPLATES[tpl_key]['label']}.\n"
+        f"✅ <b>Sertifikat sozlamalari saqlandi:</b> {_h(cert_template_label(tpl))}.\n"
         f"Bu testni yechganlarning barchasiga shu ko'rinishdagi sertifikat beriladi.",
         parse_mode=ParseMode.HTML
     )
