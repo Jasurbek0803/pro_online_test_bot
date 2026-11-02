@@ -42,7 +42,7 @@ from aiogram.types import (
     Message, CallbackQuery,
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    FSInputFile, BufferedInputFile, BotCommand, BotCommandScopeDefault, BotCommandScopeChat, ErrorEvent,
+    FSInputFile, BufferedInputFile, InputMediaDocument, BotCommand, BotCommandScopeDefault, BotCommandScopeChat, ErrorEvent,
     WebAppInfo
 )
 from aiogram.fsm.context import FSMContext
@@ -1495,19 +1495,27 @@ def _cert_leaf(c, w, h, d, c1):
 
 CERT_DESIGNS = {
     "minimal": {"label": "Minimal oq-oltin", "draw": _cert_minimal,
+                "desc": "oq fon, ingichka ramka, natija doira ichida; rasmiy, har qanday test uchun",
                 "colors": [("Oltin", "#b8902f"), ("Ko'k", "#1f4fa3"), ("Zumrad", "#0f766e")]},
     "panel": {"label": "Ko'k panel", "draw": _cert_panel,
+              "desc": "chapda rangli ustun: natija, to'g'ri javoblar va sana katta ko'rinadi",
               "colors": [("To'q ko'k", "#1b2f6b"), ("Firuza", "#0f5f5c"), ("Olcha", "#5b1f4a")]},
     "geo": {"label": "Geometrik", "draw": _cert_geo,
+            "desc": "burchaklarda yorqin shakllar; zamonaviy, yoshlarga mos",
             "colors": [("Ko'k", ("#1d4ed8", "#38bdf8")), ("Firuza", ("#0f766e", "#2dd4bf")),
                        ("Binafsha", ("#7c3aed", "#f59e0b"))]},
     "academic": {"label": "Akademik zamonaviy", "draw": _cert_academic,
+                 "desc": "qo'sh ramka va muhr; jiddiy imtihon va olimpiadalar uchun",
                  "colors": [("To'q ko'k", "#1f3a5f"), ("Bordo", "#6b1d2a"), ("Yashil", "#2f4f3a")]},
     "leaf": {"label": "Yashil yengil", "draw": _cert_leaf,
+             "desc": "och yashil fon, dafna novdasi; yumshoq va chiroyli",
              "colors": [("Yashil", "#1f7a5a"), ("Moviy", "#0e7490"), ("Terrakota", "#9a3412")]},
     "classic": {"label": "Klassik", "draw": None,
+                "desc": "eski ko'rinish: krem fon, oltin bezaklar va medal",
                 "colors": [("Oltin", "gold"), ("Yashil", "green"), ("Ko'k", "blue")]},
 }
+_CERT_COLOR_DOT = {"Oltin": "🟡", "Ko'k": "🔵", "Zumrad": "🟢", "To'q ko'k": "🔵", "Firuza": "🟢", "Olcha": "🟣",
+                   "Binafsha": "🟣", "Bordo": "🔴", "Yashil": "🟢", "Moviy": "🔵", "Terrakota": "🟠"}
 
 
 def parse_cert_template(tpl: str | None) -> tuple[str, int]:
@@ -14341,14 +14349,24 @@ async def _cert_settings_entry_check(user_tg_id: int, test_id: int) -> bool:
     return t["creator_id"] == user_tg_id or await is_admin_user(user_tg_id)
 
 
+def _certcfg_step_kb(test_id: int, keep_label: str, step: str) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=f"✅ {keep_label}"[:60], callback_data=f"certcfg_k_{test_id}_{step}")]]
+    if step == "s":
+        rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"certcfg_b_{test_id}")])
+    rows.append([InlineKeyboardButton(text="❌ Bekor qilish", callback_data=f"certcfg_x_{test_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 async def _nav_show_certcfg_academy(answerable, state: FSMContext) -> None:
-    cur = (await state.get_data()).get("certcfg_academy") or ACADEMY_NAME
+    data = await state.get_data()
+    cur = data.get("certcfg_academy") or ACADEMY_NAME
     await answerable.answer(
-        f"🎓 <b>1/3 — O'quv markazi nomi</b>\n\n"
-        f"Sertifikatda ko'rinadigan nomni kiriting.\n"
-        f"O'zgartirmaslik uchun <code>-</code> yuboring (hozir: <b>{_h(cur)}</b>):",
+        f"🎓 <b>Sertifikat sozlamalari · 1/3 — O'quv markazi nomi</b>\n\n"
+        f"Sertifikatning yuqorisida yoziladigan nom.\n"
+        f"Hozir: <b>{_h(cur)}</b>\n\n"
+        f"✍️ Yangi nomni yozib yuboring yoki hozirgisini qoldiring:",
         parse_mode=ParseMode.HTML,
-        reply_markup=nav_kb(include_back=True)
+        reply_markup=_certcfg_step_kb(int(data["certcfg_test_id"]), f"«{cur}» qolsin", "a")
     )
     await state.set_state(CertConfigState.waiting_academy)
 
@@ -14359,25 +14377,28 @@ async def certcfg_start(callback: CallbackQuery, state: FSMContext):
     if not await _cert_settings_entry_check(callback.from_user.id, test_id):
         return await callback.answer("Bu testga huquqingiz yo'q!", show_alert=True)
 
-    # ✅ joriy sozlamalar oldindan yuklanadi — "-" yuborilsa o'zgarmay qoladi
+    # ✅ joriy sozlamalar oldindan yuklanadi — "qolsin" bosilsa o'zgarmaydi
     cur = await POOL.fetchrow("SELECT cert_academy_name, cert_signee_name, cert_template FROM tests WHERE id=$1",
                               test_id)
     await state.update_data(certcfg_test_id=test_id, nav_stack=[],
                             certcfg_academy=cur["cert_academy_name"] if cur else None,
                             certcfg_signee=cur["cert_signee_name"] if cur else None,
-                            certcfg_template=cur["cert_template"] if cur else None)
+                            certcfg_template=cur["cert_template"] if cur else None,
+                            certcfg_album_mids=[], certcfg_preview_mid=None)
     await _nav_show_certcfg_academy(callback.message, state)
 
 
 async def _nav_show_certcfg_signee(answerable, state: FSMContext) -> None:
-    cur = (await state.get_data()).get("certcfg_signee")
+    data = await state.get_data()
+    cur = data.get("certcfg_signee")
+    shown = cur or "test yaratuvchisining ismi"
     await answerable.answer(
-        "🎓 <b>2/3 — Mas'ul shaxs</b>\n\n"
-        "Sertifikatda «Mas'ul shaxs» sifatida yoziladigan ism-familiyani kiriting.\n"
-        f"O'zgartirmaslik uchun <code>-</code> yuboring "
-        f"(hozir: <b>{_h(cur) if cur else 'test yaratuvchisining ismi'}</b>):",
+        "🎓 <b>Sertifikat sozlamalari · 2/3 — Mas'ul shaxs</b>\n\n"
+        "Sertifikat pastida «Mas'ul shaxs» deb yoziladigan ism-familiya.\n"
+        f"Hozir: <b>{_h(shown)}</b>\n\n"
+        "✍️ Yangi ismni yozib yuboring yoki hozirgisini qoldiring:",
         parse_mode=ParseMode.HTML,
-        reply_markup=nav_kb(include_back=True)
+        reply_markup=_certcfg_step_kb(int(data["certcfg_test_id"]), f"«{shown}» qolsin", "s")
     )
     await state.set_state(CertConfigState.waiting_signee)
 
@@ -14411,26 +14432,116 @@ async def certcfg_got_signee(message: Message, state: FSMContext, bot: Bot):
     if val and val != "-":
         await state.update_data(certcfg_signee=val)
     await _nav_push(state, "base", "certcfg_signee")
+    await _certcfg_step3(bot, message.from_user.id, message, state)
+
+
+async def _certcfg_active(callback: CallbackQuery, state: FSMContext, test_id: int) -> bool:
+    """Tugma shu foydalanuvchining hozir ochiq turgan sozlamasiga tegishlimi."""
+    if (await state.get_data()).get("certcfg_test_id") == test_id:
+        return True
+    await callback.answer("Bu sozlama eskirgan — «🎓 Sertifikat sozlamalari»ni qaytadan oching.", show_alert=True)
+    return False
+
+
+@router.callback_query(F.data.startswith("certcfg_k_"))
+async def certcfg_keep(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    _, _, tid, step = callback.data.split("_")
+    test_id = int(tid)
+    if not await _cert_settings_entry_check(callback.from_user.id, test_id):
+        return await callback.answer("Bu testga huquqingiz yo'q!", show_alert=True)
+    if not await _certcfg_active(callback, state, test_id):
+        return
+    await _close_buttons(callback)
+    if step == "a":
+        await _nav_show_certcfg_signee(callback.message, state)
+    else:
+        await _certcfg_step3(bot, callback.from_user.id, callback.message, state)
+
+
+@router.callback_query(F.data.startswith("certcfg_b_"))
+async def certcfg_back(callback: CallbackQuery, state: FSMContext):
+    test_id = int(callback.data.split("_")[2])
+    if not await _certcfg_active(callback, state, test_id):
+        return
+    await _close_buttons(callback)
+    await _nav_show_certcfg_academy(callback.message, state)
+
+
+@router.callback_query(F.data.startswith("certcfg_x_"))
+async def certcfg_cancel(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    test_id = int(callback.data.split("_")[2])
     data = await state.get_data()
-    await _certcfg_design_menu(message, int(data.get("certcfg_test_id")), data.get("certcfg_template"))
+    if data.get("certcfg_test_id") == test_id:
+        await _certcfg_cleanup(bot, callback.from_user.id, data, keep_mid=None)
+        await state.clear()
+    await _close_buttons(callback, "❌ <b>Bekor qilindi</b> — sertifikat o'zgarmadi.")
+
+
+# ✅ 3-qadam: avval barcha dizaynlar namunasi bitta albomda (ustozning o'z
+# testi nomi bilan) keladi, so'ng tavsifli ro'yxat. Dizayn bosilsa — shu
+# dizayn namunasi rang tugmalari bilan; "✅ Shu dizaynni tanlash" saqlaydi.
+# Tanlangach albom va eski namunalar o'chiriladi — chat toza qoladi.
+async def _certcfg_sample(test_id: int, state: FSMContext, tpl: str, out_path: str) -> bool:
+    academy, signee = await _certcfg_values(state, test_id)
+    t = await POOL.fetchrow("SELECT title, subject, code, creator_id FROM tests WHERE id=$1", test_id)
+    if not t:
+        return False
+    academy, signee, _tpl = await _resolve_cert_settings(academy, signee, None, t["creator_id"])
+    await asyncio.to_thread(
+        make_certificate_pdf, full_name="Ism Familiya", subject=t["subject"] or "Fan", test_code=t["code"],
+        test_title=t["title"] or "Test", exam_date_str=now_str_local(), percent=90.0, correct_count=27,
+        total_questions=30, grade=None, academy_name=academy, signee_name=signee, template=tpl, out_path=out_path)
+    return True
+
+
+async def _certcfg_step3(bot: Bot, user_tg_id: int, answerable, state: FSMContext) -> None:
+    data = await state.get_data()
+    test_id = int(data["certcfg_test_id"])
     await state.set_state(CertConfigState.waiting_template)
+    wait = await answerable.answer("⏳ Dizayn namunalari tayyorlanmoqda...")
+    try:
+        await bot.send_chat_action(user_tg_id, "upload_document")
+    except Exception:
+        pass
+    media = []
+    tmp = tempfile.gettempdir()
+    for i, (key, meta) in enumerate(CERT_DESIGNS.items(), 1):
+        path = os.path.join(tmp, f"certcat_{test_id}_{user_tg_id}_{key}.pdf")
+        if await _certcfg_sample(test_id, state, f"{key}:0", path):
+            media.append(InputMediaDocument(media=FSInputFile(path, filename=f"{i}-dizayn.pdf"),
+                                            caption=f"{i}. {meta['label']}"))
+    album_mids = []
+    if len(media) >= 2:
+        try:
+            sent = await bot.send_media_group(user_tg_id, media)
+            album_mids = [m.message_id for m in sent]
+        except (TelegramBadRequest, TelegramNetworkError):
+            logging.exception("Sertifikat namunalari albomini yuborib bo'lmadi")
+    await state.update_data(certcfg_album_mids=album_mids)
+    try:
+        await bot.delete_message(user_tg_id, wait.message_id)
+    except Exception:
+        pass
+    await _certcfg_design_menu(answerable, test_id, data.get("certcfg_template"), bool(album_mids))
 
 
-# ✅ 3-qadam: dizayn ro'yxati -> tanlangan dizayn namunasi (PDF) rang
-# tugmalari bilan -> "✅ Shuni tanlash". Har bir namuna haqiqiy test nomi va
-# ustoz kiritgan markaz/mas'ul shaxs bilan chiziladi; yangi namuna
-# yuborilganda oldingisi o'chiriladi (chat to'lib ketmaydi).
-async def _certcfg_design_menu(answerable, test_id: int, current_tpl: str | None) -> None:
+async def _certcfg_design_menu(answerable, test_id: int, current_tpl: str | None, with_album: bool = False) -> None:
     cur_design, _ci = parse_cert_template(current_tpl)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=("✅ " if key == cur_design else "🎨 ") + f"{i}. {meta['label']}",
-                              callback_data=f"certcfg_d_{test_id}_{key}")]
-        for i, (key, meta) in enumerate(CERT_DESIGNS.items(), 1)])
+    lines = []
+    buttons = []
+    for i, (key, meta) in enumerate(CERT_DESIGNS.items(), 1):
+        mark = "  ✅ hozirgi" if key == cur_design else ""
+        lines.append(f"<b>{i}. {meta['label']}</b>{mark}\n<i>{meta['desc']}</i>")
+        buttons.append(InlineKeyboardButton(text=("✅ " if key == cur_design else "") + f"{i}. {meta['label']}",
+                                            callback_data=f"certcfg_d_{test_id}_{key}"))
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton(text="❌ Bekor qilish", callback_data=f"certcfg_x_{test_id}")])
+    head = ("👆 Yuqorida barcha dizaynlar namunasi — sizning testingiz nomi bilan.\n\n" if with_album else "")
     await answerable.answer(
-        "🎓 <b>3/3 — Sertifikat dizayni</b>\n\n"
-        f"Hozirgi: <b>{_h(cert_template_label(current_tpl))}</b>\n\n"
-        "Dizaynni bosing — namunasi (PDF) keladi, unda rangini ham tanlaysiz.",
-        parse_mode=ParseMode.HTML, reply_markup=kb)
+        "🎓 <b>Sertifikat sozlamalari · 3/3 — Dizayn</b>\n\n" + head + "\n\n".join(lines) +
+        f"\n\nHozir: <b>{_h(cert_template_label(current_tpl))}</b>\n\n"
+        "👇 Yoqqan dizayn <b>raqamini</b> bosing — keyin rangini tanlaysiz.",
+        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 async def _certcfg_values(state: FSMContext, test_id: int) -> tuple[str | None, str | None]:
@@ -14442,34 +14553,43 @@ async def _certcfg_values(state: FSMContext, test_id: int) -> tuple[str | None, 
     return (row["cert_academy_name"], row["cert_signee_name"]) if row else (None, None)
 
 
+async def _certcfg_cleanup(bot: Bot, chat_id: int, data: dict, keep_mid: int | None) -> None:
+    for mid in list(data.get("certcfg_album_mids") or []) + [data.get("certcfg_preview_mid")]:
+        if mid and mid != keep_mid:
+            try:
+                await bot.delete_message(chat_id, mid)
+            except Exception:
+                pass
+
+
 async def _certcfg_send_preview(callback: CallbackQuery, state: FSMContext, bot: Bot, test_id: int,
                                 design: str, ci: int) -> None:
-    academy, signee = await _certcfg_values(state, test_id)
-    t = await POOL.fetchrow("SELECT title, subject, code, creator_id FROM tests WHERE id=$1", test_id)
-    if not t:
-        return await callback.answer("Test topilmadi.", show_alert=True)
-    academy, signee, _tpl = await _resolve_cert_settings(academy, signee, None, t["creator_id"])
     await callback.answer("⏳ Namuna tayyorlanmoqda...")
     tpl = f"{design}:{ci}"
     pdf_path = os.path.join(tempfile.gettempdir(), f"certpreview_{test_id}_{callback.from_user.id}.pdf")
-    await asyncio.to_thread(
-        make_certificate_pdf, full_name="Ism Familiya", subject=t["subject"] or "Fan", test_code=t["code"],
-        test_title=t["title"] or "Test", exam_date_str=now_str_local(), percent=90.0, correct_count=27,
-        total_questions=30, grade=None, academy_name=academy, signee_name=signee, template=tpl, out_path=pdf_path)
+    if not await _certcfg_sample(test_id, state, tpl, pdf_path):
+        return await callback.message.answer("Test topilmadi.")
     meta = CERT_DESIGNS[design]
-    color_row = [InlineKeyboardButton(text=("● " if i == ci else "") + name,
+    num = list(CERT_DESIGNS).index(design) + 1
+    color_name = meta["colors"][ci][0]
+    color_row = [InlineKeyboardButton(text=f"{_CERT_COLOR_DOT.get(name, '🎨')} {name}" + (" ✓" if i == ci else ""),
                                       callback_data=f"certcfg_c_{test_id}_{design}_{i}")
                  for i, (name, _v) in enumerate(meta["colors"])]
     kb = InlineKeyboardMarkup(inline_keyboard=[
         color_row,
-        [InlineKeyboardButton(text="✅ Shuni tanlash", callback_data=f"certcfg_pick_{test_id}_{tpl}")],
-        [InlineKeyboardButton(text="🎨 Boshqa dizaynlar", callback_data=f"certcfg_menu_{test_id}")],
+        [InlineKeyboardButton(text="✅ Shu dizaynni tanlash", callback_data=f"certcfg_pick_{test_id}_{tpl}")],
+        [InlineKeyboardButton(text="⬅️ Boshqa dizaynlar", callback_data=f"certcfg_menu_{test_id}")],
     ])
     data = await state.get_data()
     old_mid = data.get("certcfg_preview_mid")
     sent = await bot.send_document(
-        chat_id=callback.from_user.id, document=FSInputFile(pdf_path, filename="sertifikat_namuna.pdf"),
-        caption=f"🎓 Namuna: <b>{_h(cert_template_label(tpl))}</b>\n<i>Rangini pastdagi tugmalardan tanlang.</i>",
+        chat_id=callback.from_user.id,
+        document=FSInputFile(pdf_path, filename=f"namuna-{num}-{design}.pdf"),
+        caption=(f"🎓 <b>{num}. {_h(meta['label'])}</b> · rang: {_CERT_COLOR_DOT.get(color_name, '')} "
+                 f"<b>{_h(color_name)}</b>\n\n"
+                 f"🎨 Boshqa rangni ko'rish uchun rang tugmasini bosing.\n"
+                 f"✅ Yoqsa — «Shu dizaynni tanlash».\n\n"
+                 f"<i>Bu namuna: haqiqiy sertifikatda o'quvchining ismi va natijasi yoziladi.</i>"),
         parse_mode=ParseMode.HTML, reply_markup=kb)
     await state.update_data(certcfg_preview_mid=sent.message_id)
     if old_mid and old_mid != sent.message_id:
@@ -14503,14 +14623,14 @@ async def certcfg_color(callback: CallbackQuery, state: FSMContext, bot: Bot):
 
 
 @router.callback_query(F.data.startswith("certcfg_menu_"))
-async def certcfg_menu(callback: CallbackQuery, state: FSMContext):
+async def certcfg_menu(callback: CallbackQuery, state: FSMContext, bot: Bot):
     test_id = int(callback.data.split("_")[2])
     if not await _cert_settings_entry_check(callback.from_user.id, test_id):
         return await callback.answer("Bu testga huquqingiz yo'q!", show_alert=True)
     data = await state.get_data()
     cur = data.get("certcfg_template") if data.get("certcfg_test_id") == test_id else \
         await POOL.fetchval("SELECT cert_template FROM tests WHERE id=$1", test_id)
-    await _certcfg_design_menu(callback.message, test_id, cur)
+    await _certcfg_design_menu(callback.message, test_id, cur, bool(data.get("certcfg_album_mids")))
 
 
 @router.callback_query(F.data.startswith("certcfg_pick_"))
@@ -14529,12 +14649,15 @@ async def certcfg_pick(callback: CallbackQuery, state: FSMContext, bot: Bot):
     )
     data = await state.get_data()
     if data.get("certcfg_test_id") == test_id:
+        await _certcfg_cleanup(bot, callback.from_user.id, data,
+                               keep_mid=callback.message.message_id if callback.message else None)
         await state.clear()
     await _close_buttons(callback, "✅ <b>Tanlandi</b>")
     await callback.answer("✅ Saqlandi!", show_alert=False)
     await callback.message.answer(
-        f"✅ <b>Sertifikat sozlamalari saqlandi:</b> {_h(cert_template_label(tpl))}.\n"
-        f"Bu testni yechganlarning barchasiga shu ko'rinishdagi sertifikat beriladi.",
+        f"✅ <b>Sertifikat saqlandi:</b> {_h(cert_template_label(tpl))}\n\n"
+        f"Bu testni muvaffaqiyatli yechgan o'quvchilarga shu ko'rinishdagi sertifikat beriladi.\n"
+        f"<i>Keyin o'zgartirish: «🛠 Yaratgan testlarim» → test → «🎓 Sertifikat sozlamalari».</i>",
         parse_mode=ParseMode.HTML
     )
 
