@@ -4946,7 +4946,8 @@ async def _free_test_start(callback: CallbackQuery, state: FSMContext, bot: Bot,
     saved_answers = saved.get("answers") or {}
     await state.update_data(
         test_id=test_id, mode="free", qcount=qcount, current_q=1, test_answers=saved_answers,
-        test_open_answers=saved.get("open_answers") or {}, test_answers_key=answer_key
+        test_open_answers=saved.get("open_answers") or {}, test_answers_key=answer_key,
+        blank_submit_ok=False
     )
     resumed_note = (f"♻️ Avvalgi <b>{len(saved_answers)}</b> ta javobingiz tiklandi.\n"
                     if saved_answers else "")
@@ -6210,7 +6211,8 @@ async def begin_test(callback: CallbackQuery, state: FSMContext, bot: Bot):
     saved_answers = saved.get("answers") or {}
     await state.update_data(
         test_id=test_id, mode="paid", qcount=qcount, current_q=1, test_answers=saved_answers,
-        test_open_answers=saved.get("open_answers") or {}, test_answers_key=answer_key
+        test_open_answers=saved.get("open_answers") or {}, test_answers_key=answer_key,
+        blank_submit_ok=False
     )
     resumed_note = (f"♻️ Avvalgi <b>{len(saved_answers)}</b> ta javobingiz tiklandi.\n"
                     if saved_answers else "")
@@ -17136,6 +17138,12 @@ async def contact_shared_anywhere(message: Message):
 async def fallback_message(message: Message, state: FSMContext):
     st = await state.get_state()
     if st is None:
+        # ✅ O'quvchi test kodini to'g'ridan-to'g'ri bosh menyuda yozsa ham test
+        # ochiladi (avval "menyudan tanlang" deyilib, kod e'tiborsiz qolardi).
+        code = normalize_code(message.text or "")
+        if is_valid_code(code) and await test_by_code(code):
+            await _open_test_by_deeplink(message, message.from_user.id, code)
+            return
         admin_flag = await is_admin_user(message.from_user.id)
         await message.answer("🤖 Kerakli bo'limni pastdagi menyudan tanlang 👇",
                              reply_markup=main_menu_kb(admin_flag))
@@ -19819,7 +19827,7 @@ function renderInfo(r) {
   const btns = [];
   const start = async (retake) => {
     const txt = t.staged ? "Bo'limlar ketma-ket topshiriladi, har birining o'z vaqti bor." :
-      `Vaqt ${t.duration} daqiqa. Boshlangach taymer to'xtamaydi — ilovani yopsangiz ham vaqt ketaveradi, javoblaringiz saqlanadi.`;
+      `Vaqt ${t.duration} daqiqa. Boshlangach taymer to'xtamaydi — ilovani yopsangiz ham vaqt ketaveradi, javoblaringiz saqlanadi. Testni faqat 1 marta topshirish mumkin.`;
     if (st === "ready" || retake) { if (!await confirmBox("Testni boshlaysizmi?", txt, "Boshlash")) return; }
     startTest(t, retake);
   };
