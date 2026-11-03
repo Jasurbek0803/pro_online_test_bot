@@ -26,7 +26,7 @@ import base64
 import gzip
 import hashlib
 import hmac
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, urlencode, quote
 import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
@@ -37,13 +37,13 @@ from openpyxl.utils import get_column_letter
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart, StateFilter, Command
+from aiogram.filters import CommandStart, StateFilter, Command, Filter
 from aiogram.types import (
     Message, CallbackQuery,
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
     FSInputFile, BufferedInputFile, InputMediaDocument, BotCommand, BotCommandScopeDefault, BotCommandScopeChat, ErrorEvent,
-    WebAppInfo
+    WebAppInfo, ReplyParameters
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -328,6 +328,10 @@ class AdminEditTestState(StatesGroup):
 
 class AskAdminState(StatesGroup):
     waiting_text = State()
+
+
+class SupportReplyState(StatesGroup):
+    waiting = State()
 
 
 class CertConfigState(StatesGroup):
@@ -2690,6 +2694,52 @@ async def init_db(db):
     await db.execute("CREATE INDEX IF NOT EXISTS idx_payments_user_test ON payments(user_id, test_id)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_staged_attempts_user_test ON staged_attempts(user_id, test_id)")
 
+    # ✅ Bo'sh urinish (birorta javob belgilanmay vaqt tugagan) — har bir testda
+    # o'quvchiga faqat bir marta "hisoblanmadi" imkoni beriladi.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS blank_discards (
+            user_id INTEGER,
+            test_id INTEGER,
+            created_ts BIGINT DEFAULT 0,
+            PRIMARY KEY (user_id, test_id)
+        )
+    """)
+    # ✅ Test fayli standart holatda himoyalangan (forward/saqlash taqiqlanadi,
+    # Telegram mobil ilovasida skrinshot cheklanadi) — ustoz 🛡 menyusidan
+    # o'chirishi mumkin. Mavjud testlarga bir marta qo'llanadi.
+    await db.execute("ALTER TABLE tests ALTER COLUMN protect_files SET DEFAULT 1")
+    await db.execute("CREATE TABLE IF NOT EXISTS schema_flags (name TEXT PRIMARY KEY, created_ts BIGINT DEFAULT 0)")
+    if await db.fetchval("INSERT INTO schema_flags (name, created_ts) VALUES ('protect_files_on', $1) "
+                         "ON CONFLICT DO NOTHING RETURNING name", now_ts()):
+        await db.execute("UPDATE tests SET protect_files=1")
+
+    # ✅ Ustoz yangi test haqida avvalgi o'quvchilariga xabar beradi (1 marta);
+    # o'quvchi aniq ustozdan xabar olishni o'chirib qo'yishi mumkin.
+    await _ensure_column(db, "tests", "notified_ts", "BIGINT DEFAULT 0")
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS teacher_optout (
+            user_id INTEGER,
+            teacher_tg BIGINT,
+            created_ts BIGINT DEFAULT 0,
+            PRIMARY KEY (user_id, teacher_tg)
+        )
+    """)
+    # ✅ Foydalanuvchi ↔ admin yozishmasi (admin savolga belgilab javob qaytaradi)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS support_msgs (
+            id SERIAL PRIMARY KEY,
+            user_tg BIGINT NOT NULL,
+            user_msg_id BIGINT,
+            admin_msg_id BIGINT,
+            admin_msg_id2 BIGINT,
+            text TEXT,
+            created_ts BIGINT DEFAULT 0,
+            answered_ts BIGINT DEFAULT 0,
+            answered_by BIGINT
+        )
+    """)
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_support_admin_msg ON support_msgs(admin_msg_id)")
+
 
 # ===================== SECURITY =====================
 class SecurityManager:
@@ -3007,6 +3057,54 @@ async def _resume_active_timers(bot: Bot):
             logging.warning(f"Timer tiklanmadi: user={tg_id} test={test_id}")
 
 
+# ✅ Bot o'chiq turgan paytda vaqti tugagan seanslar avval hech qachon
+# yakunlanmasdi (taymer faqat hali tugamaganlar uchun tiklanardi) — "osilib"
+# qolib, o'quvchi testni qayta ochganda "vaqt tugagan" deb turardi. Endi
+# ishga tushganda va har 10 daqiqada tekshiriladi: javob belgilangan bo'lsa
+# topshiriladi, bo'sh bo'lsa urinish hisoblanmaydi; 1 kundan eskisi jimgina tozalanadi.
+EXPIRED_SWEEP_EVERY_SEC = 600
+EXPIRED_SWEEP_GRACE_SEC = 180
+EXPIRED_STALE_AFTER_SEC = 86400
+
+
+async def _sweep_expired_sessions(bot: Bot) -> int:
+    now_ = now_ts()
+    rows = await POOL.fetch("""
+        SELECT s.user_id, s.test_id, s.mode, s.start_ts, s.duration_sec, u.telegram_id
+        FROM sessions s JOIN users u ON u.id = s.user_id
+        WHERE s.mode IN ('free', 'paid') AND s.duration_sec > 0 AND s.start_ts + s.duration_sec + $2 < $1
+    """, now_, EXPIRED_SWEEP_GRACE_SEC)
+    done = 0
+    for r in rows:
+        tg_id, test_id = int(r["telegram_id"]), int(r["test_id"])
+        end_ = int(r["start_ts"]) + int(r["duration_sec"])
+        task = ACTIVE_TIMERS.get((tg_id, test_id)) or WEB_DEADLINE_TASKS.get((tg_id, test_id))
+        if task and not task.done():
+            continue
+        try:
+            if now_ - end_ <= EXPIRED_STALE_AFTER_SEC:
+                await _auto_submit_on_timeout(bot, tg_id, test_id, end_)
+            if await get_session(r["user_id"], test_id, r["mode"]):
+                await delete_session(r["user_id"], test_id, r["mode"])
+            done += 1
+        except Exception:
+            logging.exception(f"Eskirgan seansni yakunlab bo'lmadi (user={tg_id}, test={test_id})")
+    if done:
+        logging.info(f"Eskirgan test seanslari yakunlandi: {done}")
+    return done
+
+
+async def expired_sessions_daemon(bot: Bot):
+    delay = 30   # ishga tushgach tez orada bir marta, keyin har 10 daqiqada
+    while True:
+        await asyncio.sleep(delay)
+        delay = EXPIRED_SWEEP_EVERY_SEC
+        try:
+            await _sweep_expired_sessions(bot)
+        except Exception:
+            logging.exception("expired_sessions_daemon xatosi")
+
+
 FSM_STORAGE = None  # main() ichida o'rnatiladi (taymer avtomatik topshirishi uchun)
 EVENTS_ISOLATION = None  # main() ichida o'rnatiladi (foydalanuvchi bo'yicha qulf)
 
@@ -3079,9 +3177,9 @@ async def _auto_submit_on_timeout_core(bot: "Bot", user_tg_id: int, test_id: int
         qcount = int(data.get("qcount") or 0)
         answers = data.get("test_answers", {}) or {}
         user_ans = "".join(answers.get(str(i), "*") for i in range(1, qcount + 1))
-        await bot.send_message(user_tg_id, "⏱ <b>Vaqt tugadi</b> — belgilagan javoblaringiz avtomatik topshirildi.",
-                               parse_mode=ParseMode.HTML)
-        await process_test_submission(user_tg_id, bot, state, user_ans, data.get("test_open_answers") or {})
+        open_ans = data.get("test_open_answers") or {}
+        await bot.send_message(user_tg_id, _timeout_note(user_ans, open_ans), parse_mode=ParseMode.HTML)
+        await process_test_submission(user_tg_id, bot, state, user_ans, open_ans, timed_out=True)
         return
 
     # 2) bosqichli test — joriy bosqich
@@ -3117,10 +3215,16 @@ async def _auto_submit_on_timeout_core(bot: "Bot", user_tg_id: int, test_id: int
         answers = saved.get("answers") or {}
         user_ans = "".join(answers.get(str(i), "*") for i in range(1, qcount + 1))
         tmp = _DetachedState({"test_id": test_id, "mode": mode})
-        await bot.send_message(user_tg_id, "⏱ <b>Vaqt tugadi</b> — belgilagan javoblaringiz avtomatik topshirildi.",
-                               parse_mode=ParseMode.HTML)
-        await process_test_submission(user_tg_id, bot, tmp, user_ans, saved.get("open_answers") or {})
+        open_ans = saved.get("open_answers") or {}
+        await bot.send_message(user_tg_id, _timeout_note(user_ans, open_ans), parse_mode=ParseMode.HTML)
+        await process_test_submission(user_tg_id, bot, tmp, user_ans, open_ans, timed_out=True)
         return
+
+
+def _timeout_note(user_ans: str, open_ans: dict) -> str:
+    if _answered_any(user_ans, open_ans):
+        return "⏱ <b>Vaqt tugadi</b> — belgilagan javoblaringiz avtomatik topshirildi."
+    return "⏱ <b>Vaqt tugadi</b> — birorta ham javob belgilanmagan edi, urinish 0% natija bilan yakunlandi."
 
 
 async def _stash_test_progress(state: FSMContext, user_tg_id: int) -> None:
@@ -3159,6 +3263,8 @@ async def upsert_session(user_id: int, test_id: int, mode: str, start_ts_: int, 
             "SELECT 1 FROM tests WHERE id=$1 AND COALESCE(b_answers,'')<>'' AND COALESCE(b_file_id,'')<>''", test_id)
         if has_b:
             variant = _pick_variant(user_id, test_id)
+            if await _blank_discard_used(user_id, test_id):
+                variant = "a" if variant == "b" else "b"   # qayta imkonda — boshqa variant
     await POOL.execute("""
         INSERT INTO sessions (user_id, test_id, mode, start_ts, duration_sec, created_at, variant)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -3226,6 +3332,106 @@ async def _test_variant_row(test_id: int):
 
 async def delete_session(user_id: int, test_id: int, mode: str):
     await POOL.execute("DELETE FROM sessions WHERE user_id=$1 AND test_id=$2 AND mode=$3", user_id, test_id, mode)
+
+
+# ===================== BO'SH URINISHLAR =====================
+# ✅ "Bo'sh" natija — o'quvchi testni ochgan-u, birorta ham javob belgilamagan
+# (prod'da natijalarning uchdan biri shunday edi). Bunday natija urinish
+# sifatida qoladi, lekin o'rtacha ball, reyting va savollar tahliliga
+# kirmaydi. Faqat test boshlanganiga 1 daqiqa bo'lmay javobsiz yakunlansa
+# (adashib boshlangan) — urinish hisoblanmaydi, bu imkon har testda 1 marta.
+BLANK_RETAKE_WINDOW_SEC = 60
+def _blank_sql(alias: str = "r") -> str:
+    a = f"{alias}." if alias else ""
+    return (f"(COALESCE({a}user_answers,'') <> '' AND REPLACE({a}user_answers,'*','') = '' "
+            f"AND {a}essay_status IS NULL AND COALESCE({a}open_text_answers,'') IN ('', '{{}}', 'null'))")
+
+
+def _real_sql(alias: str = "r") -> str:
+    return "NOT " + _blank_sql(alias)
+
+
+def _answered_any(user_ans: str, open_answers: dict | None = None) -> bool:
+    return any(ch != "*" for ch in (user_ans or "")) or bool(open_answers)
+
+
+
+
+async def _result_exists_any(user_db_id: int, test_id: int) -> bool:
+    return bool(await POOL.fetchval("SELECT 1 FROM results WHERE user_id=$1 AND test_id=$2 LIMIT 1",
+                                    user_db_id, test_id))
+
+
+async def _blank_discard_used(user_db_id: int, test_id: int) -> bool:
+    return bool(await POOL.fetchval("SELECT 1 FROM blank_discards WHERE user_id=$1 AND test_id=$2",
+                                    user_db_id, test_id))
+
+
+async def _discard_blank_attempt(bot: "Bot", user_tg_id: int, user_db_id: int, test_id: int, mode: str,
+                                 state=None, elapsed: int = 0) -> None:
+    """Test 1 daqiqa ichida birorta javobsiz yakunlandi — bu urinish
+    hisoblanmaydi. Imkon har bir testda faqat BIR MARTA: keyingi urinish
+    natijasi (bo'sh bo'lsa ham) hisobga olinadi. G'irromlikka qarshi:
+    qayta urinishda (B varianti bo'lsa) boshqa variant beriladi va admin
+    xabardor qilinadi."""
+    await POOL.execute("INSERT INTO blank_discards (user_id, test_id, created_ts) VALUES ($1,$2,$3) "
+                       "ON CONFLICT DO NOTHING", user_db_id, test_id, now_ts())
+    await delete_session(user_db_id, test_id, mode)
+    cancel_timer(user_tg_id, test_id)
+    _web_cancel_deadline(user_tg_id, test_id)
+    if state is not None:
+        await state.clear()
+    sched = await POOL.fetchval("SELECT start_mode FROM tests WHERE id=$1", test_id)
+    tail = ""
+    if (sched or "normal") != "scheduled":
+        tail = ("\n\n♻️ Sizga <b>yana 1 marta</b> imkon beriladi — tayyor bo'lganingizda testni qaytadan "
+                "boshlang. <b>Keyingi urinish natijasi hisobga olinadi</b> (qayta imkon boshqa berilmaydi).")
+    await bot.send_message(
+        user_tg_id, "↩️ Test boshlanganiga 1 daqiqa bo'lmay, birorta ham javob belgilanmasdan yakunlandi — "
+                    "bu urinish <b>hisoblanmadi</b>." + tail, parse_mode=ParseMode.HTML)
+    has_b = await POOL.fetchval("SELECT 1 FROM tests WHERE id=$1 AND COALESCE(b_answers,'')<>''", test_id)
+    await _report_suspicious(
+        bot, "quick_blank", user_db_id, test_id,
+        f"Test {elapsed} soniyada javobsiz yakunlandi va o'quvchi 1 martalik qayta imkon oldi. "
+        + ("Qayta urinishda unga boshqa (B/A) variant beriladi." if has_b else
+           "Testda B variant yo'q — qayta urinishda savollar o'sha. Ko'chirishga qarshi menyudan B variant "
+           "qo'shish tavsiya etiladi."))
+
+
+# ===================== TESTNI O'QUVCHILARGA YETKAZISH =====================
+def _share_url(link: str, title: str) -> str | None:
+    """Telegram'ning "kimga yuborish" oynasini ochadigan havola."""
+    if not (link or "").startswith("https://"):
+        return None
+    return "https://t.me/share/url?" + urlencode(
+        {"url": link, "text": f"📝 «{title}» testini yeching:"}, quote_via=quote)
+
+
+def _teacher_audience_sql() -> str:
+    # ustozning o'quvchilari — uning testlarini haqiqatan yechganlar (o'zi va xabar olmaslikni tanlaganlar emas)
+    return f"""
+        SELECT DISTINCT u.telegram_id FROM results r JOIN tests t ON t.id=r.test_id JOIN users u ON u.id=r.user_id
+        WHERE t.creator_id=$1 AND u.telegram_id<>$1 AND {_real_sql()}
+          AND NOT EXISTS (SELECT 1 FROM teacher_optout o WHERE o.user_id=u.id AND o.teacher_tg=$1)"""
+
+
+async def _teacher_audience_count(teacher_tg: int) -> int:
+    return int(await POOL.fetchval(f"SELECT COUNT(*) FROM ({_teacher_audience_sql()}) x", teacher_tg) or 0)
+
+
+async def _test_share_rows(link: str, test_id: int, title: str, creator_tg: int | None) -> list:
+    rows = []
+    url = _share_url(link, title or "Test")
+    if url:
+        rows.append([InlineKeyboardButton(text="📤 O'quvchilarga yuborish", url=url)])
+    if creator_tg:
+        notified = await POOL.fetchval("SELECT COALESCE(notified_ts,0) FROM tests WHERE id=$1", test_id)
+        n = 0 if notified else await _teacher_audience_count(int(creator_tg))
+        if n:
+            rows.append([InlineKeyboardButton(text=f"📢 Avvalgi o'quvchilarimga xabar berish ({n})",
+                                              callback_data=f"tnotify_{test_id}")])
+    return rows
+
 
 
 # ===================== ROUTER + MIDDLEWARE =====================
@@ -3645,6 +3851,33 @@ router.message.middleware(NavMessageMiddleware())
 router.callback_query.middleware(NavCallbackMiddleware())
 
 
+class _SupportReplyTarget(Filter):
+    """Admin foydalanuvchi xabariga Telegram'da «Reply» qilib yozdimi?"""
+
+    async def __call__(self, message: Message, bot: Bot):
+        r = message.reply_to_message
+        if not r or message.chat.id != ADMIN_ID or not r.from_user or not r.from_user.is_bot:
+            return False
+        sup = await _support_row_by_admin_msg(r.message_id)
+        if sup:
+            return {"support_target": dict(sup)}
+        # funksiya qo'shilishidan oldingi xabarlar — ID matnning o'zida bor
+        m = re.search(r"🆔 (\d+)", r.text or "")
+        if m and "Yangi xabar" in (r.text or ""):
+            return {"support_target": {"id": None, "user_tg": int(m.group(1)), "user_msg_id": None,
+                                       "admin_msg_id": None}}
+        return False
+
+
+# ✅ Boshqa barcha xabar handlerlaridan OLDIN — aks holda admin javobini
+# (masalan kod qidirish kabi) umumiy matn handlerlari "yutib" yuborardi.
+@router.message(_SupportReplyTarget())
+async def support_native_reply(message: Message, state: FSMContext, bot: Bot, support_target: dict):
+    if await state.get_state() == SupportReplyState.waiting.state:
+        await state.clear()
+    await _send_support_answer(bot, message, support_target)
+
+
 @router.callback_query(F.data == "navback")
 async def nav_back_cb(callback: CallbackQuery, **data):
     """"🔙 Orqaga": oldingi ekranni xuddi o'sha xabarda qayta chizadi."""
@@ -4007,16 +4240,131 @@ async def test_link_cb(callback: CallbackQuery, bot: Bot):
     test_id = int(callback.data.split("_")[1])
     if not await _is_admin_or_creator(callback.from_user.id, test_id):
         return await callback.answer("Bu testga huquqingiz yo'q!", show_alert=True)
-    t = await POOL.fetchrow("SELECT code, title FROM tests WHERE id=$1", test_id)
+    t = await POOL.fetchrow("SELECT code, title, creator_id FROM tests WHERE id=$1", test_id)
     if not t:
         return await callback.answer("Test topilmadi.", show_alert=True)
     await callback.answer()
     link = await _test_deep_link(bot, t["code"])
+    rows = await _test_share_rows(link, test_id, t["title"], t["creator_id"])
     await callback.message.answer(
         f"🔗 <b>{_h(t['title'])}</b> testi havolasi:\n{link}\n\n"
         f"<i>Shu havolani o'quvchilarga yuboring — bosishi bilan bot ochiladi va test darhol chiqadi "
-        f"(kod yozish shart emas). Ro'yxatdan o'tmaganlar avval ro'yxatdan o'tadi, so'ng test ochiladi.</i>",
-        parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        f"(kod yozish shart emas). Ro'yxatdan o'tmaganlar avval ro'yxatdan o'tadi, so'ng test ochiladi.</i>\n"
+        f"<i>«📤 O'quvchilarga yuborish» — havolani istalgan guruh yoki chatga bir bosishda yuboradi.</i>",
+        parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
+
+
+NOTIFY_SEND_DELAY = 0.05   # ~20 xabar/soniya — Telegram cheklovidan past
+
+
+@router.callback_query(F.data.startswith("tnotify_"))
+async def test_notify_ask(callback: CallbackQuery):
+    test_id = int(callback.data.split("_")[1])
+    if not await _is_admin_or_creator(callback.from_user.id, test_id):
+        return await callback.answer("Bu testga huquqingiz yo'q!", show_alert=True)
+    t = await POOL.fetchrow("SELECT title, creator_id, COALESCE(notified_ts,0) AS notified_ts, "
+                            "COALESCE(is_hidden,0) AS is_hidden FROM tests WHERE id=$1", test_id)
+    if not t or not t["creator_id"]:
+        return await callback.answer("Test topilmadi.", show_alert=True)
+    if t["notified_ts"]:
+        return await callback.answer("Bu test haqida o'quvchilarga allaqachon xabar yuborilgan.", show_alert=True)
+    if t["is_hidden"]:
+        return await callback.answer("Test yashirilgan — avval uni qaytaring.", show_alert=True)
+    n = await _teacher_audience_count(int(t["creator_id"]))
+    if not n:
+        return await callback.answer("Hozircha xabar yuboriladigan o'quvchi yo'q (testlaringizni hali hech kim "
+                                     "yechmagan).", show_alert=True)
+    await callback.answer()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✅ Ha, {n} nafarga yuborish", callback_data=f"tnotifyok_{test_id}")],
+        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="dismiss_msg")],
+    ])
+    await callback.message.answer(
+        f"📢 <b>«{_h(t['title'])}»</b> haqida <b>{n}</b> nafar o'quvchingizga xabar yuboriladi.\n\n"
+        f"Bular — avval testlaringizni yechgan o'quvchilar. Xabarda testni bir bosishda ochish tugmasi bo'ladi; "
+        f"o'quvchi xohlasa sizdan xabar olishni o'chirib qo'yishi mumkin.\n"
+        f"<i>Har bir test uchun faqat 1 marta yuboriladi.</i>", parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("tnotifyok_"))
+async def test_notify_send(callback: CallbackQuery, bot: Bot):
+    test_id = int(callback.data.split("_")[1])
+    if not await _is_admin_or_creator(callback.from_user.id, test_id):
+        return await callback.answer("Bu testga huquqingiz yo'q!", show_alert=True)
+    t = await POOL.fetchrow("""
+        UPDATE tests SET notified_ts=$1 WHERE id=$2 AND COALESCE(notified_ts,0)=0 AND creator_id IS NOT NULL
+        RETURNING id, title, duration, questions_count, creator_id
+    """, now_ts(), test_id)
+    if not t:
+        return await callback.answer("Bu test haqida xabar allaqachon yuborilgan.", show_alert=True)
+    await callback.answer()
+    try:
+        await callback.message.edit_text("⏳ Xabar yuborilmoqda... Tugagach natijasini shu yerga yozaman.")
+    except TelegramBadRequest:
+        pass
+    asyncio.create_task(_broadcast_new_test(bot, dict(t), callback.from_user.id))
+
+
+async def _broadcast_new_test(bot: Bot, t: dict, report_to: int) -> None:
+    try:
+        teacher_tg = int(t["creator_id"])
+        targets = [r["telegram_id"] for r in await POOL.fetch(_teacher_audience_sql(), teacher_tg)]
+        name = await POOL.fetchval("SELECT full_name FROM users WHERE telegram_id=$1", teacher_tg) or "Ustozingiz"
+        text = (f"📢 <b>{_h(name)}</b> yangi test joyladi!\n\n📚 <b>{_h(t['title'])}</b>\n"
+                f"🧮 {t['questions_count']} ta savol · ⏳ {t['duration']} daqiqa\n\n"
+                f"Ochish uchun pastdagi tugmani bosing.")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📝 Testni ochish", callback_data=f"topen_{t['id']}")],
+            [InlineKeyboardButton(text="🔕 Bu ustozdan xabar olmaslik", callback_data=f"tunsub_{teacher_tg}")],
+        ])
+        ok = fail = 0
+        for tg in targets:
+            for attempt in range(2):
+                try:
+                    await bot.send_message(tg, text, parse_mode=ParseMode.HTML, reply_markup=kb)
+                    ok += 1
+                    break
+                except TelegramRetryAfter as e:
+                    if attempt:
+                        fail += 1
+                    else:
+                        await asyncio.sleep(e.retry_after + 1)
+                except Exception:
+                    fail += 1
+                    break
+            await asyncio.sleep(NOTIFY_SEND_DELAY)
+        await bot.send_message(
+            report_to, f"✅ «{_h(t['title'])}» haqida xabar <b>{ok}</b> nafar o'quvchiga yetkazildi."
+                       + (f"\n⚠️ {fail} nafariga yetmadi (botni bloklagan bo'lishi mumkin)." if fail else ""),
+            parse_mode=ParseMode.HTML)
+    except Exception:
+        logging.exception(f"Yangi test xabarini yuborib bo'lmadi (test={t.get('id')})")
+
+
+@router.callback_query(F.data.startswith("topen_"))
+async def test_open_cb(callback: CallbackQuery):
+    code = await POOL.fetchval("SELECT code FROM tests WHERE id=$1", int(callback.data.split("_")[1]))
+    await callback.answer()
+    if not code:
+        return await callback.message.answer("❌ Test topilmadi (o'chirilgan bo'lishi mumkin).")
+    await _open_test_by_deeplink(callback.message, callback.from_user.id, code)
+
+
+@router.callback_query(F.data.startswith("tunsub_"))
+async def teacher_unsubscribe_cb(callback: CallbackQuery):
+    teacher_tg = int(callback.data.split("_")[1])
+    user_db_id = await get_user_db_id(callback.from_user.id)
+    if user_db_id:
+        await POOL.execute("INSERT INTO teacher_optout (user_id, teacher_tg, created_ts) VALUES ($1,$2,$3) "
+                           "ON CONFLICT DO NOTHING", user_db_id, teacher_tg, now_ts())
+    await callback.answer("🔕 Bu ustozdan yangi test xabarlari endi kelmaydi.", show_alert=True)
+    try:
+        rows = [r for r in (callback.message.reply_markup.inline_keyboard if callback.message.reply_markup else [])
+                if not any((b.callback_data or "").startswith("tunsub_") for b in r)]
+        await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    except TelegramBadRequest:
+        pass
 
 
 # ===================== REJALASHTIRILGAN TEST ESLATMASI =====================
@@ -4142,13 +4490,11 @@ async def _send_test_card(message: Message, user_db_id: int, t, scope: str) -> N
     if prow:
         payment_id, status, started_at_paid, reject_reason = prow["id"], prow["status"], prow["started_at"], prow["reject_reason"]
 
-    has_result = bool(await POOL.fetchrow(
-        "SELECT 1 FROM results WHERE user_id=$1 AND test_id=$2 LIMIT 1", user_db_id, test_id
-    ))
+    has_result = await _result_exists_any(user_db_id, test_id)
 
     # ✅ Ijtimoiy dalil: nechta kishi yechgan, o'rtacha natija qancha
     social = await POOL.fetchrow(
-        "SELECT COUNT(*) AS cnt, AVG(percent) AS avgp FROM results WHERE test_id=$1", test_id
+        f"SELECT COUNT(*) AS cnt, AVG(percent) AS avgp FROM results r WHERE r.test_id=$1 AND {_real_sql()}", test_id
     )
 
     kind = "🆓 Tekin" if is_free == 1 else "🧾 Pullik"
@@ -4195,7 +4541,10 @@ async def _send_test_card(message: Message, user_db_id: int, t, scope: str) -> N
                 kb.inline_keyboard.append(
                     [InlineKeyboardButton(text="🏆 Reytingni ko‘rish", callback_data="rt_overall")])
             else:
-                kb.inline_keyboard.append([InlineKeyboardButton(text="🚀 Boshlash", callback_data=f"fstart_{test_id}")])
+                if not scheduled_blocked:
+                    text += ("\n⚠️ «🚀 Boshlash»ni bosishingiz bilan vaqt ketadi. Testni <b>1 marta</b> topshirish "
+                             "mumkin — tayyor bo'lganingizda boshlang.\n")
+                kb.inline_keyboard.append([InlineKeyboardButton(text="🚀 Boshlash", callback_data=f"fgo_{test_id}")])
         else:
             text += "\n⚠️ Bu test pullik. '🧾 Pullik testlar' bo‘limidan sotib oling."
     elif scope == "paid":
@@ -4421,6 +4770,45 @@ async def show_free_tests(message: Message):
 
 @router.callback_query(F.data.startswith("fstart_"))
 async def free_test_start(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await _free_test_start(callback, state, bot, confirmed=False)
+
+
+@router.callback_query(F.data.startswith("fgo_"))
+async def free_test_go(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await _free_test_start(callback, state, bot, confirmed=True)
+
+
+@router.callback_query(F.data.startswith("fno_"))
+async def free_test_not_now(callback: CallbackQuery):
+    await callback.answer()
+    try:
+        await callback.message.edit_text("👌 Mayli. Tayyor bo'lganingizda testni qaytadan oching — vaqt faqat "
+                                         "«✅ Boshlash»ni bosganingizda ketadi.")
+    except TelegramBadRequest:
+        pass
+
+
+async def _free_start_confirm(callback: CallbackQuery, user_db_id: int, test_id: int, title: str, qcount: int,
+                              left_sec: int) -> None:
+    """✅ Avval «Boshlash» bosilishi bilan vaqt ketib, PDF kelardi — ko'p
+    o'quvchilar testni shunchaki "ko'rib chiqish" uchun ochib, yagona
+    urinishini kuydirardi. Endi avval nima bo'lishi aniq aytiladi."""
+    last = await _blank_discard_used(user_db_id, test_id)
+    text = (f"🚀 <b>Testni boshlaysizmi?</b>\n\n📚 <b>{_h(title)}</b>\n"
+            f"🧮 {qcount} ta savol · ⏳ {max(1, left_sec // 60)} daqiqa\n\n"
+            f"⚠️ «✅ Boshlash»ni bosishingiz bilan savollar fayli keladi va <b>vaqt keta boshlaydi</b>. "
+            f"Testni faqat <b>1 marta</b> topshirish mumkin.")
+    if last:
+        text += "\n♻️ Bu sizga berilgan <b>qayta imkon</b> — bu safargi natija hisobga olinadi."
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Boshlash", callback_data=f"fgo_{test_id}_c")],
+        [InlineKeyboardButton(text="⏸ Hozir emas", callback_data=f"fno_{test_id}")],
+    ])
+    await callback.answer()
+    await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def _free_test_start(callback: CallbackQuery, state: FSMContext, bot: Bot, confirmed: bool):
     if not await ensure_subscribed_callback(callback, bot):
         return
 
@@ -4437,7 +4825,7 @@ async def free_test_start(callback: CallbackQuery, state: FSMContext, bot: Bot):
     if et_row and (et_row["exam_type"] or "") in STAGED_EXAM_TYPES:
         return await start_staged_attempt(callback.from_user.id, test_id, callback.message, bot, state)
 
-    if await POOL.fetchrow("SELECT 1 FROM results WHERE user_id=$1 AND test_id=$2 LIMIT 1", user_db_id, test_id):
+    if await _result_exists_any(user_db_id, test_id):
         return await callback.message.answer(
             "⚠️ Siz bu testni allaqachon topshirgansiz. Qayta topshirib bo‘lmaydi.")
 
@@ -4481,14 +4869,24 @@ async def free_test_start(callback: CallbackQuery, state: FSMContext, bot: Bot):
         return await callback.message.answer(
             "⚠️ Admin testni xato qo‘shgan: javob kaliti uzunligi savol soniga teng emas.")
 
-    cancel_timer(callback.from_user.id, test_id)
-
     # ✅ Agar foydalanuvchida bu test uchun sessiya allaqachon mavjud bo'lsa
     # (masalan "Ortga" bosgan yoki bot qayta ishga tushgan bo'lsa), hisoblagichni
     # QAYTA BOSHLAMAYMIZ — aks holda "Boshlash"ni qayta-qayta bosib vaqtni
     # cheksiz uzaytirib olish mumkin bo'lardi. Buning o'rniga eski vaqt
     # o'lchagichdan davom ettiramiz.
     existing_session = await get_session(user_db_id, test_id, "free")
+    if existing_session:
+        old_end = int(existing_session["start_ts"]) + int(existing_session["duration_sec"])
+        if now_ts() > old_end + 60:
+            # vaqti tugagan, lekin topshirilmay qolgan seans — avval uni yakunlaymiz
+            # (javob bo'lsa topshiriladi, bo'sh bo'lsa bir martalik imkon beriladi)
+            await _auto_submit_on_timeout_unlocked(bot, callback.from_user.id, test_id, old_end)
+            if await _result_exists_any(user_db_id, test_id):
+                return
+            await delete_session(user_db_id, test_id, "free")
+            existing_session = None
+            if (start_mode or "normal") == "scheduled":
+                return await callback.message.answer("❌ Bu test vaqti tugab bo‘lgan.")
     if existing_session:
         start_ts_ = int(existing_session["start_ts"])
         duration_sec = int(existing_session["duration_sec"])
@@ -4502,6 +4900,16 @@ async def free_test_start(callback: CallbackQuery, state: FSMContext, bot: Bot):
         await delete_session(user_db_id, test_id, "free")
         return await callback.message.answer("❌ Bu test vaqti tugab bo‘lgan.")
 
+    if not existing_session and not confirmed:
+        return await _free_start_confirm(callback, user_db_id, test_id, title, int(qcount),
+                                         max(0, end_ts_ - now_ts()))
+    if callback.data.endswith("_c"):
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+
+    cancel_timer(callback.from_user.id, test_id)
     await upsert_session(user_db_id, test_id, "free", start_ts_, duration_sec)
     file_id, answer_key, protect, var_note = await _variant_for_start(user_db_id, test_id, file_id, answer_key)
 
@@ -6542,6 +6950,10 @@ async def _finalize_staged_test(answerable, state: FSMContext) -> None:
         parse_mode=ParseMode.HTML,
         reply_markup=main_menu_kb(await is_admin_user(creator_tg_id))
     )
+    share = await _test_share_rows(link, new_test_id, data.get("title"), creator_tg_id)
+    if share:
+        await answerable.answer("📤 Testni o'quvchilaringizga yetkazing:",
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=share))
     await state.clear()
 
 
@@ -8750,7 +9162,8 @@ async def _report_suspicious(bot: Bot, kind: str, user_db_id: int | None, test_i
         u = await POOL.fetchrow("SELECT full_name, phone, telegram_id FROM users WHERE id=$1", user_db_id) \
             if user_db_id else None
         t = await POOL.fetchrow("SELECT code, title FROM tests WHERE id=$1", test_id) if test_id else None
-        title = {"fast": "⚡ Juda tez yechildi", "phone": "📱 Bir telefonda bir nechta akkaunt"}.get(kind, kind)
+        title = {"fast": "⚡ Juda tez yechildi", "phone": "📱 Bir telefonda bir nechta akkaunt",
+                 "quick_blank": "↩️ 1 daqiqada javobsiz yakunlab, qayta imkon oldi"}.get(kind, kind)
         text = f"🚨 <b>Shubhali faollik: {title}</b>\n\n"
         if u:
             text += (f"👤 {_h(u['full_name'] or '-')} (ID: <code>{u['telegram_id']}</code>)\n"
@@ -8769,8 +9182,12 @@ async def _report_suspicious(bot: Bot, kind: str, user_db_id: int | None, test_i
 
 
 async def process_test_submission(
-    user_tg_id: int, bot: Bot, state: FSMContext, user_ans: str, open_answers: dict | None = None
+    user_tg_id: int, bot: Bot, state: FSMContext, user_ans: str, open_answers: dict | None = None,
+    timed_out: bool = False
 ):
+    # timed_out=True — vaqt tugagani uchun avtomatik topshirish (taymer, Mini App
+    # muddati yoki bot o'chiq turganda qolib ketgan seans): javoblar vaqt ichida
+    # belgilangan, shuning uchun kechikib ishlansa ham qabul qilinadi.
     user_db_id = await get_user_db_id(user_tg_id)
     if not user_db_id:
         await bot.send_message(user_tg_id, "Avval /start orqali ro‘yxatdan o‘ting.")
@@ -8790,19 +9207,28 @@ async def process_test_submission(
 
     start_ts_, duration_sec = sess["start_ts"], sess["duration_sec"]
     end_ts_ = int(start_ts_) + int(duration_sec)
-    if now_ts() > end_ts_ + 60:
+    if now_ts() > end_ts_ + 60 and not timed_out:
         await bot.send_message(user_tg_id, "❌ Vaqt tugadi! Javoblar qabul qilinmadi.")
         await delete_session(user_db_id, test_id, mode)
         cancel_timer(user_tg_id, test_id)
         await state.clear()
         return
 
-    if await POOL.fetchrow("SELECT 1 FROM results WHERE user_id=$1 AND test_id=$2 LIMIT 1", user_db_id, test_id):
+    if await _result_exists_any(user_db_id, test_id):
         await bot.send_message(user_tg_id,
                                "⚠️ Siz bu testni allaqachon topshirgansiz. Qayta topshirib bo‘lmaydi.")
         await delete_session(user_db_id, test_id, mode)
         cancel_timer(user_tg_id, test_id)
         await state.clear()
+        return
+
+    # ✅ Birorta ham javob yo'q va test boshlanganiga 1 daqiqa bo'lmagan —
+    # adashib boshlangan: urinish hisoblanmaydi (har testda faqat 1 marta).
+    # 1 daqiqadan keyin (yoki vaqt tugab) bo'sh topshirilsa — natija 0%.
+    elapsed = now_ts() - int(start_ts_)
+    if (not timed_out and mode == "free" and elapsed <= BLANK_RETAKE_WINDOW_SEC
+            and not _answered_any(user_ans, open_answers) and not await _blank_discard_used(user_db_id, test_id)):
+        await _discard_blank_attempt(bot, user_tg_id, user_db_id, test_id, mode, state, max(0, elapsed))
         return
 
     t = await POOL.fetchrow("""
@@ -9346,6 +9772,18 @@ async def interactive_test_handler(callback: CallbackQuery, state: FSMContext, b
         user_ans = ""
         for i in range(1, qcount + 1):
             user_ans += answers.get(str(i), "*")
+        if not _answered_any(user_ans, data.get("test_open_answers") or {}) and not data.get("blank_submit_ok"):
+            await state.update_data(blank_submit_ok=True)
+            udb = await get_user_db_id(callback.from_user.id)
+            sess = await get_session(udb, int(data.get("test_id") or 0), data.get("mode") or "free")
+            quick = (sess and (data.get("mode") or "free") == "free"
+                     and now_ts() - int(sess["start_ts"]) <= BLANK_RETAKE_WINDOW_SEC - 3
+                     and not await _blank_discard_used(udb, int(data.get("test_id") or 0)))
+            return await callback.answer(
+                "Hech narsa belgilamadingiz. Adashib boshlagan bo'lsangiz — «Yakunlash»ni yana bosing: urinish "
+                "hisoblanmaydi va 1 marta qayta imkon beriladi." if quick else
+                "Hech narsa belgilamadingiz. Yana bir bor «Yakunlash»ni bossangiz, natija 0% bo'lib yoziladi "
+                "va qayta topshirib bo'lmaydi.", show_alert=True)
 
         try:
             await callback.message.delete_reply_markup()
@@ -9408,8 +9846,8 @@ async def my_results(message: Message):
         return await message.answer("Sizda hali natijalar yo‘q.")
 
     # ✅ Shaxsiy statistika: nechta test yechgan, o'rtacha va eng yaxshi natija
-    summary = await POOL.fetchrow("""
-        SELECT COUNT(*) AS cnt, AVG(percent) AS avgp, MAX(percent) AS maxp
+    summary = await POOL.fetchrow(f"""
+        SELECT COUNT(*) AS cnt, AVG(percent) FILTER (WHERE {_real_sql('')}) AS avgp, MAX(percent) AS maxp
         FROM results WHERE user_id=$1
     """, user_db_id)
 
@@ -9533,10 +9971,10 @@ async def rating_overall(callback: CallbackQuery):
     # ✅ Hisoblash SQL tomonda (RANK() OVER ...) bajariladi — 10 000+
     # foydalanuvchi/natija bo'lganda ham butun jadval Python xotirasiga
     # yuklanmaydi, faqat TOP_N + so'rovchining o'z qatori qaytariladi.
-    rows = await POOL.fetch("""
+    rows = await POOL.fetch(f"""
         WITH agg AS (
             SELECT user_id, AVG(percent) AS avgp, COUNT(*) AS cnt
-            FROM results
+            FROM results WHERE {_real_sql('')}
             GROUP BY user_id
         ), ranked AS (
             SELECT user_id, avgp, cnt, RANK() OVER (ORDER BY avgp DESC) AS rnk
@@ -9572,11 +10010,11 @@ async def rating_overall(callback: CallbackQuery):
 @router.callback_query(F.data == "rt_weekly")
 async def rating_weekly(callback: CallbackQuery):
     cutoff = (datetime.now(TZ) - timedelta(days=7)).strftime("%Y-%m-%d %H:%M")
-    rows = await POOL.fetch("""
+    rows = await POOL.fetch(f"""
         SELECT COALESCE(u.full_name, 'Noma''lum') AS full_name, MAX(r.percent) AS bestp
         FROM results r
         JOIN users u ON u.id = r.user_id
-        WHERE r.date >= $1
+        WHERE r.date >= $1 AND {_real_sql()}
         GROUP BY u.id, u.full_name
         ORDER BY bestp DESC
         LIMIT $2
@@ -9635,11 +10073,11 @@ async def rating_per_test(callback: CallbackQuery, bot: Bot):
     if et == "rasch":
         await finalize_rush_for_test_if_ready(test_id, bot=bot)
 
-    rows = await POOL.fetch("""
+    rows = await POOL.fetch(f"""
         SELECT COALESCE(u.full_name, 'Noma''lum') AS full_name, r.percent
         FROM results r
         JOIN users u ON u.id = r.user_id
-        WHERE r.test_id=$1
+        WHERE r.test_id=$1 AND {_real_sql()}
         ORDER BY r.percent DESC
         LIMIT $2
     """, test_id, TOP_N)
@@ -11139,7 +11577,8 @@ async def _period_stats(since: datetime, until: datetime) -> dict:
     users = await POOL.fetchval(
         "SELECT COUNT(*) FROM users WHERE created_ts >= $1 AND created_ts < $2 AND COALESCE(full_name,'')<>''",
         int(since.timestamp()), int(until.timestamp()))
-    r = await POOL.fetchrow("SELECT COUNT(*) AS n, COUNT(DISTINCT user_id) AS a, AVG(percent) AS p "
+    r = await POOL.fetchrow(f"SELECT COUNT(*) AS n, COUNT(DISTINCT user_id) AS a, "
+                            f"AVG(percent) FILTER (WHERE {_real_sql('')}) AS p "
                             "FROM results WHERE date >= $1 AND date < $2", s, u)
     revenue = await POOL.fetchval("""
         SELECT COALESCE(SUM(COALESCE(p.amount, t.price)),0) FROM payments p JOIN tests t ON t.id=p.test_id
@@ -11155,9 +11594,10 @@ async def _admin_pending_counts() -> dict:
                (SELECT COUNT(*) FROM wallet_tx WHERE kind='topup' AND status='pending') AS topups,
                (SELECT COUNT(*) FROM results WHERE COALESCE(open_pending,0)>0) AS open_answers,
                (SELECT COUNT(*) FROM results WHERE essay_status='pending') AS essays,
-               (SELECT COUNT(*) FROM staged_attempts WHERE status='pending_review') AS staged
+               (SELECT COUNT(*) FROM staged_attempts WHERE status='pending_review') AS staged,
+               (SELECT COUNT(*) FROM support_msgs WHERE COALESCE(answered_ts,0)=0) AS support
     """)
-    return {k: int(row[k] or 0) for k in ("payments", "topups", "open_answers", "essays", "staged")}
+    return {k: int(row[k] or 0) for k in ("payments", "topups", "open_answers", "essays", "staged", "support")}
 
 
 async def _admin_audience() -> dict:
@@ -11252,11 +11692,14 @@ async def admin_stats(message: Message):
 
     todo = [(pend["payments"], "🧾 To'lov cheklari"), (pend["topups"], "👛 Hamyon to'ldirish cheklari"),
             (pend["open_answers"], "✍️ Ochiq javobli natijalar"), (pend["essays"], "📝 Esselar"),
-            (pend["staged"], "🎓 Bosqichli imtihon baholash")]
+            (pend["staged"], "🎓 Bosqichli imtihon baholash"),
+            (pend["support"], "✉️ Javobsiz foydalanuvchi xabarlari")]
     todo = [f"{label}: <b>{n}</b>" for n, label in todo if n]
     text += "\n⏳ <b>Sizni kutayotgan ishlar</b>\n" + ("\n".join(todo) if todo else "✅ Hammasi bajarilgan")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        *([[InlineKeyboardButton(text=f"✉️ Foydalanuvchi xabarlari ({pend['support']})", callback_data="sup_list")]]
+          if pend["support"] else []),
         [InlineKeyboardButton(text="📈 Kunlik dinamika", callback_data="st_trend"),
          InlineKeyboardButton(text="🔬 Savollar tahlili", callback_data="st_items")],
         [InlineKeyboardButton(text="👨‍🏫 Ustozlar faolligi", callback_data="st_teachers"),
@@ -11409,9 +11852,9 @@ async def stats_item_analysis(callback: CallbackQuery):
         return await callback.answer("Bosqichli imtihonlar uchun savollar tahlili hozircha yo'q.", show_alert=True)
 
     key = normalize_answers(_variant_fields(t, variant)[0] or "")[:int(t["questions_count"] or 0)]
-    rows = await POOL.fetch("""
+    rows = await POOL.fetch(f"""
         SELECT user_answers, open_grades FROM results
-        WHERE test_id=$1 AND user_answers IS NOT NULL AND COALESCE(variant,'a')=$2""", test_id, variant)
+        WHERE test_id=$1 AND user_answers IS NOT NULL AND COALESCE(variant,'a')=$2 AND {_real_sql('')}""", test_id, variant)
     answer_rows = [(normalize_answers(r["user_answers"] or ""), _load_json_dict(r["open_grades"])) for r in rows]
     head = f"🔬 <b>Savollar tahlili</b> — <code>{_h(t['code'])}</code> {_h(t['title'] or '')}"
     if t["b_answers"]:
@@ -11488,10 +11931,10 @@ async def stats_teachers(callback: CallbackQuery):
     if not await is_admin_user(callback.from_user.id):
         return
     since30 = _ts_str(_day_start(29))
-    rows = await POOL.fetch("""
+    rows = await POOL.fetch(f"""
         SELECT t.creator_id, MAX(u.full_name) AS name, MAX(u.role) AS role,
                COUNT(DISTINCT t.id) AS tests, COUNT(r.id) AS results, COUNT(DISTINCT r.user_id) AS students,
-               COUNT(r.id) FILTER (WHERE r.date >= $1) AS results30, AVG(r.percent) AS avgp,
+               COUNT(r.id) FILTER (WHERE r.date >= $1) AS results30, AVG(r.percent) FILTER (WHERE {_real_sql()}) AS avgp,
                COUNT(r.id) FILTER (WHERE COALESCE(r.open_pending,0)>0 OR r.essay_status='pending') AS todo,
                MAX(r.date) AS last
         FROM tests t LEFT JOIN users u ON u.telegram_id=t.creator_id LEFT JOIN results r ON r.test_id=t.id
@@ -11561,9 +12004,9 @@ async def stats_audience(callback: CallbackQuery):
     if grades:
         text += "\n🎒 <b>Sinflar</b>: " + ", ".join(
             f"{_h(r['k'])}{'-sinf' if r['k'].isdigit() else ''} — {r['n']}" for r in grades) + "\n"
-    top = await POOL.fetch("""
+    top = await POOL.fetch(f"""
         SELECT u.full_name, COUNT(*) AS n, AVG(r.percent) AS p FROM results r JOIN users u ON u.id=r.user_id
-        WHERE r.date >= $1 GROUP BY u.id, u.full_name ORDER BY n DESC, p DESC LIMIT 10""", _ts_str(_day_start(29)))
+        WHERE r.date >= $1 AND {_real_sql()} GROUP BY u.id, u.full_name ORDER BY n DESC, p DESC LIMIT 10""", _ts_str(_day_start(29)))
     if top:
         text += "\n🏅 <b>Eng faol o'quvchilar</b> (30 kun)\n" + "\n".join(
             f"{i}. {_h(r['full_name'] or '-')} — {r['n']} test, o'rtacha {float(r['p'] or 0):.0f}%"
@@ -12139,7 +12582,7 @@ async def user_profile_view(callback: CallbackQuery, bot: Bot):
         pass
 
     results_count = await POOL.fetchval("SELECT COUNT(*) FROM results WHERE user_id=$1", uid)
-    avg_pct = await POOL.fetchval("SELECT AVG(percent) FROM results WHERE user_id=$1", uid)
+    avg_pct = await POOL.fetchval(f"SELECT AVG(percent) FROM results WHERE user_id=$1 AND {_real_sql('')}", uid)
     approved = await POOL.fetchval("SELECT COUNT(*) FROM payments WHERE user_id=$1 AND status='approved'", uid)
     pending = await POOL.fetchval("SELECT COUNT(*) FROM payments WHERE user_id=$1 AND status='pending'", uid)
     spent = await POOL.fetchval("""
@@ -13245,8 +13688,8 @@ async def tests_ranking(callback: CallbackQuery):
     if not await is_admin_user(callback.from_user.id):
         return
 
-    rows = await POOL.fetch("""
-        SELECT t.code, t.title, COUNT(DISTINCT r.user_id) AS participants, AVG(r.percent) AS avgp
+    rows = await POOL.fetch(f"""
+        SELECT t.code, t.title, COUNT(DISTINCT r.user_id) AS participants, AVG(r.percent) FILTER (WHERE {_real_sql()}) AS avgp
         FROM tests t LEFT JOIN results r ON r.test_id=t.id
         GROUP BY t.id, t.code, t.title
         ORDER BY participants DESC
@@ -13777,6 +14220,30 @@ async def _nav_show_is_free(answerable, state: FSMContext) -> None:
     await state.set_state(AdminAddTestState.is_free)
 
 
+# ✅ Klaviatura rus tilida qolib yozilgan nom ("ЩДШЬЗШФВФ" = "OLIMPIADA") —
+# prod'da shunday nomli test o'quvchilarga tushunarsiz bo'lib, birorta ham
+# natija olmagan edi. Shunday nomni sezsak, lotinchasini taklif qilamiz.
+_RU_LAYOUT = dict(zip("йцукенгшщзхъфывапролджэячсмитьбю", "qwertyuiop[]asdfghjkl;'zxcvbnm,."))
+
+
+def _fix_wrong_layout(text: str) -> str | None:
+    letters = [c for c in text if c.isalpha()]
+    cyr = [c for c in letters if c.lower() in _RU_LAYOUT or c.lower() == "ё"]
+    if len(cyr) < 4 or len(cyr) < 0.8 * len(letters):
+        return None
+    if sum(c.lower() in "аеёиоуыэюя" for c in cyr) / len(cyr) >= 0.25:
+        return None   # unlilar yetarli — bu oddiy kirillcha so'z
+    out = []
+    for c in text:
+        m = _RU_LAYOUT.get(c.lower())
+        out.append(c if m is None else (m.upper() if c.isupper() else m))
+    fixed = "".join(out)
+    lat = [c for c in fixed if c.isalpha()]
+    if not lat or sum(c.lower() in "aeiou" for c in lat) / len(lat) < 0.3:
+        return None
+    return fixed
+
+
 @router.message(AdminAddTestState.title)
 async def set_title(message: Message, state: FSMContext):
     if (message.text or "") in TOP_MENU_BTNS:
@@ -13784,14 +14251,43 @@ async def set_title(message: Message, state: FSMContext):
     title = sanitize_plain_text(message.text, max_len=150)
     if len(title) < 2:
         return await message.answer("⚠️ Test nomi juda qisqa yoki noto'g'ri belgilar bor. Qayta kiriting:")
-    await state.update_data(title=title)
+    fixed = _fix_wrong_layout(title)
+    if fixed:
+        await state.update_data(title_raw=title, title_fix=fixed)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"✅ {fixed[:40]}", callback_data="ttlfix_y")],
+            [InlineKeyboardButton(text=f"Yo'q, «{title[:30]}» qolsin", callback_data="ttlfix_n")],
+        ])
+        return await message.answer(
+            f"⌨️ Nom rus klaviaturasida yozilganga o'xshaydi: <b>{_h(title)}</b>\n"
+            f"Balki <b>{_h(fixed)}</b> demoqchi edingiz?", parse_mode=ParseMode.HTML, reply_markup=kb)
+    await _after_title(message, state, title)
+
+
+@router.callback_query(AdminAddTestState.title, F.data.in_({"ttlfix_y", "ttlfix_n"}))
+async def set_title_fix(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    title = data.get("title_fix") if callback.data == "ttlfix_y" else data.get("title_raw")
+    if not title:
+        return await callback.answer("Nomni qaytadan yozing.", show_alert=True)
+    await callback.answer()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    await callback.message.answer(f"✅ Test nomi: <b>{_h(title)}</b>", parse_mode=ParseMode.HTML)
+    await _after_title(callback.message, state, title)
+
+
+async def _after_title(answerable, state: FSMContext, title: str) -> None:
+    await state.update_data(title=title, title_raw=None, title_fix=None)
 
     # ✅ Test kodini admin qo'lda o'ylab topmaydi — takrorlanmas kod avtomatik yaratiladi.
     new_code = await generate_unique_code()
     await state.update_data(code=new_code)
 
     await _nav_push(state, "base", "title")
-    await _nav_show_is_free(message, state)
+    await _nav_show_is_free(answerable, state)
 
 
 async def _nav_show_price(answerable, state: FSMContext) -> None:
@@ -13964,7 +14460,7 @@ async def set_duration_and_qcount(message: Message, state: FSMContext):
 
 async def _ask_exam_type(answerable, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Oddiy test", callback_data="etype_simple")],
+        [InlineKeyboardButton(text="📝 Oddiy test — tavsiya etiladi", callback_data="etype_simple")],
         [InlineKeyboardButton(text="⚡ Milliy sertifikat (Rasch)", callback_data="etype_rasch")],
         [InlineKeyboardButton(text="🇺🇿 Milliy sertifikat: Ona tili (test + esse)", callback_data="etype_msona")],
         [InlineKeyboardButton(text="✍️ Esse (Milliy sertifikat mezoni)", callback_data="etype_msessay")],
@@ -13974,9 +14470,32 @@ async def _ask_exam_type(answerable, state: FSMContext):
         [InlineKeyboardButton(text="🎧 IELTS (ko'nikmalar, ustoz/AI baholaydi)", callback_data="etype_ielts4")],
         [InlineKeyboardButton(text="📝 SAT (tezkor, 1 ball)", callback_data="etype_sat")],
         [InlineKeyboardButton(text="🧮 SAT (2 bosqich: R&W + Math)", callback_data="etype_satstaged")],
+        [InlineKeyboardButton(text="ℹ️ Har biri haqida batafsil", callback_data="etinfo")],
     ])
+    # ✅ Avval 10 ta rejimning uzun tavsifi birdaniga chiqardi — ustozlar
+    # o'qimay, deyarli hammasi "Oddiy"ni tanlardi. Endi maqsadga qarab qisqa
+    # yo'riqnoma, batafsil tavsif esa alohida tugmada.
     await answerable.answer(
         "5-qadam: <b>baholash rejimini tanlang</b>\n\n"
+        "Qaysi biri kerakligini bilmasangiz — <b>📝 Oddiy test</b>ni tanlang (har savol 1 ball, natija foizda).\n\n"
+        "🎯 <b>Maqsadingizga qarab:</b>\n"
+        "• Sinf/nazorat testi → 📝 Oddiy\n"
+        "• Milliy sertifikatga tayyorlov → ⚡ Rasch (ona tili uchun — 🇺🇿 test + esse)\n"
+        "• Abituriyentlar (DTM) → 📚 1 sessiya yoki 🎯 5 bosqich\n"
+        "• Ingliz tili → 🎓 CEFR (A1–C2) yoki 🎧 IELTS (band 0–9)\n"
+        "• SAT → 📝 tezkor yoki 🧮 2 bosqich\n\n"
+        "<i>Har birining farqi — «ℹ️ Batafsil» tugmasida.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb
+    )
+    await state.set_state(AdminAddTestState.exam_type)
+
+
+@router.callback_query(AdminAddTestState.exam_type, F.data == "etinfo")
+async def exam_type_info(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.answer(
+        "ℹ️ <b>Baholash rejimlari</b>\n\n"
         "📝 <b>Oddiy</b> — har savol 1 ball, natija oddiy foizda.\n"
         "⚡ <b>Milliy sertifikat (Rasch)</b> — matematika, tarix, kimyo, biologiya, fizika va boshqa "
         "fanlar: natija guruhga nisbatan 75 ballik shkalada (A+ … C) baholanadi; istalgan guruh kattaligida "
@@ -13997,11 +14516,10 @@ async def _ask_exam_type(answerable, state: FSMContext):
         "🧮 <b>SAT (2 bosqich)</b> — rasmiy SAT tuzilishiga mos: Reading&Writing va Math "
         "ALOHIDA vaqtda topshiriladi (xohlasangiz faqat bittasi ham bo'ladi), har biri "
         "200-800 shkalada baholanadi, ikkalasi qo'shilib 400-1600 kompozit ball hosil qiladi.\n\n"
-        "<i>CEFR/IELTS/SAT konvertatsiyasi taxminiy (foizdan hisoblanadi) — rasmiy sertifikat emas.</i>",
+        "<i>CEFR/IELTS/SAT konvertatsiyasi taxminiy (foizdan hisoblanadi) — rasmiy sertifikat emas.</i>\n\n"
+        "👆 Tanlash uchun yuqoridagi tugmalardan foydalaning.",
         parse_mode=ParseMode.HTML,
-        reply_markup=kb
     )
-    await state.set_state(AdminAddTestState.exam_type)
 
 
 @router.callback_query(AdminAddTestState.exam_type, F.data.startswith("etype_"))
@@ -14310,6 +14828,7 @@ async def _finish_base_test_creation(
         [InlineKeyboardButton(text="🎓 Sertifikat sozlamalari (ixtiyoriy)", callback_data=f"certcfg_start_{new_test_id}")]
     ])
     link = await _test_deep_link(bot or message, data.get("code"))
+    kb.inline_keyboard[0:0] = await _test_share_rows(link, new_test_id, data.get("title"), creator_tg)
     await message.answer(
         f"✅ Test qo‘shildi!\n🔑 Kod: <code>{data.get('code')}</code>\n🧮 Savollar: <b>{qcount}</b>{extra}\n"
         f"🔗 Havola: {link}\n<i>(havolani o'quvchilarga yuboring — bosishi bilan test ochiladi)</i>\n\n"
@@ -14714,7 +15233,8 @@ async def creator_test_stat_cb(callback: CallbackQuery):
     code, title, exam_type = t["code"], t["title"], t["exam_type"]
 
     res = await POOL.fetchrow(
-        "SELECT COUNT(DISTINCT user_id) AS c, AVG(percent) AS avgp, AVG(score) AS avgs FROM results WHERE test_id=$1",
+        f"SELECT COUNT(DISTINCT user_id) AS c, AVG(percent) FILTER (WHERE {_real_sql('')}) AS avgp, "
+        f"AVG(score) FILTER (WHERE {_real_sql('')}) AS avgs FROM results WHERE test_id=$1",
         test_id
     )
 
@@ -15426,20 +15946,89 @@ async def help_menu(message: Message):
 @router.callback_query(F.data == "ask_admin_start")
 async def ask_admin_start(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
-        "✉️ <b>Adminga xabar</b>\n\nSavolingiz yoki taklifingizni yozing — to'g'ridan-to'g'ri adminga yetkazaman:",
+        "✉️ <b>Adminga xabar</b>\n\nSavolingiz yoki taklifingizni yozing (rasm yoki fayl ham bo'ladi) — "
+        "to'g'ridan-to'g'ri adminga yetkazaman. Javob shu chatga, savolingizga belgilangan holda keladi:",
         parse_mode=ParseMode.HTML,
         reply_markup=nav_kb(include_back=True)
     )
     await state.set_state(AskAdminState.waiting_text)
 
 
+# ===================== ADMIN BILAN YOZISHMA =====================
+# ✅ Avval foydalanuvchi xabari adminga oddiy matn bo'lib borardi — admin bot
+# orqali javob qaytara olmasdi (faqat username/telefon orqali). Endi har bir
+# xabar saqlanadi: admin «✍️ Javob berish»ni bosib yoki xabarga Telegram'da
+# «Reply» qilib yozadi — javob foydalanuvchiga AYNAN o'sha savoliga
+# belgilangan (reply) holda yetib boradi.
+SUPPORT_LIST_LIMIT = 15
+
+
+def _support_kb(sup_id: int, answered: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text="✅ Javob berildi · yana yozish" if answered else "✍️ Javob berish", callback_data=f"supr_{sup_id}")]])
+
+
+async def _support_row(sup_id: int):
+    return await POOL.fetchrow("SELECT * FROM support_msgs WHERE id=$1", sup_id)
+
+
+async def _support_row_by_admin_msg(msg_id: int):
+    return await POOL.fetchrow(
+        "SELECT * FROM support_msgs WHERE admin_msg_id=$1 OR admin_msg_id2=$1 ORDER BY id DESC LIMIT 1", msg_id)
+
+
+def _has_media(m: Message) -> bool:
+    return bool(m.photo or m.document or m.voice or m.video or m.audio or m.animation)
+
+
+async def _deliver_support_reply(bot: Bot, reply: Message, user_tg: int, user_msg_id) -> None:
+    rp = ReplyParameters(message_id=int(user_msg_id), allow_sending_without_reply=True) if user_msg_id else None
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✉️ Yana savol berish", callback_data="ask_admin_start")]])
+    head = "💬 <b>Admin javobi:</b>"
+    if reply.text:
+        await bot.send_message(user_tg, f"{head}\n\n{reply.html_text}", parse_mode=ParseMode.HTML,
+                               reply_parameters=rp, reply_markup=kb)
+    elif _has_media(reply):
+        cap = f"{head}\n\n{reply.html_text}" if reply.caption else head
+        await bot.copy_message(user_tg, reply.chat.id, reply.message_id, caption=cap, parse_mode=ParseMode.HTML,
+                               reply_parameters=rp, reply_markup=kb)
+    else:  # stiker, video-xabar va h.k. — izohsiz turlar
+        await bot.send_message(user_tg, head, parse_mode=ParseMode.HTML, reply_parameters=rp)
+        await bot.copy_message(user_tg, reply.chat.id, reply.message_id, reply_markup=kb)
+
+
+async def _send_support_answer(bot: Bot, admin_msg: Message, sup: dict) -> None:
+    """sup — support_msgs qatori (yoki eski xabar uchun faqat user_tg bilan lug'at)."""
+    try:
+        await _deliver_support_reply(bot, admin_msg, int(sup["user_tg"]), sup.get("user_msg_id"))
+    except TelegramForbiddenError:
+        await admin_msg.answer("⚠️ Foydalanuvchi botni bloklagan — javob yetkazilmadi.")
+        return
+    except TelegramBadRequest as e:
+        logging.warning(f"Admin javobi yetkazilmadi (user={sup.get('user_tg')}): {e}")
+        await admin_msg.answer(f"⚠️ Javobni yetkazib bo'lmadi: {_h(str(e))[:200]}")
+        return
+    if sup.get("id"):
+        await POOL.execute("UPDATE support_msgs SET answered_ts=$1, answered_by=$2 WHERE id=$3",
+                           now_ts(), admin_msg.from_user.id, sup["id"])
+        if sup.get("admin_msg_id"):
+            try:
+                await bot.edit_message_reply_markup(chat_id=ADMIN_ID, message_id=int(sup["admin_msg_id"]),
+                                                    reply_markup=_support_kb(sup["id"], True))
+            except TelegramBadRequest:
+                pass
+    await admin_msg.answer("✅ Javob yuborildi — foydalanuvchiga uning savoliga belgilangan holda yetib bordi.")
+
+
 @router.message(AskAdminState.waiting_text)
 async def ask_admin_send(message: Message, state: FSMContext, bot: Bot):
     if (message.text or "") in TOP_MENU_BTNS:
         return
-    text = (message.text or "").strip()
-    if len(text) < 2:
-        return await message.answer("⚠️ Xabar juda qisqa. Qayta yozing:")
+    media = _has_media(message)
+    text = (message.text or message.caption or "").strip()
+    if not media and len(text) < 2:
+        return await message.answer("⚠️ Xabar juda qisqa. Qayta yozing (yoki rasm/fayl yuboring):")
 
     user_row = await POOL.fetchrow("SELECT full_name, phone FROM users WHERE telegram_id=$1", message.from_user.id)
     full_name = (user_row["full_name"] if user_row and user_row["full_name"] else message.from_user.full_name)
@@ -15455,24 +16044,103 @@ async def ask_admin_send(message: Message, state: FSMContext, bot: Bot):
     else:
         contact_line = "📞 Telefon/username: noma'lum"
 
+    body = message.html_text if text else "<i>(fayl ilova qilingan)</i>"
+    if len(body) > 3300:
+        body = _h(text[:3000]) + "…"
     try:
-        await bot.send_message(
+        sup_id = await POOL.fetchval(
+            "INSERT INTO support_msgs (user_tg, user_msg_id, text, created_ts) VALUES ($1,$2,$3,$4) RETURNING id",
+            message.from_user.id, message.message_id, text[:2000] or None, now_ts())
+        hdr = await bot.send_message(
             ADMIN_ID,
-            f"✉️ <b>Yangi xabar</b>\n\n"
+            f"✉️ <b>Yangi xabar</b> #{sup_id}\n\n"
             f"👤 {_h(full_name)}\n"
             f"{contact_line}\n"
             f"🆔 <code>{message.from_user.id}</code>\n\n"
-            f"{message.html_text}",
-            parse_mode=ParseMode.HTML
+            f"{body}\n\n"
+            f"<i>Javob berish: pastdagi tugma yoki shu xabarga «Reply» qiling.</i>",
+            parse_mode=ParseMode.HTML, reply_markup=_support_kb(sup_id, False)
         )
+        second = None
+        if media:
+            second = (await bot.copy_message(ADMIN_ID, message.chat.id, message.message_id,
+                                             reply_parameters=ReplyParameters(message_id=hdr.message_id,
+                                                                              allow_sending_without_reply=True))
+                      ).message_id
+        await POOL.execute("UPDATE support_msgs SET admin_msg_id=$1, admin_msg_id2=$2 WHERE id=$3",
+                           hdr.message_id, second, sup_id)
         admin_flag = await is_admin_user(message.from_user.id)
-        await message.answer("✅ Xabaringiz adminga yuborildi. Tez orada javob berishadi.",
-                             reply_markup=main_menu_kb(admin_flag))
+        await message.answer("✅ Xabaringiz adminga yuborildi. Javob shu chatga, savolingizga belgilangan "
+                             "holda keladi.", reply_markup=main_menu_kb(admin_flag))
     except Exception:
         logging.exception("ask_admin_send: xabarni adminga yuborib bo'lmadi")
         await message.answer("⚠️ Xabarni yuborishda xatolik yuz berdi. Birozdan so'ng qayta urinib ko'ring.")
 
     await state.clear()
+
+
+@router.callback_query(F.data.startswith("supr_"))
+async def support_reply_start(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin_user(callback.from_user.id):
+        return await callback.answer("Faqat admin uchun.", show_alert=True)
+    sup = await _support_row(int(callback.data.split("_")[1]))
+    if not sup:
+        return await callback.answer("Xabar topilmadi.", show_alert=True)
+    await callback.answer()
+    name = await POOL.fetchval("SELECT full_name FROM users WHERE telegram_id=$1", sup["user_tg"])
+    await state.set_state(SupportReplyState.waiting)
+    await state.update_data(support_id=sup["id"])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ Bekor qilish", callback_data="supcancel")]])
+    await callback.message.answer(
+        f"✍️ <b>{_h(name or sup['user_tg'])}</b> ga javobingizni yozing (matn, rasm, fayl yoki ovozli xabar).\n\n"
+        f"<i>Savol:</i> {_h((sup['text'] or '(fayl)')[:300])}\n\n"
+        f"Javob foydalanuvchiga uning savoliga belgilangan holda boradi.",
+        parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+@router.callback_query(F.data == "supcancel")
+async def support_reply_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer("Bekor qilindi.")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+
+
+@router.message(SupportReplyState.waiting)
+async def support_reply_send(message: Message, state: FSMContext, bot: Bot):
+    if (message.text or "") in TOP_MENU_BTNS:
+        return
+    data = await state.get_data()
+    sup = await _support_row(int(data.get("support_id") or 0))
+    await state.clear()
+    if not sup:
+        return await message.answer("Xabar topilmadi.")
+    await _send_support_answer(bot, message, dict(sup))
+
+
+@router.callback_query(F.data == "sup_list")
+async def support_list(callback: CallbackQuery):
+    if not await is_admin_user(callback.from_user.id):
+        return await callback.answer("Faqat admin uchun.", show_alert=True)
+    await callback.answer()
+    rows = await POOL.fetch("""
+        SELECT s.id, s.user_tg, s.text, u.full_name FROM support_msgs s
+        LEFT JOIN users u ON u.telegram_id=s.user_tg
+        WHERE COALESCE(s.answered_ts,0)=0 ORDER BY s.id DESC LIMIT $1
+    """, SUPPORT_LIST_LIMIT)
+    if not rows:
+        return await callback.message.answer("✅ Javob kutayotgan xabar yo'q.")
+    lines, kb = [], InlineKeyboardMarkup(inline_keyboard=[])
+    for r in rows:
+        name = r["full_name"] or str(r["user_tg"])
+        lines.append(f"#{r['id']} · <b>{_h(name)}</b> — {_h((r['text'] or '(fayl)')[:80])}")
+        kb.inline_keyboard.append([InlineKeyboardButton(text=f"✍️ #{r['id']} {name[:24]}",
+                                                        callback_data=f"supr_{r['id']}")])
+    await callback.message.answer("✉️ <b>Javob kutayotgan xabarlar</b>\n\n" + "\n".join(lines),
+                                  parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 CERT_CHECK_EVERY_SEC = 30
@@ -15543,9 +16211,11 @@ async def certificate_daemon(bot: Bot):
 BACKUP_TABLES = [
     "users", "tests", "payments", "results", "sessions", "required_channels", "user_limits",
     "staged_attempts", "retake_grants", "test_reminders", "suspicious_events", "wallet_tx", "teacher_payouts",
+    "blank_discards", "teacher_optout", "support_msgs",
 ]
 # Eski zaxira fayllarida bo'lmagan jadvallar (ular bo'lmasa ham tiklash ishlaydi)
-BACKUP_OPTIONAL_TABLES = {"retake_grants", "test_reminders", "suspicious_events", "wallet_tx", "teacher_payouts"}
+BACKUP_OPTIONAL_TABLES = {"retake_grants", "test_reminders", "suspicious_events", "wallet_tx", "teacher_payouts",
+                          "blank_discards", "teacher_optout", "support_msgs"}
 
 
 async def _run_db_backup(bot: Bot, requester_tg_id: int | None = None):
@@ -15616,7 +16286,7 @@ async def backup_now(callback: CallbackQuery, bot: Bot):
 # amal bo'lgani uchun har doim aniq tasdiqlash bosqichidan o'tadi.
 _TABLES_WITH_SERIAL_ID = [
     "users", "tests", "payments", "results", "sessions", "required_channels", "staged_attempts",
-    "suspicious_events", "wallet_tx", "teacher_payouts",
+    "suspicious_events", "wallet_tx", "teacher_payouts", "support_msgs",
 ]
 
 
@@ -16925,7 +17595,7 @@ async def _web_access(user_db_id: int, t) -> dict:
     blocked, left = is_scheduled_not_started(t["start_mode"], t["start_ts"])
     if blocked:
         return {"state": "not_started", "left": left}
-    if await POOL.fetchval("SELECT 1 FROM results WHERE user_id=$1 AND test_id=$2 LIMIT 1", user_db_id, t["id"]):
+    if await _result_exists_any(user_db_id, t["id"]):
         return {"state": "done"}
     key = normalize_answers(t["answers"] or "")
     if len(key) != int(t["questions_count"] or 0):
@@ -17575,7 +18245,8 @@ async def _admin_stats(days: int = 14) -> dict:
     u_rows = await POOL.fetch("""
         SELECT to_char(to_timestamp(created_ts + $2) AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS d, COUNT(*) AS n
         FROM users WHERE created_ts >= $1 GROUP BY 1""", start_ts, int(TZ.utcoffset(None).total_seconds()))
-    r_rows = await POOL.fetch("SELECT LEFT(date, 10) AS d, COUNT(*) AS n, AVG(percent) AS p FROM results "
+    r_rows = await POOL.fetch(f"SELECT LEFT(date, 10) AS d, COUNT(*) AS n, AVG(percent) FILTER (WHERE {_real_sql('')}) AS p "
+                              "FROM results "
                               "WHERE date >= $1 GROUP BY 1", start_str)
     p_rows = await POOL.fetch(f"""
         SELECT LEFT(COALESCE(p.approved_at, p.created_at), 10) AS d, {rev_expr} AS s
@@ -17587,8 +18258,8 @@ async def _admin_stats(days: int = 14) -> dict:
     daily = [{"d": d, "users": um.get(d, 0), "results": rm.get(d, (0, 0))[0],
               "avg": round(rm.get(d, (0, 0))[1], 1), "revenue": pm.get(d, 0)} for d in labels]
 
-    top_tests = await POOL.fetch("""
-        SELECT t.code, t.title, COUNT(r.id) AS n, AVG(r.percent) AS p
+    top_tests = await POOL.fetch(f"""
+        SELECT t.code, t.title, COUNT(r.id) AS n, AVG(r.percent) FILTER (WHERE {_real_sql()}) AS p
         FROM results r JOIN tests t ON t.id=r.test_id
         WHERE r.date >= $1 GROUP BY t.id, t.code, t.title ORDER BY n DESC LIMIT 5""", start_str)
     top_teachers = await POOL.fetch("""
@@ -17750,11 +18421,15 @@ async def webapp_api_submit(request: web.Request):
         answers, open_answers = _web_clean_answers(body.get("answers"), body.get("open_answers"), key, qcount,
                                                    set(saved.get("uploads") or []))
         user_ans = "".join(answers.get(str(i), "*") for i in range(1, qcount + 1))
+        blank = not _answered_any(user_ans, open_answers)
         _web_cancel_deadline(ctx["tg_id"], test_id)
         await process_test_submission(ctx["tg_id"], bot, _DetachedState({"test_id": test_id, "mode": mode}),
                                       user_ans, open_answers)
         view = await _web_result_view(ctx["user_db_id"], test_id)
         if view.get("state") == "none":
+            if blank:
+                raise WebError("blank_discarded", "Test 1 daqiqa ichida javobsiz yakunlandi — urinish "
+                                                  "hisoblanmadi. Sizga yana 1 marta imkon beriladi.", 409)
             raise WebError("time_over", "Vaqt tugagani uchun javoblar qabul qilinmadi.", 409)
     return web.json_response({"ok": True, "result": view})
 
@@ -18279,7 +18954,8 @@ async def webapp_api_profile(request: web.Request):
 
     user_db_id = urow["id"]
     summary = await POOL.fetchrow(
-        "SELECT COUNT(*) AS cnt, AVG(percent) AS avgp, MAX(percent) AS maxp FROM results WHERE user_id=$1",
+        f"SELECT COUNT(*) AS cnt, AVG(percent) FILTER (WHERE {_real_sql('')}) AS avgp, MAX(percent) AS maxp "
+        "FROM results WHERE user_id=$1",
         user_db_id
     )
     results = await POOL.fetch("""
@@ -19618,8 +20294,8 @@ async function doSubmit(st, auto) {
       if (!auto) return;
       setTimeout(() => doSubmit(st, true), 5000); return;
     }
-    if (e.error === "stale" || e.error === "no_session") {
-      S.st = null; toast(e.message, 3500);
+    if (e.error === "stale" || e.error === "no_session" || e.error === "blank_discarded") {
+      S.st = null; toast(e.message, 4500);
       try { const r = await api("/api/result/" + st.testId); if (r.result.state !== "none") return renderResult(r.result); } catch (x) {}
       return renderHome();
     }
@@ -20932,6 +21608,7 @@ async def main():
     dp.errors.register(global_error_handler)
 
     await _resume_active_timers(bot)
+    asyncio.create_task(expired_sessions_daemon(bot))
 
     try:
         await dp.start_polling(bot)
